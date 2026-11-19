@@ -251,3 +251,66 @@ test("document reads reject an exact-route race from the live evaluation", async
   });
   if (result.skipped) t.skip("No installed Edge/Chrome/Chromium executable");
 });
+
+test("plain same-page GET search requires a uniquely named public query field", async (t) => {
+  const result = await withPage(async (page) => {
+    await page.setContent(`
+      <form id="positive" action="" method="get">
+        <label id="search-documentation">Search documentation</label>
+        <input type="text" name="q" aria-labelledby="search-documentation">
+        <input id="positive-submit" type="submit" value="search">
+      </form>
+      <form id="hidden-field" action="" method="get">
+        <label for="hidden-q">Search</label><input id="hidden-q" type="text" name="q">
+        <input type="hidden" name="tracking" value="x"><input id="hidden-submit" type="submit" value="search">
+      </form>
+      <form id="other-route" action="/other" method="get">
+        <label for="other-q">Query</label><input id="other-q" type="text" name="q">
+        <input id="other-submit" type="submit" value="search">
+      </form>
+      <form id="post-route" action="" method="post">
+        <label for="post-q">Query</label><input id="post-q" type="text" name="q">
+        <input id="post-submit" type="submit" value="search">
+      </form>
+      <form id="override-route" action="" method="get">
+        <label for="override-q">Query</label><input id="override-q" type="text" name="q">
+        <button id="override-submit" type="submit" formmethod="get" formtarget="_blank">Search</button>
+      </form>
+      <form id="external-field" action="" method="get">
+        <label for="external-q">Query</label><input id="external-q" type="text" name="q">
+        <input id="external-submit" type="submit" value="search">
+      </form>
+      <input form="external-field" type="text" name="other" value="extra">
+      <form id="aria-disabled-extra" action="" method="get">
+        <label for="aria-q">Query</label><input id="aria-q" type="text" name="q">
+        <input type="text" name="extra" aria-disabled="true"><input id="aria-submit" type="submit" value="search">
+      </form>
+      <form id="image-submit" action="" method="get">
+        <label for="image-q">Query</label><input id="image-q" type="text" name="q">
+        <input id="image-submit-button" type="image" alt="search" value="search">
+      </form>
+      <form id="dirname-extra" action="" method="get">
+        <label for="dirname-q">Query</label><input id="dirname-q" type="text" name="q" dirname="q.dir">
+        <input id="dirname-submit" type="submit" value="search">
+      </form>`);
+    const backend = createBrowserBackend(page);
+    const frame = await backend.observe({ view: "controls" });
+    const positive = frame.controls.find((control) => control.name === "search" && control.filterAction === true);
+    assert.ok(positive, "input submit value should provide its static button caption");
+    assert.equal(positive.effect, "read");
+    for (const id of ["hidden-field", "other-route", "post-route", "override-route", "external-field", "aria-disabled-extra", "image-submit", "dirname-extra"]) {
+      const control = frame.controls.find((candidate) => candidate.name?.toLocaleLowerCase() === "search" && candidate.within === id);
+      assert.ok(control, `${id} submitter should be observed`);
+      assert.equal(control.filterAction, false, `${id} must not be a bounded search`);
+    }
+    const publicSession = createDeskSession(createBrowserBackend(page));
+    const publicObservation = await publicSession.observe();
+    const publicSearch = publicObservation.controls.find((control) => control.name?.toLocaleLowerCase() === "search" && control.effect === "read");
+    assert.ok(publicSearch);
+    assert.equal(publicSearch.effect, "read");
+    await publicSession.close();
+    await backend.close();
+    return { skipped: false };
+  });
+  if (result.skipped) t.skip("No installed Edge/Chrome/Chromium executable");
+});

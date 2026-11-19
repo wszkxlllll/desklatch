@@ -285,7 +285,7 @@ export function createRawCollectionScript() {
         if (type === "checkbox") return "checkbox";
         if (type === "radio") return "radio";
         if (type === "range") return "slider";
-        if (["button", "submit", "reset"].includes(type)) return "button";
+        if (["button", "submit", "reset", "image"].includes(type)) return "button";
         if (type === "search") return "searchbox";
         return "textbox";
       }
@@ -320,6 +320,11 @@ export function createRawCollectionScript() {
       if (element instanceof HTMLImageElement && element.alt) return text(element.alt);
       const title = attr(element, "title");
       if (title) return text(title);
+      if (element instanceof HTMLInputElement) {
+        const inputType = element.type.toLocaleLowerCase();
+        if (["button", "submit", "reset"].includes(inputType)) return text(element.value) || undefined;
+        if (inputType === "image") return text(element.alt) || undefined;
+      }
       const placeholder = attr(element, "placeholder");
       if (placeholder) return text(placeholder);
       const tag = element.tagName.toLocaleLowerCase();
@@ -330,6 +335,43 @@ export function createRawCollectionScript() {
       if (attr(element, "type")?.toLocaleLowerCase() === "password") return true;
       const fields = [attr(element, "name"), attr(element, "id"), attr(element, "autocomplete"), attr(element, "aria-label"), name, ...labels].filter(Boolean).join(" ").toLocaleLowerCase();
       return protectedPattern.test(fields) || protectedExtras.some((value) => value && fields.includes(value));
+    };
+    const plainGetSearchStructure = (form: HTMLFormElement, submitter: HTMLElement): boolean => {
+      const method = (form.getAttribute("method") || "get").toLocaleLowerCase();
+      if (method !== "get" || submitter.hasAttribute("formmethod") || submitter.hasAttribute("formtarget")) return false;
+      const submitterType = attr(submitter, "type")?.toLocaleLowerCase() || "";
+      if (submitterType === "image" || submitter.hasAttribute("dirname")) return false;
+      if (submitter.hasAttribute("name")) return false;
+      const target = (form.getAttribute("target") || document.querySelector("base")?.getAttribute("target") || "").toLocaleLowerCase();
+      if (target && target !== "_self") return false;
+      try {
+        const destination = new URL(attr(submitter, "formaction") || attr(form, "action") || document.URL, document.baseURI);
+        const current = new URL(document.URL);
+        if (destination.origin !== current.origin || destination.protocol !== current.protocol || destination.host !== current.host || destination.pathname !== current.pathname) return false;
+      } catch {
+        return false;
+      }
+      const fields = Array.from(form.elements).filter((field): field is HTMLElement => field instanceof HTMLElement);
+      if (fields.some((field) => field.hasAttribute("dirname"))) return false;
+      const successful = fields.filter((field) => {
+        if (field === submitter || !attr(field, "name") || field.hasAttribute("disabled")) return false;
+        const type = attr(field, "type")?.toLocaleLowerCase() || "";
+        if (["submit", "image", "button", "reset"].includes(type)) return false;
+        if (["checkbox", "radio"].includes(type) && !(field as HTMLInputElement).checked) return false;
+        return true;
+      });
+      const queryNames = new Set(["q", "query", "search", "term", "keyword", "keywords", "search_query", "searchterm"]);
+      const queryFields = successful.filter((field) => {
+        const type = attr(field, "type")?.toLocaleLowerCase() || "text";
+        if (!(field instanceof HTMLInputElement) || !["text", "search"].includes(type)) return false;
+        const labels = labelsFor(field);
+        const accessible = nameFor(field, labels);
+        const explicitAccessible = attr(field, "aria-label") || (attr(field, "aria-labelledby")?.split(/\s+/u).map((id) => document.getElementById(id)?.textContent || "").join(" ")) || labels.join(" ");
+        const named = text(attr(field, "name")).normalize("NFKC").toLocaleLowerCase();
+        const accessibleName = text(explicitAccessible).normalize("NFKC").toLocaleLowerCase();
+        return !isProtected(field, accessible, labels) && queryNames.has(named) && /\b(search|query|keyword|term)\b|\u641c\u7d22|\u67e5\u8be2/iu.test(accessibleName);
+      });
+      return successful.length === 1 && queryFields.length === 1;
     };
     const nearestWithin = (element: HTMLElement): { name?: string; keys: string[] } => {
       let current: HTMLElement | null = element.parentElement;
@@ -372,7 +414,7 @@ export function createRawCollectionScript() {
         (form?.getAttribute("role")?.toLocaleLowerCase() === "search" ? genericSearchStructure : null);
       let boundedNativeSearch = false;
       if (formSubmitter && nativeForm && (attr(element, "formmethod") || attr(nativeForm, "method") || "get").toLocaleLowerCase() === "get") {
-        const targetName = (attr(element, "formtarget") || attr(nativeForm, "target") || "").toLocaleLowerCase();
+        const targetName = (attr(element, "formtarget") || attr(nativeForm, "target") || document.querySelector("base")?.getAttribute("target") || "").toLocaleLowerCase();
         if (!targetName || targetName === "_self") {
           try {
             const destination = new URL(attr(element, "formaction") || attr(nativeForm, "action") || document.URL, document.baseURI);
@@ -383,9 +425,10 @@ export function createRawCollectionScript() {
           }
         }
       }
+      const plainSelfSearch = Boolean(formSubmitter && nativeForm && boundedNativeSearch && plainGetSearchStructure(nativeForm, element));
       const filterAction = Boolean(
         searchScope && ["button", "link"].includes(role) && canonicalName && searchNames.has(canonicalName) &&
-        (formSubmitter ? Boolean(boundedNativeSearch && nativeSearchStructure) : Boolean(genericSearchStructure)),
+        (formSubmitter ? Boolean((boundedNativeSearch && nativeSearchStructure) || plainSelfSearch) : Boolean(genericSearchStructure)),
       );
       const singleLineInput = element instanceof HTMLInputElement && ["text", "search", "email", "url", "tel", "password", "number"].includes(element.type.toLocaleLowerCase()) && !element.disabled && !element.readOnly;
       const enterMaySubmit = Boolean(singleLineInput && nativeForm);
