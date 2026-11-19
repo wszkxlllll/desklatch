@@ -80,6 +80,50 @@ test("captures only verified selector steps and substitutes different parameters
   assert.equal(JSON.stringify(store.load()).includes("new-value"), false);
 });
 
+test("v1 binds the expected readback to the same selector and original payload", async () => {
+  const fake = fakeSession();
+  const reuse = createVerifiedStepReuse({ session: fake.session });
+  const crossField = {
+    steps: [{
+      kind: "type",
+      target: { role: "textbox", name: "Title" },
+      text: "same-value",
+      expect: { target: { role: "textbox", name: "Notes" }, valueEquals: "same-value" },
+    }],
+  };
+  const crossResult = await reuse.act(crossField);
+  await assert.rejects(() => reuse.remember("cross-field", crossField, crossResult, {
+    parameters: [{ name: "value", paths: ["steps.0.text", "steps.0.expect.valueEquals"] }],
+  }), ReuseValidationError);
+
+  const unequalOriginals = {
+    steps: [{
+      kind: "setValue",
+      target: { role: "textbox", name: "Title" },
+      value: "actual-value",
+      expect: { target: { role: "textbox", name: "Title" }, valueEquals: "different-value" },
+    }],
+  };
+  const unequalResult = await reuse.act(unequalOriginals);
+  await assert.rejects(() => reuse.remember("unequal-originals", unequalOriginals, unequalResult, {
+    parameters: [{ name: "value", paths: ["steps.0.value", "steps.0.expect.valueEquals"] }],
+  }), ReuseValidationError);
+
+  const reversedKeys = {
+    steps: [{
+      kind: "type",
+      target: { name: "Title", role: "textbox" },
+      text: "reversed-order",
+      expect: { valueEquals: "reversed-order", target: { role: "textbox", name: "Title" } },
+    }],
+  };
+  const reversedResult = await reuse.act(reversedKeys);
+  const reversedRecord = await reuse.remember("reversed-selector-keys", reversedKeys, reversedResult, {
+    parameters: [{ name: "value", paths: ["steps.0.text", "steps.0.expect.valueEquals"] }],
+  });
+  assert.equal(reversedRecord.key, "reversed-selector-keys");
+});
+
 test("context, coverage, and parameters fail closed without invoking act", async () => {
   const fake = fakeSession();
   const reuse = createVerifiedStepReuse({ session: fake.session });
@@ -261,4 +305,3 @@ test("recommended per-key stores preserve unrelated captures from concurrent reu
   ]);
   assert.deepEqual((await leftReuse.list()).map((record) => record.key).sort(), ["left", "right"]);
 });
-

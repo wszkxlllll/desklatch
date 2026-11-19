@@ -2,6 +2,7 @@ import type {
   ActionKind,
   ActRequest,
   Control,
+  DocumentRead,
   Delivery,
   DesktopBackend,
   Dispatch,
@@ -91,7 +92,7 @@ const DEFAULT_MAX_TEXT_LENGTH = 16_384;
 const DEFAULT_MAX_SCROLL_AMOUNT = 100;
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_APPROVAL_TIMEOUT_MS = 30_000;
-const OBSERVATION_VIEWS: readonly View[] = ["controls", "image", "both"];
+const OBSERVATION_VIEWS: readonly View[] = ["controls", "image", "both", "document"];
 
 /**
  * Construct an execution-only desktop session. The session contains no provider
@@ -104,6 +105,10 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
   }
 
   const allowModelImages = options.allowModelImages === true;
+  const backendDocumentText = (backend as DesktopBackend & { readonly allowDocumentText?: boolean }).allowDocumentText === true;
+  // The model delivery gate is an intersection: an explicit session grant
+  // cannot make a native/unsupported backend advertise document text.
+  const allowModelDocumentText = backendDocumentText && options.allowModelDocumentText === true;
   const policy = options.policy ?? defaultRiskPolicy;
   const maxSteps = options.maxSteps ?? DEFAULT_MAX_STEPS;
   const maxTextLength = options.maxTextLength ?? DEFAULT_MAX_TEXT_LENGTH;
@@ -128,6 +133,7 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
 
   const observationRegistry = new ObservationRegistry({
     allowModelImages,
+    allowModelDocumentText,
     grantedAction,
     refsGranted: effectiveCapabilities.some((capability) => capability.targets.includes("ref")),
   });
@@ -247,12 +253,13 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
   }
 
   async function observeInternal(
-    optionsForBackend: { view: View; where?: Selector; signal?: AbortSignal },
+    optionsForBackend: { view: View; where?: Selector; read?: DocumentRead; signal?: AbortSignal },
     exposed: boolean,
+    documentRequested = false,
   ): Promise<StoredObservation> {
     const frame = await awaitAbortable(backend.observe(optionsForBackend), optionsForBackend.signal ?? new AbortController().signal);
     if (!isFrame(frame)) throw new Error("invalid_frame");
-    return observationRegistry.remember(frame, exposed, active?.pinnedObservations);
+    return observationRegistry.remember(frame, exposed, active?.pinnedObservations, documentRequested);
   }
 
   function isFrame(value: unknown): value is Frame {
@@ -685,7 +692,11 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
             if (pending.timer) clearTimeout(pending.timer);
             pending.settle(syncDecision);
             if (syncDecision === "deny") {
-              return stoppedResult(request, index, "approval_denied", receipts, step.kind);
+              const result = stoppedResult(request, index, "approval_denied", receipts, step.kind);
+              const requestId = pending.request.requestId;
+              completedApprovals.set(requestId, { ...result, requestId });
+              releasePendingRisk(pending);
+              return result;
             }
             let verified: { prepared?: PreparedStep; code?: string; candidates?: readonly Control[]; candidateObservation?: StoredObservation };
             try {
@@ -806,16 +817,24 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
 
   async function observe(optionsForObserve: DeskObserveOptions = {}): Promise<DeskObservation> {
     if (closed) throw new Error("closed");
-    const view = optionsForObserve.view ?? "controls";
+    const documentOnly = optionsForObserve.view === "document"
+      || (optionsForObserve.view === undefined && optionsForObserve.read !== undefined && !optionsForObserve.where);
+    if (documentOnly && optionsForObserve.where) throw new Error("invalid_document_scope");
+    if (documentOnly && !allowModelDocumentText) throw new Error("document_delivery_not_authorized");
+    const view = documentOnly ? "document" : optionsForObserve.view ?? "controls";
     if (!OBSERVATION_VIEWS.includes(view)) throw new Error("invalid_view");
-    const backendView: View = view !== "controls" && !allowModelImages ? "controls" : view;
+    const backendView: View = view === "document" ? "document" : view !== "controls" && !allowModelImages ? "controls" : view;
+    const read = allowModelDocumentText && !optionsForObserve.where
+      ? optionsForObserve.read ?? (documentOnly ? "document" : undefined)
+      : undefined;
     const merged = mergeSignals([globalAbort.signal, optionsForObserve.signal]);
     try {
       const stored = await observeInternal({
         view: backendView,
         ...(optionsForObserve.where ? { where: { ...optionsForObserve.where } } : {}),
+        ...(read ? { read } : {}),
         signal: merged.signal,
-      }, true);
+      }, true, read !== undefined);
       return observationRegistry.publicObservation(stored, view);
     } catch {
       throw new Error("observe_failed");
@@ -881,6 +900,7 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
   return Object.freeze({
     capabilities: effectiveCapabilities,
     allowModelImages,
+    allowModelDocumentText,
     limits: sessionLimits,
     observe,
     act,

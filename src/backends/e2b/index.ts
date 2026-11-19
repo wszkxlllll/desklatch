@@ -39,6 +39,10 @@ function positiveTimeout(value: number): number {
   return value;
 }
 
+const MAX_TRANSPORT_QUEUE = 1_024;
+const MAX_BATCH_MESSAGES = 32;
+const MAX_BATCH_BYTES = 256 * 1_024;
+
 function bounded<T>(work: Promise<T>, ms: number, signal?: AbortSignal): Promise<T> {
   return new Promise((resolve, reject) => {
     let timer: ReturnType<typeof setTimeout> | undefined = setTimeout(() => {
@@ -82,11 +86,67 @@ export async function openE2BManagedPage(guest: E2BGuest, options: E2BBrowserOpt
   let ended = false;
   let writing = Promise.resolve();
   let queued = 0;
+  let pendingData = "";
+  let pendingCount = 0;
+  let pendingBytes = 0;
+  const readyBatches: Array<{ data: string; count: number }> = [];
+  let activeBatch: { data: string; count: number } | undefined;
+  let draining = false;
   let closing: Promise<void> | undefined;
+  const discardQueued = (): void => {
+    pendingData = "";
+    pendingCount = 0;
+    pendingBytes = 0;
+    readyBatches.length = 0;
+    queued = activeBatch?.count ?? 0;
+  };
   const finish = (reason?: string) => {
     if (ended) return;
     ended = true;
+    discardQueued();
     transport.onclose?.(reason);
+  };
+  const flushPending = (): void => {
+    if (pendingCount === 0) return;
+    readyBatches.push({ data: pendingData, count: pendingCount });
+    pendingData = "";
+    pendingCount = 0;
+    pendingBytes = 0;
+  };
+  const nextBatch = (): { data: string; count: number } | undefined => {
+    const ready = readyBatches.shift();
+    if (ready) return ready;
+    if (pendingCount === 0) return undefined;
+    const pending = { data: pendingData, count: pendingCount };
+    pendingData = "";
+    pendingCount = 0;
+    pendingBytes = 0;
+    return pending;
+  };
+  const drain = (): void => {
+    if (draining || ended || !handle) return;
+    const batch = nextBatch();
+    if (!batch) return;
+    const current = handle;
+    activeBatch = batch;
+    draining = true;
+    writing = writing.then(async () => {
+      if (!ended) await current.sendStdin(batch.data, { requestTimeoutMs: startup });
+    }).catch(() => finish("guest_transport_lost")).finally(() => {
+      queued = Math.max(0, queued - batch.count);
+      activeBatch = undefined;
+      draining = false;
+      if (!ended) drain();
+    });
+  };
+  const enqueue = (line: string): void => {
+    const bytes = Buffer.byteLength(line, "utf8");
+    if (pendingCount > 0 && (pendingCount >= MAX_BATCH_MESSAGES || pendingBytes + bytes > MAX_BATCH_BYTES)) flushPending();
+    pendingData += line;
+    pendingCount += 1;
+    pendingBytes += bytes;
+    if (pendingCount >= MAX_BATCH_MESSAGES || pendingBytes >= MAX_BATCH_BYTES) flushPending();
+    drain();
   };
   async function retire(): Promise<void> {
     if (!handle) return;
@@ -101,12 +161,10 @@ export async function openE2BManagedPage(guest: E2BGuest, options: E2BBrowserOpt
   const transport: ConnectOverCDPTransport = {
     send(message) {
       if (ended || !handle) throw Error("guest_transport_closed");
-      if (++queued > 1024) { finish("guest_queue_full"); return; }
+      if (queued >= MAX_TRANSPORT_QUEUE) { finish("guest_queue_full"); return; }
+      queued += 1;
       const line = JSON.stringify(message) + "\n";
-      const current = handle;
-      writing = writing.then(() => {
-        if (!ended) return current.sendStdin(line, { requestTimeoutMs: startup });
-      }).catch(() => finish("guest_transport_lost")).finally(() => { queued--; });
+      enqueue(line);
     },
     close() { finish(); closing ??= retire(); },
   };
@@ -177,6 +235,7 @@ export async function createE2BBrowserBackend(guest: E2BGuest, options: E2BBrows
       actionTimeoutMs: options.browser?.actionTimeoutMs ?? 15_000 });
     // Preserve method receivers; the caller owns the enclosing sandbox.
     return {
+      allowDocumentText: scoped.allowDocumentText,
       capabilities: scoped.capabilities,
       observe: o => scoped.observe(o),
       ...(scoped.hitTest ? { hitTest: (f, p, s) => scoped.hitTest!(f, p, s) } : {}),

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { ActionKind, Control, Frame, View } from "../contracts.js";
+import type { ActionKind, Control, DocumentObservation, Frame, View } from "../contracts.js";
 import type { CandidateSummary, ControlObservation, DeskObservation } from "./session-types.js";
 
 export interface StoredObservation {
@@ -9,10 +9,12 @@ export interface StoredObservation {
   revision: number;
   exposed: boolean;
   pinned: boolean;
+  documentRequested: boolean;
 }
 
 export interface ObservationRegistryOptions {
   allowModelImages: boolean;
+  allowModelDocumentText: boolean;
   grantedAction: (kind: ActionKind) => boolean;
   refsGranted: boolean;
 }
@@ -38,7 +40,7 @@ export class ObservationRegistry {
 
   public constructor(private readonly options: ObservationRegistryOptions) {}
 
-  public remember(frame: Frame, exposed: boolean, pinnedSet?: Set<StoredObservation>): StoredObservation {
+  public remember(frame: Frame, exposed: boolean, pinnedSet?: Set<StoredObservation>, documentRequested = false): StoredObservation {
     const observationId = `obs-${this.namespace}-${++this.sequence}`;
     if (exposed) {
       for (const [id, old] of this.observations) {
@@ -60,6 +62,7 @@ export class ObservationRegistry {
       revision: ++this.revision,
       exposed,
       pinned: false,
+      documentRequested,
     };
     this.observations.set(observationId, stored);
     if (pinnedSet && !exposed) this.pin(stored, pinnedSet);
@@ -100,7 +103,8 @@ export class ObservationRegistry {
       complete: stored.frame.complete,
       controls,
     };
-    if (view !== "controls" && this.options.allowModelImages && stored.frame.image) result.image = stored.frame.image;
+    if ((view === "image" || view === "both") && this.options.allowModelImages && stored.frame.image) result.image = stored.frame.image;
+    if (stored.documentRequested && this.options.allowModelDocumentText && stored.frame.document) result.document = this.publicDocument(stored.frame.document);
     return result;
   }
 
@@ -143,7 +147,42 @@ export class ObservationRegistry {
     return result;
   }
 
+  private publicDocument(document: DocumentObservation): DocumentObservation {
+    const chunks: Array<DocumentObservation["chunks"][number]> = [];
+    let usedChars = 0;
+    for (const chunk of document.chunks) {
+      if (chunks.length >= 256 || usedChars >= 64_000) break;
+      const text = sanitizeText(chunk.text, Math.min(4_096, 64_000 - usedChars));
+      if (!text) continue;
+      chunks.push({ text, index: chunks.length });
+      usedChars += text.length;
+    }
+    const sourceUrl = sanitizeSourceUrl(document.sourceUrl);
+    const truncated = document.truncated || chunks.length < document.chunks.length || usedChars < document.chunks.reduce((sum, chunk) => sum + chunk.text.length, 0);
+    return {
+      kind: "page_text",
+      chunks,
+      complete: document.complete && !truncated,
+      truncated,
+      viewportOnly: document.viewportOnly === true,
+      totalChars: Math.max(0, Math.min(64_000, Math.floor(document.totalChars))),
+      totalChunks: Math.max(0, Math.min(256, Math.floor(document.totalChunks))),
+      ...(sourceUrl ? { sourceUrl } : {}),
+    };
+  }
+
   private makeRef(observationId: string, index: number): string {
     return `${observationId}-c${index}`;
+  }
+}
+
+function sanitizeSourceUrl(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return undefined;
+    return `${url.origin}${url.pathname || "/"}`.slice(0, 2_048);
+  } catch {
+    return undefined;
   }
 }

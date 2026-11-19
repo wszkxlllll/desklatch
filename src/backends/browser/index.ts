@@ -4,6 +4,8 @@ import type {
   ActionKind,
   Capability,
   Control,
+  DocumentObservation,
+  DocumentRead,
   Dispatch,
   Frame,
   FrameImage,
@@ -16,6 +18,7 @@ import {
   area,
   boundedInteger,
   containsPoint,
+  createDocumentTextScript,
   createRawCollectionScript,
   hasState,
   isPoint,
@@ -37,17 +40,24 @@ import {
   type BrowserBackendOptions,
   type BrowserDelivery,
   type BrowserElementHandleLike,
+  type BrowserLocatorLike,
   type BrowserPageLike,
   type FrameState,
   type InternalControl,
   type RawControl,
   DEFAULT_ACTION_TIMEOUT,
+  DEFAULT_DOCUMENT_CHUNK_LIMIT,
+  DEFAULT_DOCUMENT_CHUNK_SIZE,
+  DEFAULT_DOCUMENT_TEXT_LIMIT,
   DEFAULT_OBSERVE_LIMIT,
   DEFAULT_SEARCH_LIMIT,
   DEFAULT_SEARCH_TIMEOUT,
   DEFAULT_SETTLE,
   MAX_SCROLL_AMOUNT,
   MAX_STEP_TEXT_LENGTH,
+  MAX_DOCUMENT_CHUNK_LIMIT,
+  MAX_DOCUMENT_CHUNK_SIZE,
+  MAX_DOCUMENT_TEXT_LIMIT,
 } from "./types.js";
 
 export type { BrowserBackend, BrowserBackendOptions, BrowserDelivery, BrowserPageLike, BrowserRiskSignal } from "./types.js";
@@ -67,6 +77,21 @@ interface CandidateResult {
   pointOccluded?: boolean;
   handle?: BrowserElementHandleLike;
   bindingMissing?: boolean;
+}
+
+interface DocumentRouteAttestation {
+  before: { href: string; baseURI: string; documentToken: string };
+  after: { href: string; baseURI: string; documentToken: string };
+  sameDocument: boolean;
+}
+
+interface DocumentTextEvaluation {
+  chunks: string[];
+  totalChars: number;
+  totalChunks: number;
+  truncated: boolean;
+  attestation?: DocumentRouteAttestation;
+  routeChanged?: boolean;
 }
 
 function targetOf(step: Step): Target | undefined {
@@ -91,6 +116,71 @@ function isFocusTarget(target: Target | undefined): target is { focusFromStep: n
 
 function abortIfNeeded(signal?: AbortSignal): void {
   if (signal?.aborted) throw new BrowserBackendError("aborted");
+}
+
+async function disposeUnownedHandles(handles: readonly BrowserElementHandleLike[]): Promise<void> {
+  const unique = new Set(handles);
+  await Promise.all([...unique].map(async (handle) => {
+    try { await handle.dispose?.(); } catch { /* a detached/closed page is already disposed */ }
+  }));
+}
+
+/**
+ * Acquire an attached locator snapshot without Playwright's strict locator
+ * auto-wait. A missing/failed snapshot is intentionally represented as
+ * `undefined`; callers must omit the corresponding public binding.
+ */
+async function snapshotLocatorHandles(locator: BrowserLocatorLike, signal?: AbortSignal): Promise<BrowserElementHandleLike[] | undefined> {
+  let handles: BrowserElementHandleLike[] = [];
+  try {
+    abortIfNeeded(signal);
+    if (locator.elementHandles) {
+      handles = (await locator.elementHandles()) ?? [];
+    } else if (locator.elementHandle) {
+      // Legacy scoped adapters may expose only the singular API. Require a
+      // unique count first and keep this compatibility path tightly bounded;
+      // never call a strict singular lookup for duplicate matches.
+      const count = await locator.count();
+      abortIfNeeded(signal);
+      if (count !== 1) return [];
+      const handle = await locator.elementHandle({ timeout: 1 });
+      if (handle) handles = [handle];
+    }
+    abortIfNeeded(signal);
+    return handles;
+  } catch (error) {
+    await disposeUnownedHandles(handles);
+    if (signal?.aborted) throw new BrowserBackendError("aborted");
+    return undefined;
+  }
+}
+
+async function snapshotSelectors(
+  page: BrowserPageLike,
+  selectors: readonly string[],
+  signal?: AbortSignal,
+): Promise<Map<string, BrowserElementHandleLike[] | undefined>> {
+  const unique = [...new Set(selectors)];
+  const results = await Promise.allSettled(unique.map(async (selector) => {
+    try {
+      return [selector, await snapshotLocatorHandles(page.locator(selector), signal)] as const;
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      return [selector, undefined] as const;
+    }
+  }));
+  const snapshots = new Map<string, BrowserElementHandleLike[] | undefined>();
+  for (let index = 0; index < unique.length; index += 1) {
+    const result = results[index];
+    snapshots.set(unique[index], result?.status === "fulfilled" ? result.value[1] : undefined);
+  }
+  try {
+    abortIfNeeded(signal);
+  } catch (error) {
+    await disposeUnownedHandles([...snapshots.values()].flatMap((handles) => handles ?? []));
+    throw error;
+  }
+  return snapshots;
 }
 
 function errorCode(error: unknown, fallback: string): string {
@@ -120,6 +210,40 @@ function authorizedOrigin(url: string, origins: readonly string[] | undefined, a
   } catch {
     return false;
   }
+}
+
+function publicSourceUrl(value: string): string | undefined {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return undefined;
+    // Deliberately omit credentials, query parameters, and fragments. The
+    // remaining origin/path is a bounded citation hint, not page navigation.
+    const result = `${url.origin}${url.pathname || "/"}`;
+    return result.slice(0, 2_048);
+  } catch {
+    return undefined;
+  }
+}
+
+function documentReadBounds(read: DocumentRead | undefined, defaults: {
+  maxChars: number;
+  maxChunks: number;
+  chunkSize: number;
+}): {
+  maxChars: number;
+  maxChunks: number;
+  chunkSize: number;
+  viewportOnly: boolean;
+} | undefined {
+  if (read === undefined) return undefined;
+  const requested = read === "document" ? {} : read;
+  if (!requested || (requested.kind !== undefined && requested.kind !== "document")) throw new BrowserBackendError("invalid_document_read");
+  return {
+    maxChars: boundedInteger(requested.maxChars, defaults.maxChars, MAX_DOCUMENT_TEXT_LIMIT),
+    maxChunks: boundedInteger(requested.maxChunks, defaults.maxChunks, MAX_DOCUMENT_CHUNK_LIMIT),
+    chunkSize: boundedInteger(requested.chunkSize, defaults.chunkSize, MAX_DOCUMENT_CHUNK_SIZE),
+    viewportOnly: requested.viewportOnly === true,
+  };
 }
 
 function riskFor(step: Step, control: InternalControl): import("./types.js").BrowserRiskSignal {
@@ -216,9 +340,14 @@ export function createBrowserBackend(page: Page | BrowserPageLike, options: Brow
   const authorizedOrigins = options.authorizedOrigins === undefined ? undefined : Object.freeze([...options.authorizedOrigins]);
   const allowBlank = options.allowBlank !== false;
   const allowImages = options.allowImages === true;
+  const allowDocumentText = options.allowDocumentText === true;
+  const documentTextLimit = boundedInteger(options.documentTextLimit, DEFAULT_DOCUMENT_TEXT_LIMIT, MAX_DOCUMENT_TEXT_LIMIT);
+  const documentChunkLimit = boundedInteger(options.documentChunkLimit, DEFAULT_DOCUMENT_CHUNK_LIMIT, MAX_DOCUMENT_CHUNK_LIMIT);
+  const documentChunkSize = boundedInteger(options.documentChunkSize, DEFAULT_DOCUMENT_CHUNK_SIZE, MAX_DOCUMENT_CHUNK_SIZE);
   const rootSelector = options.rootSelector;
   const scopePrefix = options.scope ?? "browser";
   const rawScript = createRawCollectionScript();
+  const documentTextScript = createDocumentTextScript();
   const privateState: BrowserPrivateState = { frames: new WeakMap() };
   const stableIds = new Map<string, string>();
   const usedIds = new Map<string, string>();
@@ -292,33 +421,103 @@ export function createBrowserBackend(page: Page | BrowserPageLike, options: Brow
     }
     const controls: InternalControl[] = [];
     const seen = new Map<string, number>();
-    for (const raw of result.controls.slice(0, limit)) {
-      const base = `${raw.stableKind}:${raw.key}`;
-      const duplicate = seen.get(base) ?? 0;
-      seen.set(base, duplicate + 1);
-      const stableKey = duplicate ? `${base}:duplicate:${raw.path}` : base;
-      let id = stableIds.get(stableKey);
-      if (!id) {
-        id = `${scope}:control:${stableHash(stableKey)}`;
-        if (usedIds.has(id) && usedIds.get(id) !== stableKey) id = `${scope}:control:${stableHash(`${stableKey}:${raw.path}`)}`;
-        stableIds.set(stableKey, id);
-        usedIds.set(id, stableKey);
-      }
-      let enrichedRaw = raw;
-      if (raw.approvalCandidate) {
-        const locator = browserPage.locator(selectorFor({ path: raw.path, key: raw.key, tagName: raw.tagName, stableKind: raw.stableKind }));
-        let handle: BrowserElementHandleLike | null | undefined;
-        try {
-          if (await locator.count() === 1) handle = await locator.elementHandle?.();
-          const approvalContext = handle?.evaluate ? await handle.evaluate(readApprovalContext, undefined) : undefined;
-          if (approvalContext) enrichedRaw = { ...raw, approvalContext };
-        } finally {
-          await handle?.dispose?.();
+    let complete = result.total <= limit;
+    const boundedRaw = result.controls.slice(0, limit);
+    const approvalRaw = boundedRaw.filter((raw) => raw.approvalCandidate);
+    const approvalSelectors = approvalRaw.map((raw) => selectorFor({ path: raw.path, key: raw.key, tagName: raw.tagName, stableKind: raw.stableKind }));
+    const approvalSnapshots = await snapshotSelectors(browserPage, approvalSelectors, signal);
+    const approvalGroups = new Map<string, number>();
+    for (const selector of approvalSelectors) approvalGroups.set(selector, (approvalGroups.get(selector) ?? 0) + 1);
+    try {
+      for (const raw of boundedRaw) {
+        abortIfNeeded(signal);
+        const base = `${raw.stableKind}:${raw.key}`;
+        const duplicate = seen.get(base) ?? 0;
+        seen.set(base, duplicate + 1);
+        const stableKey = duplicate ? `${base}:duplicate:${raw.path}` : base;
+        let id = stableIds.get(stableKey);
+        if (!id) {
+          id = `${scope}:control:${stableHash(stableKey)}`;
+          if (usedIds.has(id) && usedIds.get(id) !== stableKey) id = `${scope}:control:${stableHash(`${stableKey}:${raw.path}`)}`;
+          stableIds.set(stableKey, id);
+          usedIds.set(id, stableKey);
         }
+        let enrichedRaw = raw;
+        if (raw.approvalCandidate) {
+          const selector = selectorFor({ path: raw.path, key: raw.key, tagName: raw.tagName, stableKind: raw.stableKind });
+          const matches = approvalSnapshots.get(selector);
+          let approvalContext: { token: string; summary?: string } | undefined;
+          if (approvalGroups.get(selector) === 1 && matches?.length === 1 && matches[0].evaluate) {
+            try {
+              approvalContext = await matches[0].evaluate(readApprovalContext, undefined);
+              abortIfNeeded(signal);
+            } catch {
+              if (signal?.aborted) throw new BrowserBackendError("aborted");
+              approvalContext = undefined;
+            }
+          }
+          // A consequential form control without a unique, material binding is
+          // not safe to expose as an actionable ref. Keep the read useful by
+          // omitting only this control and reporting an incomplete snapshot.
+          if (!approvalContext) {
+            complete = false;
+            continue;
+          }
+          enrichedRaw = { ...raw, approvalContext };
+        }
+        controls.push(toControl(enrichedRaw, id, stableKey));
       }
-      controls.push(toControl(enrichedRaw, id, stableKey));
+    } finally {
+      await disposeUnownedHandles([...approvalSnapshots.values()].flatMap((handles) => handles ?? []));
     }
-    return { controls, complete: result.total <= limit };
+    return { controls, complete };
+  }
+
+  async function readDocument(read: DocumentRead, signal?: AbortSignal): Promise<DocumentObservation> {
+    ensureUsable();
+    abortIfNeeded(signal);
+    if (!allowDocumentText) throw new BrowserBackendError("document_not_allowed");
+    const bounds = documentReadBounds(read, { maxChars: documentTextLimit, maxChunks: documentChunkLimit, chunkSize: documentChunkSize });
+    if (!bounds) throw new BrowserBackendError("invalid_document_read");
+    const routeBefore = pageUrl(browserPage);
+    const scopeBefore = scope;
+    if (!authorizedOrigin(routeBefore, authorizedOrigins, allowBlank)) throw new BrowserBackendError("unauthorized_origin");
+    let result: DocumentTextEvaluation;
+    try {
+      result = await browserPage.evaluate(documentTextScript, { rootSelector, expectedHref: routeBefore, ...bounds });
+    } catch (error) {
+      throw new BrowserBackendError(errorCode(error, "document_read_failed"));
+    }
+    abortIfNeeded(signal);
+    const routeAfter = pageUrl(browserPage);
+    const attestation = result.attestation;
+    const routeChanged = result.routeChanged
+      || scope !== scopeBefore
+      || routeBefore !== routeAfter
+      || !attestation
+      || !attestation.sameDocument
+      || attestation.before.href !== routeBefore
+      || attestation.after.href !== routeAfter
+      || attestation.before.baseURI !== attestation.after.baseURI
+      || attestation.before.documentToken !== attestation.after.documentToken;
+    if (routeChanged) {
+      // Refresh the backend's generation before refusing so a later caller
+      // cannot accidentally reuse this read's stale scope.
+      try { ensureUsable(); } catch { /* route rejection below is intentional */ }
+      throw new BrowserBackendError("document_route_changed");
+    }
+    if (!authorizedOrigin(routeAfter, authorizedOrigins, allowBlank)) throw new BrowserBackendError("unauthorized_origin");
+    const sourceUrl = publicSourceUrl(routeAfter);
+    return {
+      kind: "page_text",
+      chunks: result.chunks.map((text, index) => ({ text: text.slice(0, bounds.chunkSize), index })),
+      complete: !result.truncated,
+      truncated: result.truncated,
+      viewportOnly: bounds.viewportOnly,
+      totalChars: Math.max(0, Math.floor(result.totalChars)),
+      totalChunks: Math.max(0, Math.floor(result.totalChunks)),
+      ...(sourceUrl ? { sourceUrl } : {}),
+    };
   }
 
   async function locate(selector: Selector, signal?: AbortSignal): Promise<CandidateResult> {
@@ -367,6 +566,21 @@ export function createBrowserBackend(page: Page | BrowserPageLike, options: Brow
     return candidates.length === 1 ? candidates[0] : undefined;
   }
 
+  async function uniqueHandleForSelector(selector: string, signal?: AbortSignal): Promise<BrowserElementHandleLike | undefined> {
+    let matches: BrowserElementHandleLike[] | undefined;
+    try {
+      matches = await snapshotLocatorHandles(browserPage.locator(selector), signal);
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      matches = undefined;
+    }
+    if (!matches || matches.length !== 1) {
+      await disposeUnownedHandles(matches ?? []);
+      return undefined;
+    }
+    return matches[0];
+  }
+
   async function pointTarget(frame: FrameState, point: { x: number; y: number }, signal?: AbortSignal, originFrame = frame): Promise<CandidateResult> {
     if (!isPoint(point)) return { candidates: [] };
     const origin = pointInControl(originFrame, point);
@@ -398,7 +612,7 @@ export function createBrowserBackend(page: Page | BrowserPageLike, options: Brow
     if (isSelectorTarget(target)) {
       const result = await locate(target, dispatch.signal);
       if (result.target) {
-        const handle = (await browserPage.locator(selectorForControl(result.target)).elementHandle?.()) ?? undefined;
+        const handle = await uniqueHandleForSelector(selectorForControl(result.target), dispatch.signal);
         return { ...result, handle, bindingMissing: !handle };
       }
       return result;
@@ -420,40 +634,88 @@ export function createBrowserBackend(page: Page | BrowserPageLike, options: Brow
     }
   }
 
-  async function bindObservedControls(controls: readonly InternalControl[]): Promise<{ controls: InternalControl[]; handles: Map<string, BrowserElementHandleLike> }> {
+  async function bindObservedControls(
+    controls: readonly InternalControl[],
+    signal?: AbortSignal,
+  ): Promise<{ controls: InternalControl[]; handles: Map<string, BrowserElementHandleLike>; complete: boolean }> {
     const rebound: InternalControl[] = [];
     const handles = new Map<string, BrowserElementHandleLike>();
+    let complete = true;
+    const selectorControls = new Map<string, InternalControl[]>();
+    for (const control of controls) {
+      if (control.role === "img" && control.actions.length === 0) continue;
+      const selector = selectorForControl(control);
+      const grouped = selectorControls.get(selector) ?? [];
+      grouped.push(control);
+      selectorControls.set(selector, grouped);
+    }
+    const snapshots = await snapshotSelectors(browserPage, [...selectorControls.keys()], signal);
+    const consumed = new Set<BrowserElementHandleLike>();
+    const pendingIdentityRetains: BrowserElementHandleLike[] = [];
+    const missingKeys = new Set<string>();
     try {
       for (const control of controls) {
+        abortIfNeeded(signal);
         if (control.role === "img" && control.actions.length === 0) { rebound.push(control); continue; }
-        const locator = browserPage.locator(selectorForControl(control));
-        const handle = await locator.elementHandle?.();
-        const previous = identityHandles.get(control.__stableKey);
-        if (!handle) {
-          if (previous) rebound.push(control.id === previous.id ? control : { ...control, id: previous.id });
-          else rebound.push(control);
+        const selector = selectorForControl(control);
+        const group = selectorControls.get(selector) ?? [];
+        const snapshot = snapshots.get(selector);
+        // A selector shared by multiple observed controls or producing a
+        // non-unique/vanished snapshot cannot safely pin any of them.
+        if (group.length !== 1 || !snapshot || snapshot.length !== 1) {
+          complete = false;
+          missingKeys.add(control.__stableKey);
           continue;
         }
+        const handle = snapshot[0];
+        consumed.add(handle);
+        const previous = identityHandles.get(control.__stableKey);
         const sameNode = previous ? await sameDomNode(previous.handle, handle) : false;
+        abortIfNeeded(signal);
         const current = identityHandles.get(control.__stableKey);
         const id = sameNode && current === previous
           ? previous!.id
           : `${scope}:control:${stableHash(`${control.__stableKey}:node:${identitySerial++}`)}`;
-        if (current?.handle !== handle) retainHandle(handle);
+        if (current?.handle !== handle) {
+          retainHandle(handle);
+          pendingIdentityRetains.push(handle);
+        }
         stableIds.set(control.__stableKey, id);
         usedIds.set(id, control.__stableKey);
         const bound = control.id === id ? control : { ...control, id };
         rebound.push(bound);
         retainHandle(handle);
         handles.set(id, handle);
-        identityHandles.delete(control.__stableKey);
-        identityHandles.set(control.__stableKey, { id, handle });
-        if (current && current.handle !== handle) await releaseHandle(current.handle);
       }
     } catch (error) {
       await Promise.all([...handles.values()].map(releaseHandle));
+      await Promise.all(pendingIdentityRetains.map(releaseHandle));
+      await disposeUnownedHandles([...snapshots.values()].flatMap((snapshot) => (snapshot ?? []).filter((handle) => !consumed.has(handle))));
       throw error;
     }
+    // Commit identity changes only after the whole snapshot has been walked;
+    // cancellation cannot leave a partially rebound cache behind.
+    for (const control of controls) {
+      if (control.role === "img" && control.actions.length === 0) continue;
+      const selector = selectorForControl(control);
+      const group = selectorControls.get(selector) ?? [];
+      const snapshot = snapshots.get(selector);
+      const previous = identityHandles.get(control.__stableKey);
+      if (missingKeys.has(control.__stableKey) || group.length !== 1 || !snapshot || snapshot.length !== 1) {
+        if (previous) {
+          identityHandles.delete(control.__stableKey);
+          await releaseHandle(previous.handle);
+        }
+        continue;
+      }
+      const handle = snapshot[0];
+      const bound = rebound.find((candidate) => candidate.__stableKey === control.__stableKey);
+      if (!bound) continue;
+      identityHandles.delete(control.__stableKey);
+      identityHandles.set(control.__stableKey, { id: bound.id, handle });
+      if (previous && previous.handle !== handle) await releaseHandle(previous.handle);
+    }
+    await disposeUnownedHandles([...snapshots.values()].flatMap((snapshot) => (snapshot ?? []).filter((handle) => !consumed.has(handle))));
     while (identityHandles.size > searchLimit) {
       const oldest = identityHandles.keys().next().value as string | undefined;
       if (!oldest) break;
@@ -461,7 +723,7 @@ export function createBrowserBackend(page: Page | BrowserPageLike, options: Brow
       identityHandles.delete(oldest);
       await releaseHandle(entry.handle);
     }
-    return { controls: rebound, handles };
+    return { controls: rebound, handles, complete };
   }
 
   async function releaseHandles(state: FrameState): Promise<void> {
@@ -629,33 +891,45 @@ export function createBrowserBackend(page: Page | BrowserPageLike, options: Brow
   async function observe(request: ObserveOptions): Promise<Frame> {
     ensureUsable();
     abortIfNeeded(request.signal);
-    if (request.view !== "controls" && request.view !== "image" && request.view !== "both") throw new BrowserBackendError("invalid_view");
+    const view = request.view ?? (request.read === "document" && !request.where ? "document" : "controls");
+    if (view !== "controls" && view !== "image" && view !== "both" && view !== "document") throw new BrowserBackendError("invalid_view");
     await wait(settleMs, request.signal);
+    if (view === "document") {
+      if (request.where) throw new BrowserBackendError("document_read_scope");
+      const document = await readDocument(request.read ?? "document", request.signal);
+      const frame: Frame = { scope, controls: [], complete: true, document };
+      const state: FrameState = { scope, controls: new Map(), handles: new Map() };
+      privateState.frames.set(frame, state);
+      retainFrameState(state);
+      return frame;
+    }
     let controls: InternalControl[];
     let complete: boolean;
     let handles: Map<string, BrowserElementHandleLike>;
-    let scanned: InternalControl[];
     if (request.where) {
       const scoped = await locate(request.where as Selector, request.signal);
-      scanned = scoped.all ?? scoped.candidates;
-      const bound = await bindObservedControls(scoped.candidates.filter(visible));
+      const bound = await bindObservedControls(scoped.candidates.filter(visible), request.signal);
       controls = bound.controls;
       handles = bound.handles;
-      complete = scoped.complete ?? false;
+      complete = (scoped.complete ?? false) && bound.complete;
     } else {
       const collected = await collect(observeLimit, request.signal);
-      scanned = collected.controls;
-      const bound = await bindObservedControls(collected.controls.filter(visible));
+      const bound = await bindObservedControls(collected.controls.filter(visible), request.signal);
       controls = bound.controls;
       handles = bound.handles;
-      complete = collected.complete;
+      complete = collected.complete && bound.complete;
     }
     try {
-      const focusedControl = scanned.find(control => control.states.includes("focused"));
+      // Only publish a focus ref when its control survived unique binding.
+      // A vanished/ambiguous focused node must not leak an unpinned ref.
+      const focusedControl = controls.find(control => control.states.includes("focused"));
       const focusId = focusedControl ? (stableIds.get(focusedControl.__stableKey) ?? focusedControl.id)
         : complete ? undefined : await activeId(request.signal);
-      const image = request.view === "controls" ? undefined : await captureImage(request.signal);
-      const frame: Frame = { scope, controls: controls.map(publicControl), complete, ...(focusId ? { focusId } : {}), ...(image ? { image } : {}) };
+      // Document reads are explicit and never run for a selector-scoped
+      // control lookup. This keeps act/expect refreshes prose-free.
+      const document = request.read && !request.where ? await readDocument(request.read, request.signal) : undefined;
+      const image = view === "controls" ? undefined : await captureImage(request.signal);
+      const frame: Frame = { scope, controls: controls.map(publicControl), complete, ...(focusId ? { focusId } : {}), ...(image ? { image } : {}), ...(document ? { document } : {}) };
       const state: FrameState = { scope, controls: new Map(controls.map((control) => [control.id, control])), handles };
       privateState.frames.set(frame, state);
       retainFrameState(state);
@@ -700,5 +974,5 @@ export function createBrowserBackend(page: Page | BrowserPageLike, options: Brow
     { kind: "keypress", targets: ["selector", "ref", "focus"], keys: [...SAFE_KEYS] },
     { kind: "hotkey", targets: ["selector", "ref", "focus"], chords: [["ctrl", "a"], ["Control", "a"], ["meta", "a"], ["Meta", "a"]] },
   ];
-  return Object.freeze({ capabilities, observe, hitTest, dispatch, close });
+  return Object.freeze({ allowDocumentText, capabilities, observe, hitTest, dispatch, close });
 }

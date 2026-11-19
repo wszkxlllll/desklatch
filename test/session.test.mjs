@@ -211,6 +211,23 @@ test("a newly active host approval requirement does not skip OCR revalidation", 
   await session.close();
 });
 
+test("an immediate denial remains final when the host retries the approval", async () => {
+  const backend = makeBackend();
+  let requestId;
+  const session = createDeskSession(backend, {
+    policy: () => ({ decision: "approve", code: "needs_host" }),
+    onApprovalRequested(request) { requestId = request.requestId; return "deny"; },
+  });
+  try {
+    const result = await session.act({ steps: [{ kind: "click", target: { role: "Button", name: "Save" } }] });
+    assert.equal(result.code, "approval_denied");
+    assert.deepEqual(await session.resolveApproval(requestId, "approve"), { ...result, requestId });
+    assert.equal(backend.calls.dispatch.length, 0);
+  } finally {
+    await session.close();
+  }
+});
+
 test("async approval callback and repeated host decisions dispatch once", async () => {
   const backend = makeBackend();
   let release;

@@ -66,10 +66,12 @@ function readLines(child, count) {
   });
 }
 
-async function makeLocalCdpGuest(chromium, executablePath) {
+async function makeLocalCdpGuest(chromium, executablePath, options = {}) {
   const profile = await mkdtemp(join(tmpdir(), "desklatch-e2b-chrome-"));
   const child = spawn(executablePath, [
     "--headless=new",
+    "--no-first-run",
+    "--no-default-browser-check",
     "--disable-gpu",
     "--no-sandbox",
     "--remote-debugging-port=0",
@@ -118,11 +120,12 @@ async function makeLocalCdpGuest(chromium, executablePath) {
   }
   let onStdout;
   let closed = false;
+  const metrics = { sendCalls: 0, sendLines: 0, sendBytes: 0, maxBatchLines: 0 };
   let resolveWait;
   const waitPromise = new Promise((resolve) => { resolveWait = resolve; });
   let resolveReady;
   let rejectReady;
-  let initialTargetInfos;
+  let initialPageUrls;
   const targetReady = new Promise((resolve, reject) => { resolveReady = resolve; rejectReady = reject; });
   const readyTimer = setTimeout(() => rejectReady(Error("local_cdp_target_timeout")), 5000);
   let targetProbeId = 1;
@@ -133,9 +136,12 @@ async function makeLocalCdpGuest(chromium, executablePath) {
   socket.addEventListener("message", (event) => {
     try {
       const message = JSON.parse(typeof event.data === "string" ? event.data : String(event.data));
-      if (message.id === targetProbeId && message.result?.targetInfos) {
-        if (message.result.targetInfos.length > 0) {
-          initialTargetInfos = message.result.targetInfos;
+      if (!initialPageUrls && message.id === targetProbeId && message.result?.targetInfos) {
+        // Chrome can publish other CDP target types before its initial page.
+        // The runtime grants one Page in one context, so inspect that same unit.
+        const pageUrls = message.result.targetInfos.filter(target => target.type === "page").map(target => target.url);
+        if (pageUrls.includes("about:blank")) {
+          initialPageUrls = pageUrls;
           clearTimeout(readyTimer);
           resolveReady();
         } else {
@@ -166,10 +172,16 @@ async function makeLocalCdpGuest(chromium, executablePath) {
   const handle = {
     async sendStdin(data) {
       if (closed) throw Error("local_cdp_closed");
-      for (const line of data.split("\n")) {
+      const lines = data.split("\n").filter(Boolean);
+      metrics.sendCalls += 1;
+      metrics.sendLines += lines.length;
+      metrics.sendBytes += Buffer.byteLength(data, "utf8");
+      metrics.maxBatchLines = Math.max(metrics.maxBatchLines, lines.length);
+      for (const line of lines) {
         if (!line) continue;
         socket.send(line);
       }
+      if (options.sendDelayMs) await new Promise(resolve => setTimeout(resolve, options.sendDelayMs));
     },
     closeStdin: closeOrigin,
     wait: async () => waitPromise,
@@ -183,7 +195,7 @@ async function makeLocalCdpGuest(chromium, executablePath) {
       },
     },
   };
-  return { guest, close: closeOrigin, getTargetCount: () => initialTargetInfos?.length ?? 0 };
+  return { guest, close: closeOrigin, initialPageUrls, metrics };
 }
 
 test("the private Python bridge preserves multiple CDP frames and retires on EOF", { skip: process.platform !== "linux" || !commandExists("python3") }, async () => {
@@ -304,6 +316,37 @@ test("managed page uses ConnectOverCDPTransport with an owned cached Chromium", 
   }
 });
 
+test("managed CDP preserves real page flow while coalescing queued writes", { skip: nodeMajor < 22 }, async (t) => {
+  const e2b = await import("../dist/backends/e2b/index.js");
+  const { chromium } = await import("playwright-core");
+  const executablePath = await findCachedChromium(chromium);
+  if (!executablePath) {
+    t.skip("No cached local Chromium was found; this test never downloads one.");
+    return;
+  }
+  const local = await makeLocalCdpGuest(chromium, executablePath, { sendDelayMs: 2 });
+  let backend;
+  try {
+    backend = await e2b.createE2BBrowserBackend(local.guest, {
+      startupTimeoutMs: 10_000,
+      processTimeoutMs: 30_000,
+      browser: { allowBlank: true },
+      prepare: async (page) => {
+        await page.goto("data:text/html,<title>Coalesced CDP</title><main><button id='one'>One</button><button id='two'>Two</button><input aria-label='Field'></main>");
+      },
+    });
+    const frame = await backend.observe({ view: "controls" });
+    assert.equal(frame.controls.some((control) => control.name === "One"), true);
+    assert.equal(frame.controls.some((control) => control.name === "Field"), true);
+    assert.ok(local.metrics.sendLines > 0);
+    assert.ok(local.metrics.sendCalls < local.metrics.sendLines, JSON.stringify(local.metrics));
+    assert.ok(local.metrics.maxBatchLines >= 2, JSON.stringify(local.metrics));
+  } finally {
+    if (backend) await backend.close();
+    else await local.close();
+  }
+});
+
 test("E2B backend passes explicit browser origin grants to its scoped page", { skip: nodeMajor < 22 }, async (t) => {
   const e2b = await import("../dist/backends/e2b/index.js");
   const { chromium } = await import("playwright-core");
@@ -315,7 +358,7 @@ test("E2B backend passes explicit browser origin grants to its scoped page", { s
   const local = await makeLocalCdpGuest(chromium, executablePath);
   let backend;
   try {
-    assert.equal(local.getTargetCount(), 1);
+    assert.deepEqual(local.initialPageUrls, ["about:blank"]);
     backend = await e2b.createE2BBrowserBackend(local.guest, {
       startupTimeoutMs: 10_000,
       processTimeoutMs: 30_000,

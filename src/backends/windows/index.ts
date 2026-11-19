@@ -82,8 +82,16 @@ export type {
   WindowsWindowTarget,
   WindowsWindowTargetInput,
 } from "./types.js";
+export type { NativeUiAutomationWorker, NativeUiAutomationWindowsTransportOptions } from "./dialog-transport.js";
+export type {
+  WindowsOwnedDialog,
+  WindowsOwnedDialogInspector,
+  WindowsOwnedDialogNativeApi,
+} from "./dialogs.js";
 export { CuaWindowsTransport } from "./cua.js";
+export { NativeUiAutomationWindowsTransport, PowerShellNativeUiAutomationWorker, createNativeUiAutomationWindowsTransport } from "./dialog-transport.js";
 export { loadWindowsPhysicalInspector } from "./native.js";
+export { createWindowsOwnedDialogInspector, loadWindowsOwnedDialogInspector } from "./dialogs.js";
 export { backendError, isWindowsBackendError } from "./types.js";
 
 interface InternalControl extends WindowsResolvedControl {
@@ -91,6 +99,10 @@ interface InternalControl extends WindowsResolvedControl {
   readonly windowKey: string;
   readonly windowTitle?: string;
   readonly parentKey?: string;
+  /** Host-authorized physical-only route for SelectionItemPattern controls. */
+  readonly foregroundOnly?: boolean;
+  /** Screenshot-space point geometry used only by the foreground route. */
+  readonly foregroundRect?: Rect;
 }
 
 interface InternalFrame {
@@ -157,7 +169,12 @@ class WindowsDesktopSession implements WindowsDesktopBackend {
           }
         }
       }
-      const built = view === "image" ? emptyFrame() : buildControlsFrame(snapshots, options.where);
+      const built = view === "image" ? emptyFrame() : buildControlsFrame(
+        snapshots,
+        options.where,
+        this.#transport.source === "native-uia-v1",
+        this.foregroundSelectionClicksAllowed(),
+      );
       let image = undefined;
       let complete = built.complete;
       if (view === "image" || view === "both") {
@@ -231,7 +248,9 @@ class WindowsDesktopSession implements WindowsDesktopBackend {
       if (!targetResult.ok) return refuse(targetResult.code);
       const resolved = targetResult.value;
       const target = resolved.window;
-      const point = resolved.point ?? (resolved.control?.control.rect ? center(resolved.control.control.rect) : undefined);
+      const point = resolved.point
+        ?? (resolved.control?.foregroundRect ? center(resolved.control.foregroundRect) : undefined)
+        ?? (resolved.control?.control.rect ? center(resolved.control.control.rect) : undefined);
       if (request.origin && "point" in step.target) {
         const origin = this.#knownFrames.get(request.origin);
         if (!origin) return refuse("stale_origin");
@@ -248,10 +267,11 @@ class WindowsDesktopSession implements WindowsDesktopBackend {
         return refuse("control_token_unavailable");
       }
       const pointTarget = "point" in step.target;
-      const background = this.backgroundAllowed();
+      const foregroundOnly = resolved.control?.foregroundOnly === true;
+      const background = !foregroundOnly && this.backgroundAllowed();
       const foregroundPermission = this.#authorization.allowForegroundInput === true && this.#authorization.allowDesktopCapture === true;
       const coordinateControl = resolved.control?.source.role === "Canvas";
-      const foreground = foregroundPermission && (resolved.control === undefined || coordinateControl || !background) &&
+      const foreground = foregroundPermission && (resolved.control === undefined || coordinateControl || foregroundOnly || !background) &&
         (pointTarget || step.kind === "click" || step.kind === "scroll");
       if (!background && !foreground) {
         return refuse(resolved.control ? "background_delivery_not_authorized" : "foreground_input_not_authorized");
@@ -270,6 +290,7 @@ class WindowsDesktopSession implements WindowsDesktopBackend {
       const dispatchedTarget: WindowsDispatchTarget = {
         window: target,
         ...(resolved.control ? { control: resolved.control } : {}),
+        ...(resolved.control?.foregroundRect ? { point: center(resolved.control.foregroundRect) } : {}),
         ...(resolved.point ? { point: resolved.point } : point ? { point } : {}),
         ...(current.targetBounds.get(windowKey(target)) ? { windowBounds: current.targetBounds.get(windowKey(target)) } : {}),
         foreground,
@@ -310,6 +331,10 @@ class WindowsDesktopSession implements WindowsDesktopBackend {
     return this.#authorization.allowForegroundInput === true && this.#authorization.allowDesktopCapture === true;
   }
 
+  private foregroundSelectionClicksAllowed(): boolean {
+    return this.foregroundPointAllowed() && this.#authorization.allowForegroundSelectionClicks === true;
+  }
+
   private assertOpen(): void {
     if (this.#closed || this.#closing) throw backendError("session_closed");
   }
@@ -346,6 +371,7 @@ function normalizeAuthorization(input: WindowsDesktopAuthorization): NormalizedA
     ...(input.version ? { version: normalizeText(input.version, 128) } : {}),
     ...(input.allowDesktopCapture === true ? { allowDesktopCapture: true } : {}),
     ...(input.allowForegroundInput === true ? { allowForegroundInput: true } : {}),
+    ...(input.allowForegroundSelectionClicks === true ? { allowForegroundSelectionClicks: true } : {}),
     ...(input.background ? { background: { source: input.background.source } } : {}),
   });
 }
@@ -353,6 +379,13 @@ function normalizeAuthorization(input: WindowsDesktopAuthorization): NormalizedA
 function capabilitiesFor(authorization: NormalizedAuthorization, transport: WindowsTransport, inspector?: WindowsPhysicalInspector): readonly Capability[] {
   const physicalEvidence = inspector !== undefined;
   const background = physicalEvidence && authorization.background?.source !== undefined && authorization.background.source === transport.source;
+  if (transport.source === "native-uia-v1") {
+    if (!background) return Object.freeze([]);
+    return Object.freeze([
+      Object.freeze({ kind: "click", targets: ["selector", "ref"] as const, buttons: ["left"] as const, counts: [1] as const }),
+      Object.freeze({ kind: "setValue", targets: ["selector", "ref"] as const }),
+    ]);
+  }
   const foreground = physicalEvidence && authorization.allowForegroundInput === true && authorization.allowDesktopCapture === true;
   const targetForms = foreground ? ["selector", "ref", "point"] as const : ["selector", "ref"] as const;
   const capabilities: Capability[] = [];
@@ -387,6 +420,8 @@ function parseHandle(value: unknown): bigint | undefined {
 function buildControlsFrame(
   snapshots: ReadonlyArray<{ target: WindowsWindowTarget; snapshot?: WindowsWindowSnapshot; evidence?: WindowsPhysicalEvidence }>,
   where?: Selector,
+  nativeUiAutomation = false,
+  foregroundSelectionClicks = false,
 ): { controls: Control[]; internal: InternalControl[]; targetBounds: ReadonlyMap<string, Rect>; complete: boolean } {
   const controls: Control[] = [];
   const internal: InternalControl[] = [];
@@ -420,8 +455,10 @@ function buildControlsFrame(
       const parentId = element.parentIndex ? idByIndex.get(element.parentIndex) : undefined;
       const states = statesFor(element, desktopRect);
       const sensitive = element.password === true;
-      const actions: ActionKind[] = sensitive || element.inWebContent === true ? [] : actionKinds(element.actions);
-      if (!sensitive && editableRole(element.role) && element.actions.some(action => action.toLocaleLowerCase().replace(/[ -]/gu, "_") === "set_value")) {
+      const foregroundOnly = foregroundSelectionClicks && isForegroundSelectionElement(element, desktopRect, nativeUiAutomation);
+      const actions: ActionKind[] = sensitive || element.inWebContent === true ? [] : actionKinds(element.actions, nativeUiAutomation);
+      if (foregroundOnly && !actions.includes("click")) actions.push("click");
+      if (!nativeUiAutomation && !sensitive && editableRole(element.role) && element.actions.some(action => action.toLocaleLowerCase().replace(/[ -]/gu, "_") === "set_value")) {
         actions.push("type");
       }
       const control: Control = Object.freeze({
@@ -435,7 +472,8 @@ function buildControlsFrame(
         ...(!sensitive && element.value !== undefined ? { value: element.value } : {}),
         ...(sensitive ? { sensitive: true } : {}),
         ...(element.valueDescription ? { labels: Object.freeze([element.valueDescription]) } : {}),
-        effect: sensitive ? "sensitive" : actions.includes("type") ? "edit" : actions.includes("scroll") ? "read" : actions.length ? "unknown" : "read",
+        ...(!sensitive && element.approvalContext ? { approvalContext: element.approvalContext } : {}),
+        effect: sensitive ? "sensitive" : actions.includes("type") || actions.includes("setValue") ? "edit" : actions.includes("scroll") ? "read" : actions.length ? "unknown" : "read",
       });
       const internalControl: InternalControl = {
         control,
@@ -446,6 +484,8 @@ function buildControlsFrame(
         token: element.token,
         window: item.target,
         ...(localRect ? { localRect } : {}),
+        ...(foregroundOnly ? { foregroundOnly: true } : {}),
+        ...(foregroundOnly && element.rect ? { foregroundRect: element.rect } : {}),
         source: element,
       };
       if (!where || matchesSelector(control, where, internalControl)) {
@@ -512,18 +552,27 @@ function statesFor(element: WindowsWindowElement, rect: Rect | undefined): State
   return states;
 }
 
-function actionKinds(actions: readonly string[]): ActionKind[] {
+function actionKinds(actions: readonly string[], nativeUiAutomation = false): ActionKind[] {
   const set = new Set<ActionKind>();
   for (const action of actions) {
     const normalized = action.toLocaleLowerCase().replace(/[ -]/gu, "_");
     if (normalized === "invoke" || normalized === "click" || normalized === "press") set.add("click");
     else if (normalized === "text" || normalized === "type" || normalized === "type_text") set.add("type");
-    // CUA exposes the UIA ValuePattern as `set_value`, but 0.54 has no
-    // standalone set_value action tool. Treat it as verified editable text
-    // only for native edit roles (the caller still chooses `type`).
+    else if (normalized === "set_value" && nativeUiAutomation) set.add("setValue");
     else if (normalized === "scroll") set.add("scroll");
   }
   return [...set];
+}
+
+function isForegroundSelectionElement(
+  element: WindowsWindowElement,
+  rect: Rect | undefined,
+  nativeUiAutomation: boolean,
+): boolean {
+  if (nativeUiAutomation || element.inWebContent === true || element.password === true || element.role.toLocaleLowerCase().replace(/[ _-]/gu, "") !== "listitem") return false;
+  if (element.enabled !== true || rect === undefined) return false;
+  const normalized = new Set(element.actions.map(action => action.toLocaleLowerCase().replace(/[ -]/gu, "_")));
+  return normalized.has("select") && !normalized.has("invoke") && !normalized.has("click") && !normalized.has("press");
 }
 
 function editableRole(role: string): boolean {
@@ -651,8 +700,22 @@ function windowKey(target: WindowsWindowTarget): string {
   return `hwnd:${target.pid}:${target.hwnd.toString()}`;
 }
 
-function scopeForAuthorization(authorization: { readonly version?: string; readonly targets: readonly WindowsWindowTarget[]; readonly allowDesktopCapture?: boolean; readonly allowForegroundInput?: boolean; readonly background?: { readonly source: string } }): string {
-  const payload = [authorization.version ?? "", authorization.allowDesktopCapture === true ? "image" : "controls", authorization.allowForegroundInput === true ? "foreground" : "background", authorization.background?.source ?? "no-native-background", ...authorization.targets.map(target => `${target.pid}:${target.hwnd.toString()}`)].join("|");
+function scopeForAuthorization(authorization: {
+  readonly version?: string;
+  readonly targets: readonly WindowsWindowTarget[];
+  readonly allowDesktopCapture?: boolean;
+  readonly allowForegroundInput?: boolean;
+  readonly allowForegroundSelectionClicks?: boolean;
+  readonly background?: { readonly source: string };
+}): string {
+  const payload = [
+    authorization.version ?? "",
+    authorization.allowDesktopCapture === true ? "image" : "controls",
+    authorization.allowForegroundInput === true ? "foreground" : "background",
+    authorization.allowForegroundSelectionClicks === true ? "foreground-selection" : "no-foreground-selection",
+    authorization.background?.source ?? "no-native-background",
+    ...authorization.targets.map(target => `${target.pid}:${target.hwnd.toString()}`),
+  ].join("|");
   return `windows:${shortHash(payload)}`;
 }
 

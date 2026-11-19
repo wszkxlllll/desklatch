@@ -121,6 +121,14 @@ export class CuaWindowsTransport implements WindowsTransport {
       delivery_mode: target.foreground ? "foreground" : "background",
     };
     const localPoint = target.point === undefined ? undefined : localPointForTarget(target.point, target.windowBounds, target.control?.localRect);
+    if (target.foreground && localPoint && (step.kind === "click" || step.kind === "scroll")) {
+      if (!target.windowBounds) return { status: "refused", code: "foreground_bounds_unavailable" };
+      const captureId = await this.foregroundCaptureId(target.window, target.windowBounds, options.signal);
+      options.signal?.throwIfAborted();
+      if (captureId === null) return { status: "refused", code: "foreground_capture_stale" };
+      if (captureId === undefined) return { status: "refused", code: "foreground_capture_unavailable" };
+      args.capture_id = captureId;
+    }
     switch (step.kind) {
       case "click": {
         if (target.control?.token && !target.foreground) args.element_token = target.control.token;
@@ -254,6 +262,35 @@ export class CuaWindowsTransport implements WindowsTransport {
     }
   }
 
+  /**
+   * Capture a fresh exact-window screenshot for a foreground coordinate action.
+   * The returned id is intentionally kept private and sent only to CUA; it is
+   * not part of DeskLatch's model-visible frame. A changed window identity
+   * or geometry invalidates the proposed coordinates.
+   */
+  private async foregroundCaptureId(target: WindowsWindowTarget, expectedBounds?: Rect, signal?: AbortSignal): Promise<string | null | undefined> {
+    const result = await this.call("get_window_state", {
+      pid: target.pid,
+      window_id: rawBigInt(target.hwnd),
+      session: this.#session,
+      full_output: true,
+      include_accessibility_tree: false,
+      include_screenshot: true,
+      max_elements: 256,
+      max_depth: 16,
+    }, signal).catch(() => undefined);
+    if (!result || result.isError || !result.images?.[0]) return undefined;
+    const raw = structuredRecord(result);
+    if (!raw || positiveInteger(raw.pid) !== target.pid || parseBigInt(raw.window_id ?? raw.windowId) !== target.hwnd) return null;
+    if (raw.screenshot_frame_valid === false) return null;
+    if (expectedBounds !== undefined) {
+      const capturedBounds = parseRect(raw.window_bounds ?? raw.windowBounds ?? raw.bounds);
+      if (capturedBounds === undefined || !sameRect(capturedBounds, expectedBounds)) return null;
+    }
+    const captureId = stringField(raw, "capture_id", "captureId");
+    return captureId && captureId.length <= 256 ? captureId : undefined;
+  }
+
   private assertOpen(): void {
     if (!this.#opened || this.#closed) throw backendError("session_closed");
   }
@@ -298,6 +335,10 @@ function parseRect(value: unknown): Rect | undefined {
   const height = finiteNumber(item.height ?? item.h);
   if (x === undefined || y === undefined || width === undefined || height === undefined || width <= 0 || height <= 0) return undefined;
   return { x, y, width, height };
+}
+
+function sameRect(left: Rect, right: Rect): boolean {
+  return left.x === right.x && left.y === right.y && left.width === right.width && left.height === right.height;
 }
 
 function localPointForTarget(point: Point, bounds: Rect | undefined, localRect: Rect | undefined): Point | undefined {

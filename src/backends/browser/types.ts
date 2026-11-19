@@ -26,7 +26,13 @@ export interface BrowserPageLike {
 
 export interface BrowserLocatorLike {
   count(): Promise<number>;
-  elementHandle?(): Promise<BrowserElementHandleLike | null>;
+  /**
+   * Return the current attached matches without locator auto-waiting. Native
+   * Playwright locators provide this as a bounded snapshot (`$$`).
+   */
+  elementHandles?(): Promise<BrowserElementHandleLike[]>;
+  /** Compatibility fallback for scoped adapters that predate elementHandles. */
+  elementHandle?(options?: { timeout?: number }): Promise<BrowserElementHandleLike | null>;
   click?(options?: { button?: "left" | "right"; clickCount?: number; timeout?: number }): Promise<void>;
   fill?(value: string, options?: { timeout?: number }): Promise<void>;
   press?(key: string, options?: { timeout?: number }): Promise<void>;
@@ -59,12 +65,21 @@ export interface BrowserBackendOptions {
   allowBlank?: boolean;
   /** Explicit host opt-in for a viewport PNG. Controls-only observation never captures. */
   allowImages?: boolean;
+  /** Explicit host opt-in for bounded rendered page text. Off by default. */
+  allowDocumentText?: boolean;
+  /** Total rendered text exposed by one document observation. */
+  documentTextLimit?: number;
+  /** Maximum number of rendered text chunks exposed by one document observation. */
+  documentChunkLimit?: number;
+  /** Maximum characters in each rendered text chunk. */
+  documentChunkSize?: number;
   includePublicValues?: boolean;
   publicDataOnly?: boolean;
   protectedFieldNames?: readonly string[];
 }
 
 export interface BrowserBackend extends DesktopBackend {
+  readonly allowDocumentText: boolean;
 }
 
 export interface BrowserRiskSignal {
@@ -145,5 +160,11 @@ export const DEFAULT_SETTLE = 40;
 export const DEFAULT_ACTION_TIMEOUT = 1_500;
 export const MAX_STEP_TEXT_LENGTH = 32_768;
 export const MAX_SCROLL_AMOUNT = 10_000;
+export const DEFAULT_DOCUMENT_TEXT_LIMIT = 12_000;
+export const DEFAULT_DOCUMENT_CHUNK_LIMIT = 64;
+export const DEFAULT_DOCUMENT_CHUNK_SIZE = 2_000;
+export const MAX_DOCUMENT_TEXT_LIMIT = 64_000;
+export const MAX_DOCUMENT_CHUNK_LIMIT = 256;
+export const MAX_DOCUMENT_CHUNK_SIZE = 4_096;
 
 export type BrowserPage = Page;

@@ -81,8 +81,8 @@ test("scoped remote actions bind only matching controls, scroll clipped targets,
     page.locator = selector => {
       const loc = locator(selector);
       const getHandle = loc.elementHandle.bind(loc);
-      loc.elementHandle = async (...args) => {
-        const handle = await getHandle(...args);
+      const getHandles = loc.elementHandles.bind(loc);
+      function track(handle) {
         if (handle) {
           bound.add(selector);
           const scroll = handle.scrollIntoViewIfNeeded.bind(handle);
@@ -93,7 +93,9 @@ test("scoped remote actions bind only matching controls, scroll clipped targets,
           };
         }
         return handle;
-      };
+      }
+      loc.elementHandle = async (...args) => track(await getHandle(...args));
+      loc.elementHandles = async (...args) => (await getHandles(...args)).map(track);
       return loc;
     };
     const session = createDeskSession(createBrowserBackend(page));

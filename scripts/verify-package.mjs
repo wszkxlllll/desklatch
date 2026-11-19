@@ -17,6 +17,7 @@ try {
   assert.equal(basename(packed.filename), packed.filename);
   const files = new Set(packed.files.map(file => file.path));
   for (const path of ["schema/act-input.schema.json", "dist/bin/mcp.js", "dist/reuse.js", "dist/reuse.d.ts", "dist/backends/e2b/chromium_pipe.py",
+    "dist/backends/windows/dialog-transport.ps1",
     "dist/evidence/rapidocr_worker.py", "dist/integrations/dsh.js", "dist/integrations/langchain-images.js",
     "docs/architecture.md", "examples/frameworks/langgraph.mjs"]) assert.ok(files.has(path), path);
   await writeFile(join(consumer, "package.json"), '{"name":"independent-host","private":true,"type":"module"}', "utf8");

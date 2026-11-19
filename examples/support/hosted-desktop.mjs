@@ -2,13 +2,17 @@ import { randomUUID } from "node:crypto";
 import { Sandbox } from "@e2b/desktop";
 
 // Only the opt-in hosted test owns a sandbox. DeskLatch itself still attaches to a host-provided guest.
-export async function runInHostedDesktop(run) {
+// `network` and `allowInternetAccess` are explicit opt-ins for acceptance runs
+// that need a real public site; the existing synthetic tests stay offline.
+export async function runInHostedDesktop(run, options = {}) {
   if (!process.env.E2B_API_KEY) throw Error("Set E2B_API_KEY for the hosted acceptance run");
-  const metadata = { project: "desklatch", purpose: "zhipu-cloud-acceptance", run: randomUUID() };
-  const timeoutMs = 480_000;
+  const metadata = { ...options.metadata, project: "desklatch",
+    purpose: options.purpose ?? "zhipu-cloud-acceptance", run: randomUUID() };
+  const timeoutMs = options.timeoutMs ?? 480_000;
   const started = performance.now();
   const guest = await Sandbox.create({ timeoutMs, requestTimeoutMs: 45_000, metadata,
-    allowInternetAccess: false, network: { allowPublicTraffic: false } });
+    allowInternetAccess: options.allowInternetAccess ?? false,
+    network: options.network ?? { allowPublicTraffic: false } });
   try {
     const info = await guest.getInfo({ requestTimeoutMs: 15_000 });
     if (info.sandboxId !== guest.sandboxId || info.metadata?.run !== metadata.run) throw Error("unexpected_hosted_guest");

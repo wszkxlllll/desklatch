@@ -1,4 +1,4 @@
-import type { Capability, Selector, View } from "./contracts.js";
+import type { Capability, DocumentRead, Selector, View } from "./contracts.js";
 import { actToolSchema } from "./request.js";
 
 export interface ToolEndpoint {
@@ -23,8 +23,9 @@ export const desktopToolInstructions = [
 export interface DesktopToolSession {
   readonly capabilities: readonly Capability[];
   readonly allowModelImages: boolean;
+  readonly allowModelDocumentText?: boolean;
   readonly limits?: { maxSteps?: number; maxTextLength?: number; maxScrollAmount?: number };
-  observe(input: { view?: View; where?: Selector; signal?: AbortSignal }): Promise<unknown>;
+  observe(input: { view?: View; where?: Selector; read?: DocumentRead; signal?: AbortSignal }): Promise<unknown>;
   act(input: unknown, signal?: AbortSignal): Promise<unknown>;
 }
 
@@ -33,34 +34,47 @@ const fields = ["role", "name", "within", "state"];
 const record = (input: unknown): input is Record<string, unknown> =>
   !!input && typeof input === "object" && !Array.isArray(input);
 
-function readObserveArgs(input: unknown, allowImages: boolean): { view: View; where?: Selector } {
-  if (!record(input) || Object.keys(input).some(k => k !== "view" && k !== "where")) throw Error("invalid_observe");
-  const view = input.view === undefined ? "controls" : input.view;
-  if (view !== "controls" && view !== "image" && view !== "both") throw Error("invalid_view");
-  if (!allowImages && view !== "controls") throw Error("image_delivery_not_authorized");
-  if (input.where === undefined) return { view };
+function readObserveArgs(input: unknown, allowImages: boolean, allowDocumentText: boolean): { view: View; where?: Selector; read?: DocumentRead } {
+  if (!record(input) || Object.keys(input).some(k => k !== "view" && k !== "where" && k !== "read")) throw Error("invalid_observe");
+  const hasView = input.view !== undefined;
+  let view: View = input.view === undefined ? "controls" : input.view as View;
+  if (view !== "controls" && view !== "image" && view !== "both" && view !== "document") throw Error("invalid_view");
+  if (view === "document" && !allowDocumentText) throw Error("document_delivery_not_authorized");
+  if (!allowImages && (view === "image" || view === "both")) throw Error("image_delivery_not_authorized");
+  let read: DocumentRead | undefined;
+  if (input.read !== undefined) {
+    if (!allowDocumentText) throw Error("document_delivery_not_authorized");
+    if (input.read !== "document") throw Error("invalid_document_read");
+    read = "document";
+    if (!hasView) view = "document";
+  }
+  if (view === "document") read = "document";
+  if (input.where === undefined) return { view, ...(read ? { read } : {}) };
   const where = input.where;
   if (!record(where) || !Object.keys(where).length || Object.keys(where).some(k =>
     !fields.includes(k) || typeof where[k] !== "string" || !(where[k] as string).trim() || (where[k] as string).length > 1024)
     || (where.state !== undefined && !states.some(s => s === where.state))) throw Error("invalid_observe_filter");
-  return { view, where: { ...where } };
+  return { view, where: { ...where }, ...(read ? { read } : {}) };
 }
 
 export function createDeskTools(session: DesktopToolSession): ToolEndpoint[] {
   const allowImages = session.allowModelImages === true;
+  const allowDocumentText = session.allowModelDocumentText === true;
   const observe: ToolEndpoint = {
       name: "observe",
       description: "Discover controls and named graphics, or resolve ambiguity. Known targets can go directly to act. The controls view lists actual names, roles and available public values."
-        + (allowImages ? " Use image or both to read information depicted in a graphic." : " This session permits text observations."),
+        + (allowImages ? " Use image or both to read information depicted in a graphic." : " This session permits text observations.")
+        + (allowDocumentText ? ' To read rendered page text, call {"read":"document"} without where. A where query returns matching controls only.' : ""),
       inputSchema: {
         type: "object", additionalProperties: false, properties: {
-          view: { type: "string", enum: allowImages ? ["controls", "image", "both"] : ["controls"], default: "controls" },
+          view: { type: "string", enum: [...(allowImages ? ["controls", "image", "both"] : ["controls"]), ...(allowDocumentText ? ["document"] : [])], default: "controls" },
           where: { type: "object", additionalProperties: false, minProperties: 1, properties: {
             role: { type: "string" }, name: { type: "string" }, within: { type: "string" }, state: { type: "string", enum: [...states] },
           } },
+          ...(allowDocumentText ? { read: { type: "string", enum: ["document"] } } : {}),
         },
       },
-      invoke: async (input, signal) => session.observe({ ...readObserveArgs(input, allowImages), signal }),
+      invoke: async (input, signal) => session.observe({ ...readObserveArgs(input, allowImages, allowDocumentText), signal }),
     };
   if (session.capabilities.length === 0) return [observe];
   const examples = [];

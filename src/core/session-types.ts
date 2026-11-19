@@ -1,4 +1,4 @@
-import type { ActionKind, Capability, Control, Frame, RiskPolicy, Selector, State } from "../contracts.js";
+import type { ActionKind, Capability, Control, DocumentObservation, DocumentRead, Frame, RiskPolicy, Selector, State } from "../contracts.js";
 
 export interface ControlObservation {
   ref: string;
@@ -16,10 +16,12 @@ export interface ControlObservation {
 
 export interface DeskObservation {
   observationId: string;
-  view: "controls" | "image" | "both";
+  view: "controls" | "image" | "both" | "document";
   complete: boolean;
   controls: readonly ControlObservation[];
   image?: Frame["image"];
+  /** Optional host-authorized page-provided rendered text. */
+  document?: DocumentObservation;
 }
 
 export interface CandidateSummary {
@@ -71,6 +73,8 @@ export type ApprovalHandler =
 export interface DeskSessionOptions {
   policy?: RiskPolicy;
   allowModelImages?: boolean;
+  /** Explicit model-surface gate; effective only when the backend opts in. */
+  allowModelDocumentText?: boolean;
   maxSteps?: number;
   maxTextLength?: number;
   maxScrollAmount?: number;
@@ -83,14 +87,16 @@ export interface DeskSessionOptions {
 }
 
 export interface DeskObserveOptions {
-  view?: "controls" | "image" | "both";
+  view?: "controls" | "image" | "both" | "document";
   where?: Selector;
+  read?: DocumentRead;
   signal?: AbortSignal;
 }
 
 export interface DeskSession {
   readonly capabilities: readonly Capability[];
   readonly allowModelImages: boolean;
+  readonly allowModelDocumentText: boolean;
   readonly limits: Readonly<{ maxSteps: number; maxTextLength: number; maxScrollAmount: number }>;
   observe(options?: DeskObserveOptions): Promise<DeskObservation>;
   act(raw: unknown, signal?: AbortSignal): Promise<ActResult>;

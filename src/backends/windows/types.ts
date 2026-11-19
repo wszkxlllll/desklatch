@@ -45,6 +45,13 @@ export interface WindowsDesktopAuthorization {
   readonly allowDesktopCapture?: boolean;
   /** Explicitly permits foreground input for future coordinate-only actions. */
   readonly allowForegroundInput?: boolean;
+  /**
+   * Narrow host opt-in for native ListItem controls that expose only
+   * SelectionItemPattern. Such controls are dispatched as a fresh, exact
+   * foreground physical click after visibility/enabled/geometry checks; they
+   * are never treated as background InvokePattern actions.
+   */
+  readonly allowForegroundSelectionClicks?: boolean;
   /** Explicit opt-in for a verified native background delivery source. */
   readonly background?: { readonly source: WindowsBackgroundSource };
 }
@@ -89,6 +96,8 @@ export interface WindowsWindowElement {
   readonly actions: readonly string[];
   readonly parentIndex?: string;
   readonly token?: string;
+  /** Host-private binding to the material data shown in an enrolled dialog. */
+  readonly approvalContext?: Control["approvalContext"];
   /** Desktop/global physical coordinates when supplied as `frame`. */
   readonly rect?: Rect;
   /** True when `rect` came from the older window-local screenshot_frame field. */

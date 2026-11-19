@@ -456,6 +456,170 @@ export function createRawCollectionScript() {
   };
 }
 
+/**
+ * This function is serialized by Playwright and runs only in the authorized
+ * page. It deliberately reads rendered DOM text rather than source HTML,
+ * accessibility labels, control values, or embedded-frame documents.
+ */
+export function createDocumentTextScript() {
+  return ({ rootSelector, expectedHref, maxChars, maxChunks, chunkSize, viewportOnly }: {
+    rootSelector?: string;
+    expectedHref?: string;
+    maxChars: number;
+    maxChunks: number;
+    chunkSize: number;
+    viewportOnly: boolean;
+  }) => {
+    const documentElement = document.documentElement;
+    // The read path is non-mutating. Identity is attested by retaining the
+    // original DocumentElement object for the duration of this evaluation;
+    // the host's scope generation covers reloads between evaluations.
+    const route = () => ({ href: window.location.href, baseURI: document.baseURI, documentToken: documentElement ? "document-element" : "missing" });
+    const before = route();
+    const empty = { chunks: [], totalChars: 0, totalChunks: 0, truncated: false, attestation: { before, after: before, sameDocument: true }, routeChanged: false };
+    if (expectedHref !== undefined && before.href !== expectedHref) return { ...empty, routeChanged: true };
+    const root = rootSelector ? document.querySelector<HTMLElement>(rootSelector) : document.body ?? document.documentElement;
+    if (!root) return empty;
+
+    const blockTags = new Set([
+      "ADDRESS", "ARTICLE", "ASIDE", "BLOCKQUOTE", "DD", "DIV", "DL", "DT", "FIGCAPTION", "FIGURE",
+      "H1", "H2", "H3", "H4", "H5", "H6", "HEADER", "LI", "MAIN", "NAV", "OL", "P", "PRE", "SECTION",
+      "TABLE", "TD", "TH", "TR", "UL",
+    ]);
+    const excludedTags = new Set([
+      "A", "BUTTON", "INPUT", "SELECT", "TEXTAREA", "OPTION", "SUMMARY", "SCRIPT", "STYLE", "NOSCRIPT",
+      "TEMPLATE", "IFRAME", "FRAME", "OBJECT", "EMBED", "HEAD", "TITLE", "META", "LINK", "BASE",
+    ]);
+    const interactiveRoles = new Set([
+      "button", "checkbox", "combobox", "link", "listbox", "menuitem", "option", "radio", "searchbox", "slider",
+      "spinbutton", "switch", "tab", "textbox",
+    ]);
+    const normalize = (value: unknown): string => String(value ?? "").replace(/\s+/gu, " ").trim();
+    const isBlock = (element: Element): boolean => blockTags.has(element.tagName) || ["article", "main", "region"].includes((element.getAttribute("role") || "").toLocaleLowerCase());
+    const inViewport = (element: Element): boolean => {
+      const rect = (element as HTMLElement).getBoundingClientRect();
+      return rect.right > 0 && rect.bottom > 0 && rect.left < window.innerWidth && rect.top < window.innerHeight;
+    };
+    const renderedGeometry = (element: Element, candidateRect?: DOMRect): boolean => {
+      let current: Element | null = element;
+      while (current) {
+        const style = getComputedStyle(current);
+        if (style.display === "none" || style.visibility === "hidden" || style.visibility === "collapse" || Number(style.opacity) === 0 || style.contentVisibility === "hidden") return false;
+        if (style.clipPath !== "none" || style.clip !== "auto" && style.clip !== "none") return false;
+        if ((style.overflowX === "hidden" || style.overflowX === "clip" || style.overflowY === "hidden" || style.overflowY === "clip")) {
+          const clipRect = (current as HTMLElement).getBoundingClientRect();
+          if (candidateRect) {
+            const intersects = candidateRect.right > clipRect.left && candidateRect.left < clipRect.right && candidateRect.bottom > clipRect.top && candidateRect.top < clipRect.bottom;
+            if (!intersects) return false;
+          }
+        }
+        current = current.parentElement;
+      }
+      return true;
+    };
+    const excluded = (element: Element): boolean => {
+      let current: Element | null = element;
+      while (current) {
+        if (excludedTags.has(current.tagName)) return true;
+        if (current.getAttribute("aria-hidden")?.toLocaleLowerCase() === "true" || current.hasAttribute("inert")) return true;
+        if (current.getAttribute("contenteditable")?.toLocaleLowerCase() === "true" || (current as HTMLElement).isContentEditable) return true;
+        if (current instanceof HTMLDetailsElement && !current.open && current !== element) return true;
+        const style = getComputedStyle(current);
+        if (style.display === "none" || style.visibility === "hidden" || style.visibility === "collapse" || Number(style.opacity) === 0 || style.contentVisibility === "hidden") return true;
+        if (style.clipPath !== "none" || style.clip !== "auto" && style.clip !== "none") return true;
+        const role = current.getAttribute("role")?.toLocaleLowerCase();
+        if (role && interactiveRoles.has(role)) return true;
+        current = current.parentElement;
+      }
+      return false;
+    };
+    const readable = (element: Element): boolean => {
+      if (excluded(element)) return false;
+      return renderedGeometry(element);
+    };
+    const textRendered = (textNode: Text): boolean => {
+      const range = document.createRange();
+      range.selectNodeContents(textNode);
+      const rects = Array.from(range.getClientRects()).filter((rect) => rect.width > 0 && rect.height > 0);
+      const owner = textNode.parentElement ?? root;
+      return rects.some((rect) => renderedGeometry(owner, rect));
+    };
+    // Walk text nodes once in DOM order. Each contiguous run is assigned to
+    // its nearest block owner, preserving parent text around nested blocks
+    // (for example `intro <h2>heading</h2> tail`).
+    const ownerFor = (textNode: Text): Element | undefined => {
+      let current: Element | null = textNode.parentElement;
+      while (current && current !== root.parentElement) {
+        if (excluded(current)) return undefined;
+        if (isBlock(current)) return readable(current) ? current : undefined;
+        current = current.parentElement;
+      }
+      return readable(root) ? root : undefined;
+    };
+    const runs: Array<{ owner: Element; parts: string[] }> = [];
+    let currentRun: { owner: Element; parts: string[] } | undefined;
+    const walk = (node: Node): void => {
+      if (node.nodeType === Node.TEXT_NODE) {
+        const value = normalize(node.textContent);
+        if (!value) return;
+        const owner = ownerFor(node as Text);
+        if (!owner || !textRendered(node as Text) || (viewportOnly && !inViewport(owner))) {
+          currentRun = undefined;
+          return;
+        }
+        if (!currentRun || currentRun.owner !== owner) {
+          currentRun = { owner, parts: [] };
+          runs.push(currentRun);
+        }
+        currentRun.parts.push(value);
+        return;
+      }
+      if (!(node instanceof Element) || excluded(node)) return;
+      for (const child of Array.from(node.childNodes)) walk(child);
+    };
+    walk(root);
+    const rendered = runs.map((run) => normalize(run.parts.join(" "))).filter((value) => value.length > 0);
+
+    const pieces: string[] = [];
+    for (const value of rendered) {
+      let offset = 0;
+      while (offset < value.length) {
+        let end = Math.min(value.length, offset + Math.max(1, chunkSize));
+        if (end < value.length) {
+          const boundary = value.lastIndexOf(" ", end);
+          if (boundary > offset + Math.floor(chunkSize / 2)) end = boundary;
+        }
+        const piece = value.slice(offset, end).trim();
+        if (piece) pieces.push(piece);
+        offset = Math.max(end, offset + 1);
+      }
+    }
+    const totalChars = pieces.reduce((sum, piece) => sum + piece.length, 0);
+    const totalChunks = pieces.length;
+    const chunks: string[] = [];
+    let usedChars = 0;
+    for (const piece of pieces) {
+      if (chunks.length >= Math.max(1, maxChunks) || usedChars >= Math.max(1, maxChars)) break;
+      const remaining = Math.max(1, maxChars) - usedChars;
+      const text = piece.slice(0, remaining).trim();
+      if (!text) break;
+      chunks.push(text);
+      usedChars += text.length;
+      if (text.length < piece.length) break;
+    }
+    const after = route();
+    const sameDocument = documentElement === document.documentElement && before.href === after.href && before.baseURI === after.baseURI && before.documentToken === after.documentToken;
+    return {
+      chunks,
+      totalChars,
+      totalChunks,
+      truncated: chunks.length < totalChunks || usedChars < totalChars,
+      attestation: { before, after, sameDocument },
+      routeChanged: !sameDocument,
+    };
+  };
+}
+
 export async function pagePointHit(page: BrowserPageLike, point: { x: number; y: number }): Promise<string | undefined> {
   return page.evaluate(({ x, y }) => {
     const top = document.elementFromPoint(x, y);

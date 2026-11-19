@@ -59,6 +59,7 @@ export interface LocalEvidenceSinkLike {
  */
 export class EvidenceCapturingBackend implements DesktopBackend {
   public readonly capabilities: readonly Capability[];
+  public readonly allowDocumentText: boolean;
   private readonly failClosed: boolean;
 
   public constructor(private readonly backend: DesktopBackend, private readonly options: EvidenceCapturingBackendOptions) {
@@ -68,6 +69,7 @@ export class EvidenceCapturingBackend implements DesktopBackend {
       throw new Error("evidence capture requires an explicit local-only policy and sink");
     }
     this.capabilities = backend.capabilities;
+    this.allowDocumentText = backend.allowDocumentText === true;
     this.failClosed = options.failClosed ?? true;
   }
 

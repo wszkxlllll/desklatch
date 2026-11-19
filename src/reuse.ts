@@ -229,12 +229,25 @@ function isSelector(value: unknown): boolean {
   return Object.values(value).every((entry) => typeof entry === "string" && entry.trim().length > 0 && entry.length <= 1024);
 }
 
+function canonicalSelector(value: unknown): string | undefined {
+  if (!isSelector(value)) return undefined;
+  const selector = value as AnyRecord;
+  return JSON.stringify(["role", "name", "within", "state"].flatMap((key) => Object.hasOwn(selector, key) ? [key, selector[key]] : []));
+}
+
+function equivalentSelector(left: unknown, right: unknown): boolean {
+  const leftCanonical = canonicalSelector(left);
+  const rightCanonical = canonicalSelector(right);
+  return leftCanonical !== undefined && leftCanonical === rightCanonical;
+}
+
 function assertReusableStep(step: unknown): asserts step is Step {
   if (!isRecord(step) || typeof step.kind !== "string") throw new ReuseValidationError("invalid_capture");
   if (step.kind !== "type" && step.kind !== "setValue") throw new ReuseValidationError("invalid_capture");
   if (!isSelector(step.target)) throw new ReuseValidationError("invalid_capture");
   if (step.expect !== undefined) {
     if (!isRecord(step.expect) || !isSelector(step.expect.target)) throw new ReuseValidationError("invalid_capture");
+    if (!equivalentSelector(step.target, step.expect.target)) throw new ReuseValidationError("invalid_capture");
     if ("valueEquals" in step.expect && typeof step.expect.valueEquals !== "string") throw new ReuseValidationError("invalid_capture");
     if (!("state" in step.expect) && !("valueEquals" in step.expect)) throw new ReuseValidationError("invalid_capture");
   }
@@ -297,22 +310,20 @@ function parameterizeRequest(request: ActRequest, options: ReuseCaptureOptions):
     const step = request.steps[index];
     assertReusableStep(step);
     if (step.expect === undefined) throw new ReuseValidationError("invalid_capture");
-    if ((step.kind === "type" || step.kind === "setValue") && !("valueEquals" in step.expect)) {
+    if (step.kind !== "type" && step.kind !== "setValue" || !("valueEquals" in step.expect)) {
       throw new ReuseValidationError("invalid_capture");
     }
-    if ("valueEquals" in step.expect && step.kind !== "type" && step.kind !== "setValue") {
+    const payloadPath = step.kind === "type" ? `steps.${index}.text` : `steps.${index}.value`;
+    const payloadValue = step.kind === "type" ? step.text : step.value;
+    const expectedValue = step.expect.valueEquals;
+    if (typeof expectedValue !== "string" || payloadValue !== expectedValue) {
       throw new ReuseValidationError("invalid_capture");
     }
-    const payloadPath = step.kind === "type"
-      ? `steps.${index}.text`
-      : step.kind === "setValue" ? `steps.${index}.value` : undefined;
-    if (payloadPath !== undefined) {
-      const expectPath = `steps.${index}.expect.valueEquals`;
-      const payloadName = parameterNameAt(parameterPaths, payloadPath);
-      const expectName = parameterNameAt(parameterPaths, expectPath);
-      if (payloadName === undefined || expectName === undefined || payloadName !== expectName) {
-        throw new ReuseValidationError("invalid_capture");
-      }
+    const expectPath = `steps.${index}.expect.valueEquals`;
+    const payloadName = parameterNameAt(parameterPaths, payloadPath);
+    const expectName = parameterNameAt(parameterPaths, expectPath);
+    if (payloadName === undefined || expectName === undefined || payloadName !== expectName) {
+      throw new ReuseValidationError("invalid_capture");
     }
   }
   return { template, names };
@@ -344,6 +355,7 @@ function collectMarkerNames(value: unknown, result = new Set<string>()): Set<str
 function validateTemplateStep(step: unknown, index: number, names: ReadonlySet<string>): boolean {
   if (!isRecord(step) || !isSelector(step.target) || !["type", "setValue"].includes(String(step.kind))) return false;
   if (!isRecord(step.expect) || !isSelector(step.expect.target)) return false;
+  if (!equivalentSelector(step.target, step.expect.target)) return false;
   if ("state" in step.expect && typeof step.expect.state !== "string") return false;
   if (!("state" in step.expect) && !("valueEquals" in step.expect)) return false;
   if ("state" in step.expect && "valueEquals" in step.expect) return false;

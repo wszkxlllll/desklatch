@@ -50,6 +50,8 @@ const node = new ToolNode(createLangChainTools(endpoints));
 
 纯条件请求可以首调。使用控件引用、截图坐标或拖拽端点时需带上 `observationId`。每个后端公布自己的动作与参数组合。期望值只适用于已获准读取的公开字段。应用可用 `onApprovalRequested` 接收确认请求，再通过仅宿主可调用的 `resolveApproval` 处理用户决定。[运行时及宿主责任](docs/architecture.md) · [act 输入契约](schema/act-input.schema.json)
 
+需要读取网页正文时，宿主在浏览器后端启用 `allowDocumentText`，并给会话启用 `allowModelDocumentText`。`observe({read:"document"})` 只返回有界正文、来源和截断信息，省去截图和控件绑定。需要复用字段写入时，宿主可另行加载 `desklatch/reuse`。记录器只接受通过自身调用、已核验的回执，复用时仍经过当前会话的公开 `act`。[步骤复用设计](docs/architecture.md#可选的步骤复用)
+
 ## 构建和验证
 
 使用 Node.js 22.19 或更新版本。
@@ -61,7 +63,7 @@ npm test
 
 要从另一个项目接入，可在本仓库构建后运行 `npm pack`，将生成的 `.tgz` 路径交给宿主项目的 `npm install`。宿主按接入方式安装对应的框架或驱动，例如 `playwright-core` 和 `@langchain/core`。核心包的直接运行依赖只有 Ajv。
 
-真实浏览器用例使用隔离的 Chromium 实例。可用 `DESKLATCH_CHROMIUM` 指定已安装的浏览器路径。主动运行 `npm run verify:zhipu` 时才使用 `ZHIPU_API_KEY` 调用智谱 `glm-5.3-flash`。工具参数只涉及脚本自己创建的表单，最终值由浏览器独立回读。该脚本同时记录模型请求、图片、工具调用及执行器观察次数。
+真实浏览器用例使用隔离的 Chromium 实例。可用 `DESKLATCH_CHROMIUM` 指定已安装的浏览器路径。`npm run verify:zhipu` 使用 `ZHIPU_API_KEY` 调用智谱 `glm-5.3-flash`，在合成表单上独立回读最终值。另可显式运行 `node examples/reuse-comparison.mjs`，在真实馆藏检索页比较逐步执行、批量执行和字段复用。两组均记录模型调用，普通 `npm test` 不需要模型密钥。
 
 同时配置 `E2B_API_KEY` 后，`npm run verify:zhipu -- e2b` 会创建一台临时 E2B Desktop，复跑关闭取图和开局提供一张图的两个用例。`npm run verify:zhipu -- e2b-choice` 则开放文字控件与截图，由模型自行选择。每次命令共用一台沙箱，限制为 8 分钟，结束时释放并查询确认。
 

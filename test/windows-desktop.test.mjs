@@ -231,27 +231,39 @@ test('CUA transport sends controls-only UIA reads and explicit background delive
 test('CUA transport projects an explicitly foreground desktop point into window-local pixels', async () => {
   const calls = [];
   const target = { pid: 41001, hwnd: 0x100000000001n };
+  const bounds = { x: 100, y: 200, width: 500, height: 300 };
+  let capture = { pid: target.pid, window_id: String(target.hwnd), window_bounds: bounds,
+    screenshot_frame_valid: true, capture_id: 'local-capture' };
   const driver = {
     async metadata() { return { driverVersion: '0.54.0' }; },
     async startSession() { return { active: true }; },
     async endSession() { return { active: false }; },
     async callTool(name, json) {
       calls.push({ name, args: JSON.parse(json) });
+      if (name === 'get_window_state') return { isError: false, images: [{ mimeType: 'image/png', dataBase64: 'fixture' }], structuredContent: capture };
       return { isError: false, action: { effect: 'confirmed', route: 'global_input', delivery: { mode: 'foreground' } } };
     },
   };
   const transport = await CuaWindowsTransport.open(driver, 'foreground-session');
-  const result = await transport.dispatch({ kind: 'click', target: { point: { x: 150, y: 250 } } }, {
+  const recipient = {
     window: target,
     point: { x: 150, y: 250 },
-    windowBounds: { x: 100, y: 200, width: 500, height: 300 },
+    windowBounds: bounds,
     foreground: true,
-  }, {});
+  };
+  const action = { kind: 'click', target: { point: recipient.point } };
+  const result = await transport.dispatch(action, recipient, {});
   assert.equal(result.status, 'dispatched');
   const click = calls.find(call => call.name === 'click');
   assert.deepEqual({ x: click.args.x, y: click.args.y }, { x: 50, y: 50 });
   assert.equal(click.args.delivery_mode, 'foreground');
+  assert.equal(click.args.capture_id, 'local-capture');
   assert.equal(click.args.element_token, undefined);
+  capture = { ...capture, window_bounds: { ...bounds, x: bounds.x + 10 } };
+  assert.deepEqual(await transport.dispatch(action, recipient, {}), { status: 'refused', code: 'foreground_capture_stale' });
+  capture = { ...capture, window_bounds: bounds, capture_id: undefined };
+  assert.deepEqual(await transport.dispatch(action, recipient, {}), { status: 'refused', code: 'foreground_capture_unavailable' });
+  assert.equal(calls.filter(call => call.name === 'click').length, 1);
   await transport.close();
 });
 
