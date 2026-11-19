@@ -78,13 +78,25 @@ function cssAttributeEscape(value: string): string {
   return value.replace(/\\/gu, "\\\\").replace(/"/gu, '\\"').replace(/\n/gu, "\\A ");
 }
 
-export function classifyEffect(raw: Pick<RawControl, "role" | "name" | "tagName" | "href" | "sensitive" | "disclosure"> & { filterAction: boolean }): Effect {
+export function classifyEffect(raw: Pick<RawControl, "role" | "name" | "tagName" | "href" | "sensitive" | "disclosure"> & {
+  filterAction: boolean;
+  formSubmitter?: boolean;
+  sameDocumentTab?: boolean;
+}): Effect {
   if (raw.sensitive) return "sensitive";
-  if (raw.role === "img") return "read";
-  if (raw.disclosure) return "read";
-  if (raw.filterAction) return "read";
   const name = raw.name ?? "";
   for (const [effect, expression] of EFFECT_WORDS) if (expression.test(name)) return effect;
+  // Consequential evidence must win over attributes that can look like a
+  // disclosure or a tab. A native submitter is consequential even when its
+  // accessible name is opaque or absent.
+  // A scoped search/filter is the one benign exception for a native submitter:
+  // the structural input association is stronger evidence than a generic
+  // label, while a generic submitter still remains consequential.
+  if (raw.formSubmitter && !raw.filterAction) return "external";
+  if (raw.filterAction) return "read";
+  if (raw.sameDocumentTab) return "read";
+  if (raw.role === "img") return "read";
+  if (raw.disclosure) return "read";
   if (raw.href || raw.role === "link") return "navigate";
   if (["textbox", "searchbox", "combobox"].includes(raw.role)) return "edit";
   if (raw.tagName === "button" || raw.role === "button") return "unknown";
@@ -106,6 +118,7 @@ export function toControl(raw: RawControl, id: string, stableKey: string): Inter
     effect: classifyEffect({ ...raw, filterAction: raw.filterAction }),
     filterAction: raw.filterAction,
     ...(raw.disclosure ? { disclosure: true } : {}),
+    ...(raw.enterMaySubmit ? { enterMaySubmit: true } : {}),
     ...(raw.approvalContext ? { approvalContext: raw.approvalContext } : {}),
     __path: raw.path,
     __key: raw.key,
@@ -125,10 +138,18 @@ export function publicControl(control: InternalControl): Control {
 export async function readApprovalContext(element: unknown, _ignored?: unknown): Promise<{ token: string; summary: string } | undefined> {
   const target = element as HTMLElement & { form?: HTMLFormElement | null };
   const attr = (name: string) => target.getAttribute(name) || "";
-  const form = target.form || target.closest("form");
+  const nativeForm = target instanceof HTMLButtonElement || target instanceof HTMLInputElement ? target.form : undefined;
+  const form = nativeForm || target.closest("form");
   if (!form) return undefined;
+  const nativeType = target instanceof HTMLButtonElement || target instanceof HTMLInputElement ? target.type.toLocaleLowerCase() : attr("type").toLocaleLowerCase();
+  const formSubmitter = Boolean(
+    nativeForm && (
+      (target instanceof HTMLButtonElement && nativeType === "submit") ||
+      (target instanceof HTMLInputElement && (nativeType === "submit" || nativeType === "image"))
+    ),
+  );
   const materialName = `${attr("aria-label")} ${target.textContent || ""} ${attr("type")}`;
-  const material = Boolean(attr("type").toLocaleLowerCase() === "submit" || /\b(send|submit|publish|post|share|invite|confirm|overwrite|replace|delete|remove|pay|checkout)\b|\u53d1\u9001|\u63d0\u4ea4|\u53d1\u5e03|\u5206\u4eab|\u9080\u8bf7|\u786e\u8ba4|\u8986\u76d6|\u66ff\u6362|\u5220\u9664|\u652f\u4ed8/iu.test(materialName));
+  const material = Boolean(formSubmitter || /\b(send|submit|publish|post|share|invite|confirm|overwrite|replace|delete|remove|pay|checkout)\b|\u53d1\u9001|\u63d0\u4ea4|\u53d1\u5e03|\u5206\u4eab|\u9080\u8bf7|\u786e\u8ba4|\u8986\u76d6|\u66ff\u6362|\u5220\u9664|\u652f\u4ed8/iu.test(materialName));
   if (!material) return undefined;
   const destination = attr("formaction") || form.getAttribute("action") || document.URL;
   let endpoint: URL | undefined;
@@ -136,7 +157,7 @@ export async function readApprovalContext(element: unknown, _ignored?: unknown):
   const recipients = new Set<string>();
   const materialArray: unknown[] = [
     ["form", endpoint?.href ?? [document.baseURI, destination], form.method, form.target, form.enctype],
-    ["submitter", attr("formaction"), attr("formmethod"), attr("formenctype"), attr("formtarget"), attr("name"), attr("type"), attr("value")],
+    ["submitter", attr("formaction"), attr("formmethod"), attr("formenctype"), attr("formtarget"), attr("name"), attr("type"), nativeType, attr("value")],
   ];
   for (const field of Array.from(form.elements)) {
     const input = field as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement;
@@ -239,7 +260,10 @@ export function createRawCollectionScript() {
     const pathFor = (element: Element): string => {
       const parts: string[] = [];
       let current: Element | null = element;
-      while (current && current !== root && current.parentElement) {
+      // Include the document ancestry in fallback selectors. A path relative
+      // only to the observation root makes body-level and nested siblings
+      // collide (for example, both can be `button:nth-child(1)`).
+      while (current && current.parentElement) {
         const ancestor: Element = current.parentElement;
         const siblings = Array.from(ancestor.children);
         parts.unshift(`${current.tagName.toLowerCase()}:nth-child(${Math.max(1, siblings.indexOf(current) + 1)})`);
@@ -334,18 +358,72 @@ export function createRawCollectionScript() {
       if (graphic && (!name || !visible(element, style) || element.closest('[aria-hidden="true"],button,a,[role="button"],[role="link"]'))) continue;
       const sensitive = isProtected(element, name, labels);
       const canonicalName = name?.normalize("NFKC").toLocaleLowerCase();
-      const form = (element as HTMLButtonElement).form || (element as HTMLInputElement).form || (element as HTMLSelectElement).form || (element as HTMLTextAreaElement).form || element.closest("form");
+      const nativeForm = element instanceof HTMLButtonElement || element instanceof HTMLInputElement || element instanceof HTMLSelectElement || element instanceof HTMLTextAreaElement ? element.form : null;
+      const form = nativeForm || element.closest("form");
+      const formSubmitter = Boolean(
+        nativeForm && (
+          (element instanceof HTMLButtonElement && element.type.toLocaleLowerCase() === "submit") ||
+          (element instanceof HTMLInputElement && ["submit", "image"].includes(element.type.toLocaleLowerCase()))
+        ),
+      );
       const searchScope = form || element.parentElement;
-      const filterAction = Boolean(searchScope && ["button", "link"].includes(role) && canonicalName && searchNames.has(canonicalName) && searchScope.querySelector("input:not([type='hidden']),textarea,select,[contenteditable='true'],[role='textbox'],[role='searchbox'],[role='combobox']"));
+      const genericSearchStructure = searchScope?.querySelector("input:not([type='hidden']),textarea,select,[contenteditable='true'],[role='textbox'],[role='searchbox'],[role='combobox']");
+      const nativeSearchStructure = searchScope?.querySelector("input[type='search'],[role='searchbox']") ||
+        (form?.getAttribute("role")?.toLocaleLowerCase() === "search" ? genericSearchStructure : null);
+      let boundedNativeSearch = false;
+      if (formSubmitter && nativeForm && (attr(element, "formmethod") || attr(nativeForm, "method") || "get").toLocaleLowerCase() === "get") {
+        const targetName = (attr(element, "formtarget") || attr(nativeForm, "target") || "").toLocaleLowerCase();
+        if (!targetName || targetName === "_self") {
+          try {
+            const destination = new URL(attr(element, "formaction") || attr(nativeForm, "action") || document.URL, document.baseURI);
+            const current = new URL(document.URL);
+            boundedNativeSearch = destination.origin === current.origin && destination.protocol === current.protocol && destination.host === current.host;
+          } catch {
+            boundedNativeSearch = false;
+          }
+        }
+      }
+      const filterAction = Boolean(
+        searchScope && ["button", "link"].includes(role) && canonicalName && searchNames.has(canonicalName) &&
+        (formSubmitter ? Boolean(boundedNativeSearch && nativeSearchStructure) : Boolean(genericSearchStructure)),
+      );
+      const singleLineInput = element instanceof HTMLInputElement && ["text", "search", "email", "url", "tel", "password", "number"].includes(element.type.toLocaleLowerCase()) && !element.disabled && !element.readOnly;
+      const enterMaySubmit = Boolean(singleLineInput && nativeForm);
       const expanded = attr(element, "aria-expanded");
       const controlledIds = attr(element, "aria-controls")?.split(/\s+/u).filter(Boolean) ?? [];
       const controlledRegions = controlledIds.map((id) => document.getElementById(id));
+      const tabList = element.closest('[role="tablist"]');
+      const controlledRegion = controlledIds.length === 1 && controlledRegions.length === 1 ? controlledRegions[0] : undefined;
+      const sameDocumentLink = (element: HTMLElement): boolean => {
+        const href = attr(element, "href");
+        if (!href) return true;
+        if (element.hasAttribute("download")) return false;
+        const targetName = attr(element, "target")?.toLocaleLowerCase();
+        if (targetName && !["_self", "_top", "_parent"].includes(targetName)) return false;
+        try {
+          const destination = new URL(href, document.baseURI);
+          const current = new URL(document.URL);
+          return destination.protocol === current.protocol && destination.host === current.host && destination.pathname === current.pathname && destination.search === current.search && Boolean(destination.hash);
+        } catch {
+          return false;
+        }
+      };
+      const sameDocumentTab = Boolean(
+        role === "tab" &&
+        tabList &&
+        root.contains(tabList) &&
+        controlledRegion &&
+        root.contains(controlledRegion) &&
+        controlledRegion.getAttribute("role")?.toLocaleLowerCase() === "tabpanel" &&
+        !formSubmitter &&
+        sameDocumentLink(element),
+      );
       const disclosure = Boolean(
         (element.tagName.toLocaleLowerCase() === "summary" && element.closest("details")) ||
         (expanded && (expanded === "true" || expanded === "false") && controlledIds.length > 0 && controlledRegions.length === controlledIds.length && controlledRegions.every(Boolean)),
       );
       const materialName = `${name || ""} ${attr(element, "type") || ""} ${text(element.textContent)}`;
-      const approvalCandidate = Boolean(form && (attr(element, "type")?.toLocaleLowerCase() === "submit" || /\b(send|submit|publish|post|share|invite|confirm|overwrite|replace|delete|remove|pay|checkout)\b|\u53d1\u9001|\u63d0\u4ea4|\u53d1\u5e03|\u5206\u4eab|\u9080\u8bf7|\u786e\u8ba4|\u8986\u76d6|\u66ff\u6362|\u5220\u9664|\u652f\u4ed8/iu.test(materialName)));
+      const approvalCandidate = Boolean(form && (formSubmitter || /\b(send|submit|publish|post|share|invite|confirm|overwrite|replace|delete|remove|pay|checkout)\b|\u53d1\u9001|\u63d0\u4ea4|\u53d1\u5e03|\u5206\u4eab|\u9080\u8bf7|\u786e\u8ba4|\u8986\u76d6|\u66ff\u6362|\u5220\u9664|\u652f\u4ed8/iu.test(materialName)));
       const within = nearestWithin(element);
       const states: string[] = [];
       if (visible(element, style)) states.push("visible");
@@ -369,7 +447,7 @@ export function createRawCollectionScript() {
         path: pathFor(element), key: baseKey, role, name, labels, within: within.name, withinKeys: within.keys,
         states, actions, rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
         value: graphic || sensitive || !includePublicValues ? undefined : (element as HTMLInputElement).value,
-        sensitive, href: attr(element, "href"), filterAction, disclosure, approvalCandidate, tagName: element.tagName.toLocaleLowerCase(), type: attr(element, "type"),
+        sensitive, href: attr(element, "href"), filterAction, disclosure, formSubmitter, sameDocumentTab, enterMaySubmit, approvalCandidate, tagName: element.tagName.toLocaleLowerCase(), type: attr(element, "type"),
         disabled: !enabled(element), stableKind,
       });
     }
@@ -386,9 +464,8 @@ export async function pagePointHit(page: BrowserPageLike, point: { x: number; y:
     let current: Element | null = top;
     while (current && !isInteractive(current)) current = current.parentElement;
     if (!current) return undefined;
-    const root = document.body ?? document.documentElement;
     const parts: string[] = [];
-    while (current && current !== root && current.parentElement) {
+    while (current && current.parentElement) {
       const ancestor: Element = current.parentElement;
       parts.unshift(`${current.tagName.toLocaleLowerCase()}:nth-child(${Math.max(1, Array.from(ancestor.children).indexOf(current) + 1)})`);
       current = ancestor;

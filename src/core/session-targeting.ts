@@ -11,6 +11,9 @@ export function targetBindingKey(control: Control): string {
     actions: [...control.actions].sort(),
     rect: control.rect,
     effect: control.effect,
+    sensitive: control.sensitive,
+    filterAction: control.filterAction,
+    enterMaySubmit: control.enterMaySubmit,
     approvalToken: control.approvalContext?.token,
   });
 }
@@ -24,6 +27,7 @@ export function equivalentMaterial(left: Control, right: Control): boolean {
     && left.effect === right.effect
     && left.sensitive === right.sensitive
     && left.filterAction === right.filterAction
+    && left.enterMaySubmit === right.enterMaySubmit
     && JSON.stringify([...left.actions].sort()) === JSON.stringify([...right.actions].sort())
     && JSON.stringify([...(left.labels ?? [])].sort()) === JSON.stringify([...(right.labels ?? [])].sort())
     && left.approvalContext?.token === right.approvalContext?.token;

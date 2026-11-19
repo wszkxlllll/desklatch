@@ -350,6 +350,107 @@ test("material control binding changes when its recipient changes", async (t) =>
   if (result.skipped) t.skip("No installed Edge/Chrome/Chromium executable");
 });
 
+test("native tab evidence stays read while generic form submitters retain material binding", async (t) => {
+  const result = await withPage(async (page) => {
+    await page.setContent(`
+      <form id="generic-form" aria-label="Generic action form" onsubmit="event.preventDefault(); this.dataset.sent='true'">
+        <label for="recipient">Recipient</label><input id="recipient" name="recipient" type="text" value="alice@example.test">
+        <label for="message">Message</label><textarea id="message" name="message">Hello</textarea>
+        <button id="generic-submit" aria-expanded="false" aria-controls="generic-panel">Opaque action</button>
+        <button id="labeled-submit" type="button" aria-expanded="false" aria-controls="generic-panel">Send</button>
+        <div id="generic-panel" role="tabpanel">Form panel</div>
+      </form>
+      <form aria-label="Post search" role="search" method="post">
+        <input type="search" aria-label="Post query"><button type="submit">Search</button>
+      </form>
+      <form aria-label="Targeted search" role="search" method="get" target="_blank">
+        <input type="search" aria-label="Targeted query"><button type="submit">Search</button>
+      </form>
+      <form aria-label="Bounded search" role="search" method="get">
+        <input type="search" aria-label="Bounded query"><button type="submit">Search</button>
+      </form>
+      <div role="tablist" aria-label="Opaque tabs">
+        <button id="ordinary-tab" type="button" role="tab" aria-controls="ordinary-panel" aria-selected="false">Opaque tab</button>
+        <a id="external-tab" role="tab" href="/outside" aria-controls="ordinary-panel">External tab</a>
+      </div>
+      <div id="ordinary-panel" role="tabpanel">Tab panel</div>
+      <script>
+        document.getElementById('ordinary-tab').addEventListener('click', function () { this.dataset.activated = 'true'; });
+      </script>`);
+    const backend = createBrowserBackend(page);
+    try {
+      const frame = await backend.observe({ view: "controls" });
+      const submit = frame.controls.find((control) => control.name === "Opaque action");
+      const labeled = frame.controls.find((control) => control.name === "Send");
+      const tab = frame.controls.find((control) => control.name === "Opaque tab");
+      const externalTab = frame.controls.find((control) => control.name === "External tab");
+      const recipient = frame.controls.find((control) => control.name === "Recipient");
+      const message = frame.controls.find((control) => control.name === "Message");
+      assert.ok(submit?.approvalContext?.token);
+      assert.equal(submit?.effect, "external");
+      assert.equal(labeled?.effect, "external");
+      assert.equal(frame.controls.find((control) => control.name === "Search" && control.within === "Post search")?.effect, "external");
+      assert.equal(frame.controls.find((control) => control.name === "Search" && control.within === "Targeted search")?.effect, "external");
+      const boundedSearch = frame.controls.find((control) => control.name === "Search" && control.within === "Bounded search");
+      assert.equal(boundedSearch?.effect, "read");
+      assert.equal(boundedSearch?.filterAction, true);
+      assert.equal(tab?.effect, "read");
+      assert.equal(externalTab?.effect, "navigate");
+      assert.equal(recipient?.enterMaySubmit, true);
+      assert.equal(message?.enterMaySubmit, undefined);
+
+      await page.locator("#recipient").fill("bob@example.test");
+      const stale = await backend.dispatch({ frame, target: submit, step: { kind: "click", target: { ref: "generic-submit-ref" } } });
+      assert.equal(stale.status, "refused");
+      assert.equal(stale.code, "approval_context_changed");
+      assert.equal(await page.locator("#generic-form").getAttribute("data-sent"), null);
+
+      const fresh = await backend.observe({ view: "controls" });
+      const freshSubmit = fresh.controls.find((control) => control.name === "Opaque action");
+      assert.ok(freshSubmit?.approvalContext?.token);
+      assert.notEqual(freshSubmit.approvalContext.token, submit.approvalContext.token);
+      const sent = await backend.dispatch({ frame: fresh, target: freshSubmit, step: { kind: "click", target: { ref: "fresh-generic-submit-ref" } } });
+      assert.equal(sent.status, "dispatched");
+      assert.equal(await page.locator("#generic-form").getAttribute("data-sent"), "true");
+
+      const clickedTab = await backend.dispatch({ frame, target: tab, step: { kind: "click", target: { ref: "tab-ref" } } });
+      assert.equal(clickedTab.status, "dispatched");
+      assert.equal(await page.locator("#ordinary-tab").getAttribute("data-activated"), "true");
+    } finally { await backend.close(); }
+    return { skipped: false };
+  });
+  if (result.skipped) t.skip("No installed Edge/Chrome/Chromium executable");
+});
+
+test("fallback browser paths remain unique across nested and document-level controls", async (t) => {
+  const result = await withPage(async (page) => {
+    await page.setContent(`<button>First</button><fieldset><button>Continue</button></fieldset><button>Continue</button>`);
+    const backend = createBrowserBackend(page);
+    try {
+      const frame = await backend.observe({ view: "controls" });
+      assert.equal(frame.controls.filter((control) => control.name === "Continue").length, 2);
+      const scoped = await backend.observe({ view: "controls", where: { role: "button", name: "Continue" } });
+      assert.equal(scoped.controls.length, 2);
+    } finally { await backend.close(); }
+    return { skipped: false };
+  });
+  if (result.skipped) t.skip("No installed Edge/Chrome/Chromium executable");
+});
+
+test("same-document tab evidence stays inside a scoped observation root", async (t) => {
+  const result = await withPage(async (page) => {
+    await page.setContent(`<div id="tab-scope"><div role="tablist"><button type="button" role="tab" aria-controls="outside-panel">Opaque scoped tab</button></div></div><div id="outside-panel" role="tabpanel">Outside panel</div>`);
+    const backend = createBrowserBackend(page, { rootSelector: "#tab-scope" });
+    try {
+      const frame = await backend.observe({ view: "controls" });
+      const tab = frame.controls.find((control) => control.name === "Opaque scoped tab");
+      assert.equal(tab?.effect, "unknown");
+    } finally { await backend.close(); }
+    return { skipped: false };
+  });
+  if (result.skipped) t.skip("No installed Edge/Chrome/Chromium executable");
+});
+
 test("backend reports delivery even when a caller-side expect would fail", async (t) => {
   const result = await withPage(async (page) => {
     await page.setContent(await fixture("browser-form.html"));

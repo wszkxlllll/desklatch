@@ -7,6 +7,7 @@ import type {
   Dispatch,
   Frame,
   RiskDecision,
+  RiskInput,
   State,
   View,
   Selector,
@@ -42,7 +43,7 @@ export type {
 import { randomUUID } from "node:crypto";
 import { validateRequest } from "./request.js";
 import { matchControl } from "./grounding.js";
-import { defaultRiskPolicy } from "./policy.js";
+import { defaultRiskPolicy, recheckRiskApproval } from "./policy.js";
 import { awaitAbortable, deepFreeze, freezeCapabilities, intersectCapabilities, mergeSignals, safeAdapterCode, safeValidationCode } from "./core/session-support.js";
 import { approvalActionParams, approvalSummary, normalizeApprovalDecision } from "./core/session-approval.js";
 import { isSensitiveControl, ObservationRegistry, sanitizeText, type StoredObservation } from "./core/observation-registry.js";
@@ -51,6 +52,9 @@ import { sameBinding, TargetResolver, type Binding, type FocusRecord, type Prepa
 interface PendingApproval {
   request: ApprovalRequest;
   binding: Binding;
+  /** Host-only risk facts used to recheck live rules without repeating exact evidence. */
+  riskDecision?: RiskDecision;
+  riskInput?: RiskInput;
   timer?: ReturnType<typeof setTimeout>;
   state: "pending" | "approved" | "denied" | "expired" | "cancelled";
   settle: (decision: ApprovalDecision | "expired" | "cancelled") => void;
@@ -261,6 +265,8 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
     prepared: PreparedStep,
     index: number,
     execution: ActiveExecution,
+    riskDecision: RiskDecision,
+    riskInput: RiskInput,
   ): PendingApproval {
     const requestId = makeApprovalId();
     const request: ApprovalRequest = {
@@ -287,6 +293,8 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
     const pending: PendingApproval = {
       request,
       binding: prepared.binding,
+      riskDecision,
+      riskInput,
       state: "pending",
       settle,
       promise,
@@ -297,6 +305,14 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
       if (pending.suspended) {
         const result = suspendedResult(pending.suspended, "approval_expired");
         finalizeSuspended(pending.suspended, result);
+      } else {
+        completedApprovals.set(requestId, {
+          requestId,
+          status: "stopped",
+          code: "approval_expired",
+          steps: [],
+        });
+        releasePendingRisk(pending);
       }
       pending.settle("expired");
     }, Math.max(1, approvalTimeoutMs));
@@ -350,7 +366,15 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
     suspended.execution.suspended = undefined;
     if (suspended.pending.timer) clearTimeout(suspended.pending.timer);
     completedApprovals.set(suspended.pending.request.requestId, result);
+    releasePendingRisk(suspended.pending);
     finishExecution(suspended.execution);
+  }
+
+  function releasePendingRisk(pending: PendingApproval): void {
+    pending.riskDecision = undefined;
+    pending.riskInput = undefined;
+    pending.suspended = undefined;
+    approvalRecords.delete(pending.request.requestId);
   }
 
   async function resolveApprovalInternal(requestId: string, decision: ApprovalDecision): Promise<ApprovalResolution> {
@@ -367,7 +391,10 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
         ? suspendedResult(pending.suspended, "cancelled")
         : { requestId, status: "stopped" as const, code: "cancelled", steps: [] };
       if (pending.suspended) finalizeSuspended(pending.suspended, result);
-      else completedApprovals.set(requestId, result);
+      else {
+        completedApprovals.set(requestId, result);
+        releasePendingRisk(pending);
+      }
       pending.settle("cancelled");
       return result;
     }
@@ -382,6 +409,7 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
         steps: [],
       };
       completedApprovals.set(requestId, result);
+      releasePendingRisk(pending);
       return result;
     }
     if (decision === "deny") {
@@ -409,6 +437,7 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
           code: reason,
           steps: [],
         });
+        releasePendingRisk(pending);
       }
       pending.settle("cancelled");
     }
@@ -475,22 +504,27 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
     index: number,
     prepared: PreparedStep,
     execution: ActiveExecution,
+    pending: PendingApproval,
   ): Promise<{ prepared?: PreparedStep; code?: string; candidates?: readonly Control[]; candidateObservation?: StoredObservation }> {
     const refreshed = await revalidateApproval(request, index, prepared, execution);
     if (!refreshed.prepared) return refreshed;
+    const refreshedInput: RiskInput = {
+      step: refreshed.prepared.step,
+      target: policyControl(refreshed.prepared.target),
+      ...(refreshed.prepared.destination ? { destination: policyControl(refreshed.prepared.destination) } : {}),
+      signal: execution.controller.signal,
+    };
     let finalDecision: RiskDecision;
     try {
-      finalDecision = await awaitAbortable(policy({
-        step: refreshed.prepared.step,
-        target: policyControl(refreshed.prepared.target),
-        destination: refreshed.prepared.destination ? policyControl(refreshed.prepared.destination) : undefined,
-        signal: execution.controller.signal,
-      }), execution.controller.signal);
+      if (!pending.riskDecision || !pending.riskInput) return { code: "approval_evidence_unavailable" };
+      const internalRecheck = recheckRiskApproval(policy, pending.riskDecision, pending.riskInput, refreshedInput);
+      finalDecision = await awaitAbortable(internalRecheck ?? policy(refreshedInput), execution.controller.signal);
     } catch {
       if (execution.controller.signal.aborted) return { code: currentReason(execution) };
       return { code: "risk_policy_error" };
     }
-    if (finalDecision.decision !== "approve") return { code: finalDecision.code || "risk_recheck_denied" };
+    if (finalDecision.decision === "needs_evidence") return { code: "risk_evidence_required" };
+    if (finalDecision.decision !== "approve" && finalDecision.decision !== "allow") return { code: finalDecision.code || "risk_recheck_denied" };
     return refreshed;
   }
 
@@ -508,7 +542,7 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
       }
       let verified: { prepared?: PreparedStep; code?: string; candidates?: readonly Control[]; candidateObservation?: StoredObservation };
       try {
-        verified = await verifyApproved(suspended.request, suspended.index, suspended.prepared, execution);
+        verified = await verifyApproved(suspended.request, suspended.index, suspended.prepared, execution, suspended.pending);
       } catch {
         verified = { code: "approval_recheck_failed" };
       }
@@ -530,6 +564,7 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
       };
       suspended.result = result;
       completedApprovals.set(suspended.pending.request.requestId, result);
+      releasePendingRisk(suspended.pending);
       // A later step may itself be waiting for approval. In that case the
       // resumed execution remains live under the newer pending request.
       if (!execution.suspended) finishExecution(execution);
@@ -614,14 +649,16 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
         }
 
         let decision: RiskDecision | undefined;
+        let riskInput: RiskInput | undefined;
         if (!usingInitialPrepared) {
           try {
-            decision = await awaitAbortable(policy({
+            riskInput = {
               step,
               target: policyControl(prepared.target),
-              destination: prepared.destination ? policyControl(prepared.destination) : undefined,
+              ...(prepared.destination ? { destination: policyControl(prepared.destination) } : {}),
               signal: execution.controller.signal,
-            }), execution.controller.signal);
+            };
+            decision = await awaitAbortable(policy(riskInput), execution.controller.signal);
           } catch {
             if (execution.controller.signal.aborted) return stoppedResult(request, index, currentReason(execution), receipts, step.kind);
             return stoppedResult(request, index, "risk_policy_error", receipts, step.kind);
@@ -633,11 +670,15 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
         if (!usingInitialPrepared && decision && decision.decision === "deny") {
           return stoppedResult(request, index, decision.code || "risk_denied", receipts, step.kind);
         }
+        if (!usingInitialPrepared && decision?.decision === "needs_evidence") {
+          const result = stoppedResult(request, index, decision.code || "risk_evidence_required", receipts, step.kind);
+          return { ...result, code: "risk_evidence_required" };
+        }
         if (!usingInitialPrepared && (!decision || (decision.decision !== "allow" && decision.decision !== "approve"))) {
           return stoppedResult(request, index, decision?.code || "risk_policy_invalid", receipts, step.kind);
         }
         if (!usingInitialPrepared && decision?.decision === "approve") {
-          const pending = makeApproval(prepared, index, execution);
+          const pending = makeApproval(prepared, index, execution, decision, riskInput!);
           if (pending.syncDecision) {
             const syncDecision = pending.syncDecision;
             pending.state = syncDecision === "approve" ? "approved" : "denied";
@@ -648,14 +689,16 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
             }
             let verified: { prepared?: PreparedStep; code?: string; candidates?: readonly Control[]; candidateObservation?: StoredObservation };
             try {
-              verified = await verifyApproved(request, index, prepared, execution);
+              verified = await verifyApproved(request, index, prepared, execution, pending);
             } catch {
               verified = { code: "approval_recheck_failed" };
             }
             if (!verified.prepared) {
+              releasePendingRisk(pending);
               return stoppedResult(request, index, verified.code ?? "approval_stale", receipts, step.kind);
             }
             prepared = verified.prepared;
+            releasePendingRisk(pending);
           } else {
           const suspended: SuspendedBatch = {
             request,

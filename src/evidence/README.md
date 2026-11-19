@@ -22,8 +22,9 @@ Chinese OCR text remains safe on Windows cp1252 stdout and is restored by the
 Node parser.
 
 The OCR result is text evidence only. It is never sent to the reviewer as an
-image, and OCR cannot authorize an action. A missing, failed, or low-confidence
-result keeps the action at approval/stop rather than silently allowing it.
+image. A consequential label can trigger host approval. If the crop is inconclusive,
+the configured reviewer can use the remaining evidence. An unresolved step
+returns `risk_evidence_required` without dispatch or an approval request.
 
 `LocalEvidenceSink` is opt-in and execution-side only. It requires an explicit
 private store and a redactor. The raw image is copied for in-memory redaction;

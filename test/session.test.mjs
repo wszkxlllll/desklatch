@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createDeskSession } from "../dist/session.js";
-import { createDeskTools } from "desklatch";
+import { createDeskTools, createRiskPolicy } from "desklatch";
 
 const capabilities = [
   { kind: "click", targets: ["selector"], buttons: ["left"], counts: [1] },
@@ -97,6 +97,117 @@ test("synchronous host approval can continue in the same act call", async () => 
   const result = await session.act({ steps: [{ kind: "click", target: { role: "Button", name: "Save" } }] });
   assert.equal(result.status, "completed");
   assert.equal(backend.calls.dispatch.length, 1);
+  await session.close();
+});
+
+test("a cap-one text-reviewed approval dispatches once without repeating the reviewer", async () => {
+  const backend = makeBackend();
+  backend.controls[0] = { ...backend.controls[0], name: "Continue", effect: "unknown" };
+  let reviews = 0;
+  const session = createDeskSession(backend, {
+    policy: createRiskPolicy({
+      maxExternalRequests: 1,
+      reviewer: () => {
+        reviews += 1;
+        return { classification: "high" };
+      },
+    }),
+    onApprovalRequested: () => "approve",
+  });
+  const result = await session.act({ steps: [{ kind: "click", target: { role: "Button", name: "Continue" } }] });
+  assert.equal(result.status, "completed");
+  assert.equal(reviews, 1);
+  assert.equal(backend.calls.dispatch.length, 1);
+  await session.close();
+});
+
+test("an approval recheck applies a newly active hard denial", async () => {
+  const backend = makeBackend();
+  backend.controls[0] = { ...backend.controls[0], name: "Continue", effect: "unknown" };
+  let denied = false;
+  let reviews = 0;
+  const session = createDeskSession(backend, {
+    policy: createRiskPolicy({
+      maxExternalRequests: 1,
+      reviewer: () => {
+        reviews += 1;
+        return { classification: "high" };
+      },
+      hostRules: { hardDeny: () => denied ? { match: true, code: "new_hard_deny" } : false },
+    }),
+  });
+  const pending = await session.act({ steps: [{ kind: "click", target: { role: "Button", name: "Continue" } }] });
+  assert.equal(pending.code, "approval_required");
+  denied = true;
+  const result = await session.resolveApproval(pending.requestId, "approve");
+  assert.equal(result.status, "stopped");
+  assert.equal(result.code, "new_hard_deny");
+  assert.equal(reviews, 1);
+  assert.equal(backend.calls.dispatch.length, 0);
+  await session.close();
+});
+
+test("tight OCR budgets do not create unusable approval", async () => {
+  const backend = makeBackend();
+  backend.controls[0] = { ...backend.controls[0], name: "Continue", effect: "unknown", rect: { x: 0, y: 0, width: 80, height: 24 } };
+  let ocrCalls = 0;
+  let approvals = 0;
+  const session = createDeskSession(backend, {
+    policy: createRiskPolicy({
+      maxExternalRequests: 1,
+      ocr: { localOnly: true, recognize: async () => { ocrCalls += 1; return { lines: [{ text: "Send" }] }; } },
+    }),
+    onApprovalRequested: () => { approvals += 1; return "approve"; },
+  });
+  const result = await session.act({ steps: [{ kind: "click", target: { role: "Button", name: "Continue" } }] });
+  assert.equal(result.status, "stopped");
+  assert.equal(result.code, "risk_evidence_required");
+  assert.equal(ocrCalls, 1);
+  assert.equal(approvals, 0);
+  assert.equal(backend.calls.dispatch.length, 0);
+  await session.close();
+});
+
+test("changed OCR evidence cannot authorize a pending approval", async () => {
+  const backend = makeBackend();
+  backend.controls[0] = { ...backend.controls[0], name: "Continue", effect: "unknown", rect: { x: 0, y: 0, width: 80, height: 24 } };
+  let ocrCalls = 0;
+  const session = createDeskSession(backend, {
+    policy: createRiskPolicy({
+      maxExternalRequests: 2,
+      ocr: { localOnly: true, recognize: async () => ({ lines: [{ text: ocrCalls++ === 0 ? "Send" : "Pay" }] }) },
+    }),
+  });
+  const pending = await session.act({ steps: [{ kind: "click", target: { role: "Button", name: "Continue" } }] });
+  assert.equal(pending.code, "approval_required");
+  const result = await session.resolveApproval(pending.requestId, "approve");
+  assert.equal(result.status, "stopped");
+  assert.equal(result.code, "risk_evidence_required");
+  assert.equal(ocrCalls, 2);
+  assert.equal(backend.calls.dispatch.length, 0);
+  await session.close();
+});
+
+test("a newly active host approval requirement does not skip OCR revalidation", async () => {
+  const backend = makeBackend();
+  backend.controls[0] = { ...backend.controls[0], name: "Continue", effect: "unknown", rect: { x: 0, y: 0, width: 80, height: 24 } };
+  let required = false;
+  let ocrCalls = 0;
+  const session = createDeskSession(backend, {
+    policy: createRiskPolicy({
+      maxExternalRequests: 2,
+      ocr: { localOnly: true, recognize: async () => ({ lines: [{ text: ocrCalls++ === 0 ? "Send" : "Pay" }] }) },
+      hostRules: { requireApproval: () => required },
+    }),
+  });
+  const pending = await session.act({ steps: [{ kind: "click", target: { role: "Button", name: "Continue" } }] });
+  assert.equal(pending.code, "approval_required");
+  required = true;
+  const result = await session.resolveApproval(pending.requestId, "approve");
+  assert.equal(result.status, "stopped");
+  assert.equal(result.code, "risk_evidence_required");
+  assert.equal(ocrCalls, 2);
+  assert.equal(backend.calls.dispatch.length, 0);
   await session.close();
 });
 

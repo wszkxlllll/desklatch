@@ -35,6 +35,8 @@ export interface Control {
   approvalContext?: { token: string; summary?: string };
   /** Set only for a structurally identified, low-risk search/filter operation. */
   filterAction?: boolean;
+  /** The backend found that Enter in this field can submit its enclosing form. */
+  enterMaySubmit?: boolean;
 }
 export interface FrameImage { mimeType: string; dataBase64: string; width: number; height: number }
 export interface Frame {
@@ -57,5 +59,6 @@ export interface DesktopBackend {
   close(): Promise<void>;
 }
 export interface RiskInput { step: Step; target: Control; destination?: Control; signal?: AbortSignal }
-export interface RiskDecision { decision: "allow" | "approve" | "deny"; code: string }
+/** needs_evidence leaves the action unsent and returns control to the agent without opening an approval. */
+export interface RiskDecision { decision: "allow" | "approve" | "needs_evidence" | "deny"; code: string }
 export type RiskPolicy = (input: RiskInput) => Promise<RiskDecision> | RiskDecision;

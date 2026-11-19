@@ -97,6 +97,12 @@ export interface RawControl {
   href?: string;
   filterAction: boolean;
   disclosure: boolean;
+  /** Native form submission semantics, including a button's omitted default type. */
+  formSubmitter?: boolean;
+  /** A role=tab that is structurally tied to a same-document tabpanel. */
+  sameDocumentTab?: boolean;
+  /** Enter on this native single-line form control may invoke implicit submission. */
+  enterMaySubmit?: boolean;
   approvalCandidate?: boolean;
   approvalContext?: { token: string; summary?: string };
   tagName: string;
@@ -113,6 +119,7 @@ export interface InternalControl extends Control {
   __type?: string;
   __disabled: boolean;
   disclosure?: boolean;
+  enterMaySubmit?: boolean;
 }
 
 export interface FrameState {

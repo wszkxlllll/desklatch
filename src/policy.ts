@@ -15,7 +15,7 @@ import type {
  * A host may inject a local OCR adapter and/or a text-only reviewer through
  * `createRiskPolicy`; the default policy never asks either one for help.
  */
-export const RISK_POLICY_VERSION = "desklatch-risk-v1";
+export const RISK_POLICY_VERSION = "desklatch-risk-v2";
 
 export type RiskCategory =
   | "external"
@@ -147,9 +147,9 @@ export interface RiskPolicyOptions {
   ocr?: LocalOcrProvider;
   /** Region provider. If absent, policy will use target.rect only. */
   ocrRegion?: (input: RiskInput) => Rect | undefined;
-  /** Maximum reviewer/OCR time. Defaults to 1 second and is always bounded. */
+  /** Override the per-hook deadline. Defaults: 1s for host rules, 5s for OCR or review. */
   timeoutMs?: number;
-  /** Maximum reviewer/OCR requests made by this policy instance. Defaults to two. */
+  /** Optional cumulative cap shared by OCR and review for this policy instance. Each evaluation tries each at most once. */
   maxExternalRequests?: number;
   /** Host rules run before any optional reviewer and OCR. */
   hostRules?: RiskHostRules;
@@ -157,18 +157,55 @@ export interface RiskPolicyOptions {
   forbiddenHotkeys?: readonly (readonly string[])[];
 }
 
+type RiskEvidence =
+  | {
+      kind: "ocr";
+      input: RiskInput;
+      region: Rect;
+      lines: readonly TextRiskOcrLine[];
+      revalidationReserved: boolean;
+    }
+  | {
+      kind: "review";
+      input: RiskInput;
+      request: TextRiskReviewRequest;
+      /** Present when the reviewer saw OCR text and therefore needs fresh visual evidence. */
+      ocr?: { region: Rect; lines: readonly TextRiskOcrLine[]; revalidationReserved: boolean };
+    };
+
+type RiskPolicyRechecker = (
+  originalDecision: RiskDecision,
+  originalInput: RiskInput,
+  refreshedInput: RiskInput,
+) => Promise<RiskDecision>;
+
+// These maps deliberately never cross the public approval request boundary.
+// A pending approval keeps the returned decision object, while the optional
+// evidence that produced it remains host-only and can only be reused for that
+// exact decision/input pair during the one approval resumption.
+const riskEvidence = new WeakMap<RiskDecision, RiskEvidence>();
+const riskPolicyRecheckers = new WeakMap<RiskPolicy, RiskPolicyRechecker>();
+
+/** Internal session hook: recheck live host rules without repeating exact evidence. */
+export function recheckRiskApproval(
+  policy: RiskPolicy,
+  originalDecision: RiskDecision,
+  originalInput: RiskInput,
+  refreshedInput: RiskInput,
+): Promise<RiskDecision> | undefined {
+  const rechecker = riskPolicyRecheckers.get(policy);
+  return rechecker?.(originalDecision, originalInput, refreshedInput);
+}
+
 interface LocalClassification {
-  decision: "allow" | "approve" | "deny" | "review";
+  decision: RiskDecision["decision"] | "review";
   code: string;
   category?: RiskCategory;
   reason: string;
 }
 
-const DEFAULT_TIMEOUT_MS = 1_000;
-// One bounded local OCR pass plus one bounded text-only review pass may be
-// useful for a single ambiguous action. The host can lower this to one (or
-// zero) when its budget only permits one external operation.
-const DEFAULT_MAX_EXTERNAL_REQUESTS = 2;
+const HOST_RULE_TIMEOUT_MS = 1_000;
+const EVIDENCE_TIMEOUT_MS = 5_000;
 const MAX_REVIEW_TEXT = 320;
 const MAX_OCR_LINES = 24;
 const HIGH_RISK_EFFECTS = new Map<Effect, RiskCategory>([
@@ -195,19 +232,53 @@ export const defaultRiskPolicy: RiskPolicy = createRiskPolicy();
 
 /**
  * Construct an independent policy for one host/session. The returned function
- * is stateful only for its bounded external-request budget; no approval is
+ * is stateful only if the host sets a cumulative evidence budget; no approval is
  * cached, so a host must explicitly handle each `approve` result once.
  */
 export function createRiskPolicy(options: RiskPolicyOptions = {}): RiskPolicy {
-  const timeoutMs = boundedTimeout(options.timeoutMs);
-  const maxExternalRequests = boundedRequestBudget(options.maxExternalRequests);
+  const ruleTimeoutMs = boundedTimeout(options.timeoutMs ?? HOST_RULE_TIMEOUT_MS);
+  const evidenceTimeoutMs = boundedTimeout(options.timeoutMs ?? EVIDENCE_TIMEOUT_MS);
+  let remainingRequests = boundedRequestBudget(options.maxExternalRequests);
   const hostRules = options.hostRules ?? {};
   const reviewer = options.reviewer;
   const ocr = options.ocr;
   const forbiddenHotkeys = new Set((options.forbiddenHotkeys ?? []).map(normalizeHotkey));
-  let externalRequests = 0;
 
-  return async function riskPolicy(input: RiskInput): Promise<RiskDecision> {
+  const getOcrRegion = (input: RiskInput): Rect | undefined => {
+    try {
+      return options.ocrRegion ? options.ocrRegion(input) : input.target.rect;
+    } catch {
+      return undefined;
+    }
+  };
+
+  const freshOcr = async (
+    evidence: { region: Rect; lines: readonly TextRiskOcrLine[]; revalidationReserved: boolean },
+    input: RiskInput,
+  ): Promise<{ lines: readonly TextRiskOcrLine[] } | { decision: RiskDecision }> => {
+    if (ocr === undefined || (!evidence.revalidationReserved && remainingRequests === 0)) {
+      return { decision: decision("needs_evidence", "ocr_revalidation_budget_exhausted", "Fresh local visual evidence is required before approval can resume.") };
+    }
+    const region = getOcrRegion(input);
+    if (region === undefined || !isBoundedRegion(region) || !sameRect(region, evidence.region)) {
+      return { decision: decision("needs_evidence", "ocr_evidence_changed", "The bounded visual evidence changed before approval resumed.") };
+    }
+    if (evidence.revalidationReserved) evidence.revalidationReserved = false;
+    else remainingRequests -= 1;
+    const result = await runOcr(ocr, {
+      input,
+      region,
+      signal: input.signal ?? new AbortController().signal,
+    }, evidenceTimeoutMs);
+    if (result.kind === "aborted") return { decision: decision("deny", "aborted", "The action was cancelled during local evidence collection.") };
+    if (result.kind !== "ok") return { decision: decision("needs_evidence", result.code, "Fresh local visual evidence could not be collected.") };
+    if (evidenceFingerprint(result.lines) !== evidenceFingerprint(evidence.lines)) {
+      return { decision: decision("needs_evidence", "ocr_evidence_changed", "The bounded visual evidence changed before approval resumed.") };
+    }
+    return { lines: result.lines };
+  };
+
+  const riskPolicy: RiskPolicy = async function riskPolicy(input: RiskInput): Promise<RiskDecision> {
     const basic = validateInput(input);
     if (basic !== undefined) return basic;
 
@@ -216,60 +287,147 @@ export function createRiskPolicy(options: RiskPolicyOptions = {}): RiskPolicy {
 
     const hardRule = hostRules.hardDeny;
     if (hardRule !== undefined) {
-      const result = await runHostRule(hardRule, input, timeoutMs, input.signal);
+      const result = await runHostRule(hardRule, input, ruleTimeoutMs, input.signal);
       if (result.kind === "aborted") return decision("deny", "aborted", "The action was cancelled during host policy evaluation.");
       if (result.kind === "error") return decision("deny", "host_rule_failed_closed", "The host denial rule failed; the action is stopped.");
       if (result.match) return decision("deny", result.code ?? "host_denied", "The host policy denied this action.");
     }
 
     const local = classifyStructurally(input, forbiddenHotkeys);
-    if (local.decision === "deny") return decision("deny", local.code, local.reason);
+    if (local.decision === "deny" || local.decision === "needs_evidence") return decision(local.decision, local.code, local.reason);
 
     const approvalRule = hostRules.requireApproval;
     if (approvalRule !== undefined) {
-      const result = await runHostRule(approvalRule, input, timeoutMs, input.signal);
+      const result = await runHostRule(approvalRule, input, ruleTimeoutMs, input.signal);
       if (result.kind === "aborted") return decision("deny", "aborted", "The action was cancelled during host policy evaluation.");
-      if (result.kind === "error") return decision("approve", "host_rule_failed_closed", "The host approval rule could not be checked; approval is required.");
+      if (result.kind === "error") return decision("deny", "host_rule_failed_closed", "The host approval rule could not be checked.");
       if (result.match) return decision("approve", result.code ?? "host_approval_required", "The host policy requires approval for this action.");
     }
 
-    if (local.decision === "allow" || local.decision === "approve") {
+    if (local.decision !== "review") {
       return decision(local.decision, local.code, local.reason);
     }
 
     // Structural evidence is insufficient. OCR is deliberately lazy and only
     // gets a host-bounded region; its text is never sent to an image-capable API.
     let localText: readonly TextRiskOcrLine[] | undefined;
-    let region: Rect | undefined;
-    try {
-      region = options.ocrRegion?.(input) ?? input.target.rect;
-    } catch {
-      return decision("approve", "ocr_region_failed", "The bounded OCR region could not be determined; host approval is required.");
-    }
-    if (ocr !== undefined && region !== undefined && isBoundedRegion(region) && externalRequests < maxExternalRequests) {
-      externalRequests += 1;
-      const ocrResult = await runOcr(ocr, { input, region, signal: input.signal ?? new AbortController().signal }, timeoutMs);
-      if (ocrResult.kind === "ok") {
-        localText = ocrResult.lines;
-        const ocrRisk = classifyOcrText(localText);
-        if (ocrRisk !== undefined) return decision("approve", ocrRisk.code, ocrRisk.reason);
-      } else if (ocrResult.kind === "aborted") {
-        return decision("deny", "aborted", "The action was cancelled during local evidence collection.");
+    let localRegion: Rect | undefined;
+    if (ocr !== undefined && remainingRequests > 0) {
+      const region = getOcrRegion(input);
+      if (region !== undefined && isBoundedRegion(region)) {
+        localRegion = region;
+        remainingRequests -= 1;
+        const ocrResult = await runOcr(ocr, { input, region, signal: input.signal ?? new AbortController().signal }, evidenceTimeoutMs);
+        if (ocrResult.kind === "ok") {
+          localText = ocrResult.lines;
+          const ocrRisk = classifyOcrText(localText);
+          if (ocrRisk !== undefined) {
+            // Approval based on pixels needs one fresh bounded OCR pass at
+            // resume. Do not create consent that the configured cap cannot
+            // actually revalidate.
+            if (remainingRequests === 0) {
+              return decision("needs_evidence", "ocr_revalidation_budget_exhausted", "Fresh local visual evidence is required before approval can resume.");
+            }
+            // Reserve the fresh pass now so concurrent pending approvals
+            // cannot all spend the same final request at resume time.
+            remainingRequests -= 1;
+            return rememberRiskEvidence(
+              decision("approve", ocrRisk.code, ocrRisk.reason),
+              { kind: "ocr", input, region: cloneRect(region), lines: localText, revalidationReserved: true },
+            );
+          }
+        } else if (ocrResult.kind === "aborted") {
+          return decision("deny", "aborted", "The action was cancelled during local evidence collection.");
+        }
       }
     }
 
-    if (reviewer === undefined || externalRequests >= maxExternalRequests) {
-      return decision("approve", reviewer === undefined ? "ambiguous_requires_approval" : "review_budget_exhausted", "The immediate consequence is ambiguous; host approval is required.");
+    if (reviewer === undefined) return decision("needs_evidence", local.code, local.reason);
+    if (remainingRequests === 0) return decision("needs_evidence", "review_budget_exhausted", "The configured evidence budget is exhausted.");
+
+    remainingRequests -= 1;
+    const reviewRequest = makeTextReviewRequest(input, local.reason, localText);
+    const reviewed = await runReviewer(reviewer, reviewRequest, evidenceTimeoutMs, input.signal);
+    if (reviewed.kind === "aborted") return decision("deny", "aborted", "The action was cancelled during risk review.");
+    if (reviewed.kind !== "ok") return decision("needs_evidence", reviewed.code, reviewed.reason);
+
+    const reviewedDecision = decisionFromReview(reviewed.value);
+    if (reviewedDecision.decision !== "approve") return reviewedDecision;
+    // A review that included OCR is also approval based on visual evidence,
+    // so reserve a request for the fresh OCR pass before opening consent.
+    if (localText !== undefined && remainingRequests === 0) {
+      return decision("needs_evidence", "ocr_revalidation_budget_exhausted", "Fresh local visual evidence is required before approval can resume.");
+    }
+    if (localText !== undefined) {
+      // Reserve the fresh pass now so concurrent pending approvals cannot all
+      // pass a last-request check and later exceed the cumulative cap.
+      remainingRequests -= 1;
+    }
+    return rememberRiskEvidence(reviewedDecision, {
+      kind: "review",
+      input,
+      request: reviewRequest,
+       ...(localText === undefined || localRegion === undefined ? {} : { ocr: { region: cloneRect(localRegion), lines: localText, revalidationReserved: true } }),
+    });
+  };
+
+  const recheck: RiskPolicyRechecker = async (originalDecision, originalInput, refreshedInput): Promise<RiskDecision> => {
+    const basic = validateInput(refreshedInput);
+    if (basic !== undefined) return basic;
+    if (refreshedInput.signal?.aborted === true) return decision("deny", "aborted", "The action was cancelled before risk evaluation.");
+
+    const hardRule = hostRules.hardDeny;
+    if (hardRule !== undefined) {
+      const result = await runHostRule(hardRule, refreshedInput, ruleTimeoutMs, refreshedInput.signal);
+      if (result.kind === "aborted") return decision("deny", "aborted", "The action was cancelled during host policy evaluation.");
+      if (result.kind === "error") return decision("deny", "host_rule_failed_closed", "The host denial rule failed; the action is stopped.");
+      if (result.match) return decision("deny", result.code ?? "host_denied", "The host policy denied this action.");
     }
 
-    externalRequests += 1;
-    const reviewRequest = makeTextReviewRequest(input, local.reason, localText);
-    const reviewed = await runReviewer(reviewer, reviewRequest, timeoutMs, input.signal);
-    if (reviewed.kind === "aborted") return decision("deny", "aborted", "The action was cancelled during risk review.");
-    if (reviewed.kind !== "ok") return decision("approve", reviewed.code, reviewed.reason);
+    const local = classifyStructurally(refreshedInput, forbiddenHotkeys);
+    if (local.decision === "deny" || local.decision === "needs_evidence") return decision(local.decision, local.code, local.reason);
 
-    return decisionFromReview(reviewed.value);
+    const approvalRule = hostRules.requireApproval;
+    let liveApprovalCode: string | undefined;
+    if (approvalRule !== undefined) {
+      const result = await runHostRule(approvalRule, refreshedInput, ruleTimeoutMs, refreshedInput.signal);
+      if (result.kind === "aborted") return decision("deny", "aborted", "The action was cancelled during host policy evaluation.");
+      if (result.kind === "error") return decision("deny", "host_rule_failed_closed", "The host approval rule could not be checked.");
+      if (result.match) liveApprovalCode = result.code ?? "host_approval_required";
+    }
+
+    if (local.decision !== "review") return decision(local.decision, local.code, local.reason);
+
+    const evidence = riskEvidence.get(originalDecision);
+    if (!evidence || evidence.input !== originalInput || originalDecision.decision !== "approve") {
+      if (liveApprovalCode !== undefined) return decision("approve", liveApprovalCode, "The host policy requires approval for this action.");
+      return decision("needs_evidence", "approval_evidence_unavailable", "The original optional evidence is not bound to this action.");
+    }
+
+    if (evidence.kind === "ocr") {
+      const refreshedOcr = await freshOcr(evidence, refreshedInput);
+      if ("decision" in refreshedOcr) return refreshedOcr.decision;
+      const ocrRisk = classifyOcrText(refreshedOcr.lines);
+      if (ocrRisk === undefined || ocrRisk.code !== originalDecision.code) {
+        return decision("needs_evidence", "ocr_evidence_changed", "The bounded visual evidence no longer establishes the approved consequence.");
+      }
+      return liveApprovalCode === undefined ? originalDecision : decision("approve", liveApprovalCode, "The host policy requires approval for this action.");
+    }
+
+    let localText: readonly TextRiskOcrLine[] | undefined;
+    if (evidence.ocr !== undefined) {
+      const refreshedOcr = await freshOcr(evidence.ocr, refreshedInput);
+      if ("decision" in refreshedOcr) return refreshedOcr.decision;
+      localText = refreshedOcr.lines;
+    }
+    const refreshedRequest = makeTextReviewRequest(refreshedInput, local.reason, localText);
+    if (evidenceFingerprint(refreshedRequest) !== evidenceFingerprint(evidence.request)) {
+      return decision("needs_evidence", "review_evidence_changed", "The trusted text evidence changed before approval resumed.");
+    }
+    return liveApprovalCode === undefined ? originalDecision : decision("approve", liveApprovalCode, "The host policy requires approval for this action.");
   };
+  riskPolicyRecheckers.set(riskPolicy, recheck);
+  return riskPolicy;
 }
 
 function validateInput(input: RiskInput): RiskDecision | undefined {
@@ -306,21 +464,61 @@ function classifyStructurally(input: RiskInput, forbiddenHotkeys: ReadonlySet<st
   const stateError = checkStateForAction(step, target);
   if (stateError !== undefined) return stateError;
 
+  const enter = step.kind === "keypress" && /^(enter|return)$/iu.test(step.key);
+  if (enter && target.enterMaySubmit) {
+    return { decision: "needs_evidence", code: "implicit_form_submit", reason: "Use the explicit form control so its effect and submitted parameters can be checked." };
+  }
   const explicitRisk = effect === undefined ? undefined : HIGH_RISK_EFFECTS.get(effect);
   if (explicitRisk !== undefined) {
     return { decision: "approve", code: `effect_${explicitRisk}_requires_approval`, category: explicitRisk, reason: `The target is structurally marked as ${effect}.` };
   }
-  if (target.filterAction === true && (step.kind === "click" || step.kind === "keypress" || step.kind === "scroll" || step.kind === "type" || step.kind === "setValue")) {
+  if (target.sensitive === true) {
+    return { decision: "approve", code: "protected_target", category: "sensitive", reason: "The target is marked sensitive; host approval is required." };
+  }
+  if (step.kind === "drag") {
+    const destination = input.destination;
+    if (!destination) return { decision: "deny", code: "missing_drag_destination", reason: "A drag needs an identifiable destination." };
+    const category = destination.sensitive ? "sensitive" : destination.effect && HIGH_RISK_EFFECTS.get(destination.effect);
+    if (category) return { decision: "approve", code: `destination_${category}_requires_approval`, category, reason: "The drag destination is consequential." };
+    return { decision: "review", code: "ambiguous_drag", reason: "A drag can transfer or alter data; inspecting the source alone is insufficient." };
+  }
+
+  const primaryClick = step.kind === "click" && (step.button ?? "left") === "left" && (step.count ?? 1) === 1;
+  const targetRole = normalizeText(target.role).toLowerCase();
+  const actionLabel = isNonActionRole(targetRole) ? "" : normalizeText(target.name);
+  if ((step.kind === "click" || enter) && (effect === undefined || effect === "unknown")) {
+    const namedRisk = actionLabelRisk(actionLabel);
+    if (namedRisk !== undefined) {
+      return { decision: "approve", code: `label_${namedRisk}_requires_approval`, category: namedRisk, reason: "The target itself identifies a consequential action." };
+    }
+  }
+  if (target.filterAction === true && (primaryClick || enter || step.kind === "scroll" || step.kind === "type" || step.kind === "setValue")) {
     return { decision: "allow", code: "structural_filter_action", reason: "The host marked this as a bounded search/filter action." };
+  }
+  if (step.kind === "click" && !primaryClick) {
+    return { decision: "review", code: "alternate_click", reason: "The default action of this control does not establish the effect of this mouse gesture." };
+  }
+  if (step.kind === "hotkey") {
+    const chord = normalizeHotkey(step.keys);
+    if (target.states.includes("editable") && (chord === "a+ctrl" || chord === "a+control" || chord === "a+meta" || chord === "a+command")) {
+      return { decision: "allow", code: "select_field_text", reason: "Select all in the focused public editor." };
+    }
+    return { decision: "review", code: "shortcut_effect_unknown", reason: "The effect of this shortcut depends on the application command." };
+  }
+  if (step.kind === "keypress") {
+    const editable = target.states.includes("editable") || effect === "edit";
+    if (enter && editable) {
+      return { decision: "review", code: "implicit_activation", reason: "Enter in this editor may activate the form's default action; editing permission alone does not identify it." };
+    }
+    if (editable && isNavigationKey(step.key)) {
+      return { decision: "allow", code: "editor_navigation", reason: "The navigation key moves through the focused public editor." };
+    }
+    if (!enter || !/^(button|link)$/iu.test(target.role)) {
+      return { decision: "review", code: "key_effect_unknown", reason: "The effect of this key is not established by the control's default action." };
+    }
   }
   if (effect === "unknown") {
     return { decision: "review", code: "unknown_effect", category: "unknown", reason: "The target's immediate consequence is unknown." };
-  }
-
-  // Protected input is an approval boundary, but it is not a reason to expose
-  // the value to OCR/review. The policy only sees the target's sensitivity bit.
-  if (target.sensitive === true) {
-    return { decision: "approve", code: "protected_target", category: "sensitive", reason: "The target is marked sensitive; host approval is required." };
   }
 
   // Text contents are intentionally not inspected. A draft body containing
@@ -337,9 +535,6 @@ function classifyStructurally(input: RiskInput, forbiddenHotkeys: ReadonlySet<st
 
   // A target without a declared effect is only safe when the action and role
   // make the immediate consequence clear. Labels/nearby text are ignored.
-  const targetName = normalizeText(target.name);
-  const targetRole = normalizeText(target.role);
-  const actionLabel = targetName && !isNonActionRole(targetRole) ? targetName : "";
   if (isExplicitNegation(actionLabel)) {
     return { decision: "allow", code: "negated_action_label", reason: "A negated label is not evidence of a send/payment operation." };
   }
@@ -352,30 +547,12 @@ function classifyStructurally(input: RiskInput, forbiddenHotkeys: ReadonlySet<st
   }
 
   if (step.kind === "click") {
-    const namedRisk = actionLabelRisk(actionLabel);
-    if (namedRisk !== undefined) {
-      return { decision: "approve", code: `label_${namedRisk}_requires_approval`, category: namedRisk, reason: "The action target itself suggests a consequential operation." };
-    }
     if (SAFE_ACTION_TEXT.test(actionLabel) || isReadOnlyHistoryLabel(actionLabel) || isDraftActionLabel(actionLabel) || target.filterAction === true) {
       return { decision: "allow", code: "structural_safe_click", reason: "The action target is a clear navigation/filter control." };
     }
     return { decision: "review", code: "ambiguous_click_target", reason: "The click target's immediate consequence is not established." };
   }
 
-  if (step.kind === "drag") {
-    if (input.destination === undefined) return { decision: "review", code: "ambiguous_drag_destination", reason: "A drag destination is not available for consequence checking." };
-    if (input.destination.effect !== undefined && HIGH_RISK_EFFECTS.has(input.destination.effect)) {
-      const category = HIGH_RISK_EFFECTS.get(input.destination.effect)!;
-      return { decision: "approve", code: `destination_${category}_requires_approval`, category, reason: "The drag destination is consequential." };
-    }
-    return { decision: "review", code: "ambiguous_drag", reason: "A drag can transfer or alter data and needs consequence evidence." };
-  }
-
-  // Keypress/focus actions can submit forms or invoke browser/app commands;
-  // only a structurally known low-impact key gets an unconditional allow.
-  if (step.kind === "keypress" && isNavigationKey(step.key) && targetRole.includes("search")) {
-    return { decision: "allow", code: "structural_navigation_key", reason: "The key is a navigation key on a search target." };
-  }
   return { decision: "review", code: "ambiguous_action", reason: "The action's immediate consequence is not established." };
 }
 
@@ -462,15 +639,12 @@ function decisionFromReview(review: TextRiskReview): RiskDecision {
   if ("decision" in review) {
     if (review.decision === "deny") return decision("deny", "review_denied", review.reason ?? "The text-only reviewer denied this action.");
     if (review.decision === "approve") return decision("approve", "review_approval_required", review.reason ?? "The text-only reviewer requires host approval.");
-    if (review.classification === "clear" || review.classification === "low" || review.classification === undefined) {
-      return decision("allow", "review_clear", review.reason ?? "The text-only reviewer found no consequential effect.");
-    }
-    return decision("approve", "review_ambiguous", review.reason ?? "The text-only reviewer did not establish a low-risk effect.");
   }
-  if (review.classification === "clear" || review.classification === "low") {
+  if (review.classification === "clear" || review.classification === "low" || review.classification === undefined) {
     return decision("allow", "review_clear", review.reason ?? "The text-only reviewer found no consequential effect.");
   }
-  return decision("approve", `review_${review.classification}`, review.reason ?? `The text-only reviewer classified this action as ${review.classification}.`);
+  if (review.classification === "high") return decision("approve", "review_high", review.reason ?? "The reviewer identified a high-risk action.");
+  return decision("needs_evidence", `review_${review.classification}`, review.reason ?? "The reviewer could not establish the immediate consequence.");
 }
 
 async function runReviewer(
@@ -493,7 +667,7 @@ async function runReviewer(
   } catch {
     if (parentSignal?.aborted) return { kind: "aborted" };
     if (signal.aborted) return { kind: "timeout", code: "review_timeout", reason: "The text-only reviewer exceeded its bounded time." };
-    return { kind: "error", code: "review_failed", reason: "The text-only reviewer failed; host approval is required." };
+    return { kind: "error", code: "review_failed", reason: "The text-only reviewer could not complete the assessment." };
   } finally {
     clearTimeout(timeout);
   }
@@ -578,14 +752,30 @@ function decision(decisionValue: RiskDecision["decision"], code: string, _reason
   return { decision: decisionValue, code: normalizeCode(code) };
 }
 
-function boundedTimeout(value: number | undefined): number {
-  if (value === undefined) return DEFAULT_TIMEOUT_MS;
+function rememberRiskEvidence(result: RiskDecision, evidence: RiskEvidence): RiskDecision {
+  riskEvidence.set(result, evidence);
+  return result;
+}
+
+function sameRect(left: Rect, right: Rect): boolean {
+  return left.x === right.x && left.y === right.y && left.width === right.width && left.height === right.height;
+}
+
+function cloneRect(rect: Rect): Rect {
+  return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+}
+
+function evidenceFingerprint(value: unknown): string {
+  return JSON.stringify(value) ?? "";
+}
+
+function boundedTimeout(value: number): number {
   if (!Number.isFinite(value) || value < 1) throw new Error("timeoutMs must be a positive finite number");
   return Math.min(Math.floor(value), 60_000);
 }
 
 function boundedRequestBudget(value: number | undefined): number {
-  if (value === undefined) return DEFAULT_MAX_EXTERNAL_REQUESTS;
+  if (value === undefined) return Infinity;
   if (!Number.isInteger(value) || value < 0) throw new Error("maxExternalRequests must be a non-negative integer");
   return Math.min(value, 8);
 }
@@ -640,7 +830,7 @@ function isKnownForbiddenHotkey(value: string): boolean {
 }
 
 function isNavigationKey(value: string): boolean {
-  return new Set(["enter", "return", "tab", "escape", "esc", "arrowdown", "arrowup"]).has(normalizeText(value).toLowerCase());
+  return /^(tab|arrowleft|arrowright|arrowup|arrowdown|home|end)$/iu.test(normalizeText(value));
 }
 
 function isNonActionRole(role: string): boolean {

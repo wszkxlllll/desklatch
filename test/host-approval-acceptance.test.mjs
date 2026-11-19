@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { createDeskSession, createDeskTools } from "desklatch";
+import { createDeskSession, createDeskTools, createRiskPolicy } from "desklatch";
 import { createDeskMcpServer } from "desklatch/mcp";
 import { chromiumPath, createFixture } from "../examples/support/fixture.mjs";
 
@@ -81,4 +81,51 @@ test("the host sees a masked recipient and a changed addressee invalidates appro
     await session.close();
     await fixture.close();
   }
+});
+
+test("cleared steps execute in one real browser batch, uncertain steps return to the agent, and consent is reserved for the consequential action", {
+  skip: chromiumPath() ? false : "installed Chromium required",
+}, async () => {
+  const fixture = await createFixture();
+  const reviews = [];
+  const approvals = [];
+  const session = createDeskSession(fixture.backend, {
+    policy: createRiskPolicy({ reviewer(request) {
+      reviews.push(request.target.name);
+      return { classification: request.target.within === "Local previews" ? "low" : "unclear" };
+    } }),
+    onApprovalRequested(request) { approvals.push(request); },
+  });
+  try {
+    const previews = ["Outline", "Map", "Timeline", "Index"];
+    await fixture.page.setContent(`<fieldset aria-label="Local previews">
+      ${previews.map(name => `<button type="button">${name}</button>`).join("")}</fieldset>
+      <button type="button">Continue</button><a href="#details">View details</a><section id="details"></section>
+      <button type="button">Send report</button><output></output>
+      <script>document.addEventListener('click', e => document.querySelector('output').textContent += e.target.textContent + '|')</script>`);
+    const act = createDeskTools(session).find(tool => tool.name === "act");
+    const click = name => ({ kind: "click", target: { name } });
+    const result = await act.invoke({ steps: [...previews, "Continue", "Send report"].map(click) });
+    assert.deepEqual(reviews, [...previews, "Continue"], JSON.stringify(result));
+    assert.deepEqual(result.steps.map(step => step.status), [...previews.map(() => "dispatched"), "not_dispatched", "not_dispatched"]);
+    assert.equal(result.code, "risk_evidence_required");
+    assert.equal(result.steps[4].code, "review_unclear");
+    assert.equal(result.requestId, undefined);
+    assert.equal(approvals.length, 0);
+    assert.equal(await fixture.page.locator("output").textContent(), previews.join("|") + "|");
+
+    const alternative = await act.invoke({ steps: [click("View details")] });
+    assert.equal(alternative.status, "completed");
+    assert.equal(new URL(fixture.page.url()).hash, "#details");
+    assert.equal(approvals.length, 0);
+
+    const send = await act.invoke({ steps: [click("Send report")] });
+    assert.equal(send.code, "approval_required");
+    assert.equal(approvals.length, 1);
+    assert.equal(approvals[0].requestId, send.requestId);
+    await session.resolveApproval(send.requestId, "deny");
+    assert.equal(reviews.length, previews.length + 1);
+    assert.equal(await fixture.page.locator("output").textContent(), previews.join("|") + "|View details|");
+    assert.equal(fixture.stats.captures, 0);
+  } finally { await session.close(); }
 });

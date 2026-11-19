@@ -16,6 +16,7 @@ export const desktopToolInstructions = [
   "Use observe when you must discover a target, compare candidates, or obtain genuinely necessary visual information.",
   "A control name identifies the control. Take a value to enter from the user or from the relevant observed source. A graphic's name alone does not describe its pixels.",
   "Use actual receipts to decide how to continue. Stop on pending approval or uncertain delivery. The host owns consent.",
+  "On risk_evidence_required the step was not sent. Inspect the relevant controls or choose an explicit control with a discernible effect. If nothing new establishes the effect, leave the step unsent.",
 ].join(" ");
 
 /** The agent side receives these two capabilities only. Control-plane methods stay with the host. */
@@ -70,7 +71,7 @@ export function createDeskTools(session: DesktopToolSession): ToolEndpoint[] {
   const parameters = examples.length ? ` Valid individual steps: ${examples.join(" or ")}.` : "";
   return [observe, {
       name: "act",
-      description: "Use act first for known targets. Put successive actions together in the steps array. Only refs or pixels require observationId." + parameters
+      description: "Use act first for known targets. Put successive actions together in the steps array. Only refs or pixels require observationId. On risk_evidence_required inspect or choose a clearer control before retrying; approval_required waits for the host." + parameters
         + ' Each step uses only its own keys. Omit unused keys entirely. If checking a result, add "expect":{"target":{"name":"City"},"valueEquals":"Paris"} inside the action that produces it.',
       inputSchema: actToolSchema(session.capabilities, session.limits),
       invoke: async (input, signal) => session.act(input, signal),

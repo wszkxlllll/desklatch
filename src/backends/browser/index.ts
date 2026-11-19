@@ -128,16 +128,18 @@ function riskFor(step: Step, control: InternalControl): import("./types.js").Bro
   }
   if (step.kind === "scroll") return { level: "low", effect: "read", requiresApproval: false, reason: "bounded_scroll" };
   if (step.kind === "type" || step.kind === "setValue") return { level: "low", effect: "edit", requiresApproval: false, reason: "public_field_edit" };
+  // Structural benign markers are subordinate to the effect classification.
+  // For example, a native submitter may also expose aria-expanded; only a
+  // separately evidenced scoped search/filter remains a benign exception.
+  const consequentialEffect = control.effect;
+  if (consequentialEffect && ["financial", "destructive", "security", "external"].includes(consequentialEffect)) {
+    return { level: "high", effect: consequentialEffect, requiresApproval: true, reason: `${consequentialEffect}_action` };
+  }
   if (control.disclosure && step.kind === "click") return { level: "low", effect: "read", requiresApproval: false, reason: "same_page_disclosure" };
   if (control.filterAction && (step.kind === "click" || (step.kind === "keypress" && step.key === "Enter"))) {
     return { level: "low", effect: "read", requiresApproval: false, reason: "scoped_search_filter" };
   }
   switch (control.effect) {
-    case "financial":
-    case "destructive":
-    case "security":
-    case "external":
-      return { level: "high", effect: control.effect, requiresApproval: true, reason: `${control.effect}_action` };
     case "navigate":
       return { level: "medium", effect: "navigate", requiresApproval: true, reason: "navigation" };
     case "unknown":

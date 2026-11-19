@@ -45,7 +45,7 @@ test("unknown actions do not silently allow and a clear text-only review may all
   assert.equal(Object.hasOwn(request, "imageBase64"), false);
 
   const noReviewer = await defaultRiskPolicy(input({ kind: "click", target: { role: "button", name: "Continue" } }, control({ role: "button", name: "Continue", actions: ["click"] })));
-  assert.equal(noReviewer.decision, "approve");
+  assert.equal(noReviewer.decision, "needs_evidence");
 });
 
 test("host hard denial cannot be overridden by a reviewer", async () => {
@@ -65,12 +65,69 @@ test("host hard denial cannot be overridden by a reviewer", async () => {
   assert.equal(ocrCalls, 0);
 });
 
-test("review timeout fails closed to approval", async () => {
+test("a review timeout leaves the step unsent without requesting consent", async () => {
   const policy = createRiskPolicy({
     timeoutMs: 10,
     reviewer: () => new Promise(() => {}),
   });
   const result = await policy(input({ kind: "click", target: { role: "button", name: "Continue" } }, control({ role: "button", name: "Continue", actions: ["click"] })));
-  assert.equal(result.decision, "approve");
+  assert.equal(result.decision, "needs_evidence");
   assert.equal(result.code, "review_timeout");
+});
+
+test("each ambiguous step can be cleared, and an explicit cumulative budget is respected", async () => {
+  const step = input({ kind: "click", target: { name: "Continue" } },
+    control({ role: "button", name: "Continue", effect: "unknown", actions: ["click"] }));
+  let reviews = 0;
+  const reviewer = () => { reviews++; return { classification: "low" }; };
+  const policy = createRiskPolicy({ reviewer });
+  for (let index = 0; index < 4; index++) assert.equal((await policy(step)).decision, "allow");
+  assert.equal(reviews, 4);
+
+  const metered = createRiskPolicy({ reviewer, maxExternalRequests: 1 });
+  const results = await Promise.all([metered(step), metered(step)]);
+  assert.deepEqual(results.map(result => result.decision).sort(), ["allow", "needs_evidence"]);
+  assert.equal(results.find(result => result.decision === "needs_evidence").code, "review_budget_exhausted");
+  assert.equal(reviews, 5);
+});
+
+test("review distinguishes an identifiable risk, insufficient evidence and a definite refusal", async () => {
+  const step = input({ kind: "click", target: { name: "Continue" } },
+    control({ role: "button", name: "Continue", effect: "unknown", actions: ["click"] }));
+  for (const [review, expected] of [
+    [{ classification: "high" }, "approve"],
+    [{ classification: "suspicious" }, "needs_evidence"],
+    [{ classification: "unclear" }, "needs_evidence"],
+    [{ classification: "unknown" }, "needs_evidence"],
+    [{ decision: "deny" }, "deny"],
+  ]) {
+    assert.equal((await createRiskPolicy({ reviewer: () => review })(step)).decision, expected);
+  }
+});
+
+test("a failed OCR crop can fall back to text; an inconclusive crop by itself never opens approval", async () => {
+  const step = input({ kind: "click", target: { name: "Continue" } },
+    control({ role: "button", name: "Continue", effect: "unknown", rect: { x: 0, y: 0, width: 52, height: 24 } }));
+  const ocr = { localOnly: true, recognize: async () => ({ lines: [] }) };
+  const missingCrop = createRiskPolicy({ ocr, ocrRegion() { throw Error("unavailable"); },
+    reviewer: () => ({ classification: "low" }) });
+  assert.equal((await missingCrop(step)).decision, "allow");
+  assert.equal((await createRiskPolicy({ ocr })(step)).decision, "needs_evidence");
+});
+
+test("field editing, activation, and drag destinations are assessed separately", async () => {
+  const editor = control({ effect: "edit", actions: ["type", "keypress"] });
+  const target = { name: editor.name };
+  assert.equal((await defaultRiskPolicy(input({ kind: "type", target, text: "draft" }, editor))).decision, "allow");
+  assert.equal((await defaultRiskPolicy(input({ kind: "keypress", target, key: "ArrowLeft" }, editor))).decision, "allow");
+  assert.equal((await defaultRiskPolicy(input({ kind: "keypress", target, key: "Enter" }, editor))).decision, "needs_evidence");
+
+  const neverReview = createRiskPolicy({ reviewer() { assert.fail("known risks must not reach the reviewer"); } });
+  const named = control({ role: "button", name: "Send", effect: "unknown" });
+  assert.equal((await neverReview(input({ kind: "click", target: { name: "Send" } }, named))).decision, "approve");
+  assert.equal((await neverReview(input({ kind: "type", target, text: "test" },
+    control({ sensitive: true, effect: "unknown" })))).decision, "approve");
+  const dragged = input({ kind: "drag", from: { x: 2, y: 3 }, to: { x: 5, y: 7 } }, control({ effect: "read" }),
+    { destination: control({ id: "dest", effect: "destructive" }) });
+  assert.equal((await neverReview(dragged)).decision, "approve");
 });
