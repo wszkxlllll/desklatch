@@ -45,13 +45,6 @@ export interface WindowsDesktopAuthorization {
   readonly allowDesktopCapture?: boolean;
   /** Explicitly permits foreground input for future coordinate-only actions. */
   readonly allowForegroundInput?: boolean;
-  /**
-   * Narrow host opt-in for native ListItem controls that expose only
-   * SelectionItemPattern. Such controls are dispatched as a fresh, exact
-   * foreground physical click after visibility/enabled/geometry checks; they
-   * are never treated as background InvokePattern actions.
-   */
-  readonly allowForegroundSelectionClicks?: boolean;
   /** Explicit opt-in for a verified native background delivery source. */
   readonly background?: { readonly source: WindowsBackgroundSource };
 }

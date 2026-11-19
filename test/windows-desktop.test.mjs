@@ -111,6 +111,32 @@ test('foreign popup occlusion is checked immediately before dispatch', async () 
   await backend.close();
 });
 
+test('CUA select-only ListItems remain read-only without a semantic-to-coordinate click fallback', async () => {
+  const transport = {
+    source: 'cua-uia-0.54',
+    async observeWindow(target) {
+      return {
+        ...snapshot(target, 'Fixture A', 20, 30, 'select-only'),
+        elements: [
+          { index: '0', depth: 0, role: 'Window', label: 'Fixture A', actions: [], rect: { x: 20, y: 30, width: 420, height: 280 } },
+          { index: '1', depth: 1, role: 'ListItem', label: 'Save As', actions: ['select'], enabled: true, rect: { x: 40, y: 70, width: 120, height: 30 }, parentIndex: '0' },
+        ],
+      };
+    },
+    async dispatch() { return { status: 'dispatched' }; },
+  };
+  const backend = await createWindowsDesktopBackend({
+    authorization: { targets: [targetA], allowForegroundInput: true, allowDesktopCapture: true },
+    transport,
+    inspector: { async read(target) { return { target, visible: true, minimized: false, bounds: { x: 20, y: 30, width: 420, height: 280 }, foregroundHwnd: target.hwnd }; } },
+  });
+  const frame = await backend.observe({ view: 'controls' });
+  const saveAs = frame.controls.find(control => control.role === 'ListItem');
+  assert.ok(saveAs);
+  assert.deepEqual(saveAs.actions, []);
+  await backend.close();
+});
+
 test('foreground desktop point lane switches only after explicit host grant and recheck', async () => {
   const calls = [];
   let foreground = targetB.hwnd;
