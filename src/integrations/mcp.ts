@@ -10,9 +10,7 @@ import {
   errorText,
   imagePolicy,
   normalizeEndpoints,
-  observationWithoutPixels,
-  safeJson,
-  type ImagePolicy,
+  toDesktopContent,
   type IntegrationOptions,
 } from "./shared.js";
 
@@ -32,27 +30,6 @@ function textResult(text: string, isError = false): CallToolResult {
     content: [{ type: "text", text }],
     ...(isError ? { isError: true } : {}),
   };
-}
-
-/**
- * Convert an endpoint result to an MCP CallToolResult. Frame images use MCP's
- * native image content block; the text block contains only non-pixel metadata.
- */
-function toMcpResult(value: unknown, policy: ImagePolicy = "native"): CallToolResult {
-  const normalized = observationWithoutPixels(value);
-  if (!normalized.image) return textResult(safeJson(normalized.value));
-
-  const content: CallToolResult["content"] = [
-    { type: "text", text: safeJson(normalized.value) },
-  ];
-  if (policy === "native") {
-    content.push({
-      type: "image",
-      data: normalized.image.dataBase64,
-      mimeType: normalized.image.mimeType,
-    });
-  }
-  return { content };
 }
 
 /**
@@ -86,13 +63,13 @@ export function createDeskMcpServer(
     })),
   }));
 
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  server.setRequestHandler(CallToolRequestSchema, async (request, context) => {
     const endpoint = byName.get(request.params.name as ToolEndpoint["name"]);
     if (!endpoint) return textResult(`Unknown DeskLatch tool: ${request.params.name}`, true);
 
     try {
       const input = request.params.arguments ?? {};
-      return toMcpResult(await endpoint.invoke(input), imagePolicy(options));
+      return { content: toDesktopContent(await endpoint.invoke(input, context.signal), imagePolicy(options)) };
     } catch (error) {
       return textResult(errorText(error), true);
     }

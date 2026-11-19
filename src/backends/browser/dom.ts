@@ -80,6 +80,7 @@ function cssAttributeEscape(value: string): string {
 
 export function classifyEffect(raw: Pick<RawControl, "role" | "name" | "tagName" | "href" | "sensitive" | "disclosure"> & { filterAction: boolean }): Effect {
   if (raw.sensitive) return "sensitive";
+  if (raw.role === "img") return "read";
   if (raw.disclosure) return "read";
   if (raw.filterAction) return "read";
   const name = raw.name ?? "";
@@ -250,6 +251,7 @@ export function createRawCollectionScript() {
       const explicit = attr(element, "role")?.toLocaleLowerCase();
       if (explicit) return explicit;
       const tag = element.tagName.toLocaleLowerCase();
+      if (tag === "canvas" || tag === "img" || tag === "svg") return "img";
       if (tag === "button" || tag === "summary") return "button";
       if (tag === "a" && element.hasAttribute("href")) return "link";
       if (tag === "textarea") return "textbox";
@@ -291,6 +293,7 @@ export function createRawCollectionScript() {
       const labelledBy = attr(element, "aria-labelledby");
       if (labelledBy) { const value = labelledBy.split(/\s+/u).map((id) => document.getElementById(id)?.textContent || "").join(" "); if (text(value)) return text(value); }
       if (labels.length) return labels.join(" ");
+      if (element instanceof HTMLImageElement && element.alt) return text(element.alt);
       const title = attr(element, "title");
       if (title) return text(title);
       const placeholder = attr(element, "placeholder");
@@ -320,12 +323,15 @@ export function createRawCollectionScript() {
       return { keys: [] };
     };
     const controls: any[] = [];
+    const graphics: any[] = [];
     for (const element of nodes) {
       const role = roleFor(element);
-      if (!role || (!interactiveTags.has(element.tagName) && !interactiveRoles.has(role))) continue;
+      const graphic = role === "img";
+      if (!role || (!graphic && !interactiveTags.has(element.tagName) && !interactiveRoles.has(role))) continue;
       const style = getComputedStyle(element);
       const labels = labelsFor(element);
       const name = nameFor(element, labels);
+      if (graphic && (!name || !visible(element, style) || element.closest('[aria-hidden="true"],button,a,[role="button"],[role="link"]'))) continue;
       const sensitive = isProtected(element, name, labels);
       const canonicalName = name?.normalize("NFKC").toLocaleLowerCase();
       const form = (element as HTMLButtonElement).form || (element as HTMLInputElement).form || (element as HTMLSelectElement).form || (element as HTMLTextAreaElement).form || element.closest("form");
@@ -349,25 +355,26 @@ export function createRawCollectionScript() {
       if ((element as HTMLInputElement).checked || element.getAttribute("aria-checked") === "true") states.push("checked");
       if (element.getAttribute("aria-selected") === "true" || element.hasAttribute("selected")) states.push("selected");
       const actions: string[] = [];
-      if (["button", "checkbox", "link", "menuitem", "option", "radio", "switch", "tab"].includes(role) || ["A", "BUTTON", "SUMMARY"].includes(element.tagName)) actions.push("click");
-      if (editable(element, role)) actions.push("type", "setValue");
-      if (states.includes("enabled")) actions.push("keypress", "hotkey");
-      if (element.scrollHeight > element.clientHeight || element.scrollWidth > element.clientWidth) actions.push("scroll");
+      if (!graphic && (["button", "checkbox", "link", "menuitem", "option", "radio", "switch", "tab"].includes(role) || ["A", "BUTTON", "SUMMARY"].includes(element.tagName))) actions.push("click");
+      if (!graphic && editable(element, role)) actions.push("type", "setValue");
+      if (!graphic && states.includes("enabled")) actions.push("keypress", "hotkey");
+      if (!graphic && (element.scrollHeight > element.clientHeight || element.scrollWidth > element.clientWidth)) actions.push("scroll");
       const rect = element.getBoundingClientRect();
       const id = attr(element, "id");
       const testid = attr(element, "data-testid") || attr(element, "data-test");
       const elementName = attr(element, "name");
       const stableKind = id ? "id" : testid ? "testid" : elementName ? "name" : "path";
       const baseKey = id ? `id:${id}` : testid ? `testid:${testid}` : elementName ? `name:${elementName}:${role}` : `path:${pathFor(element)}`;
-      controls.push({
+      (graphic ? graphics : controls).push({
         path: pathFor(element), key: baseKey, role, name, labels, within: within.name, withinKeys: within.keys,
         states, actions, rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
-        value: sensitive || !includePublicValues ? undefined : (element as HTMLInputElement).value,
+        value: graphic || sensitive || !includePublicValues ? undefined : (element as HTMLInputElement).value,
         sensitive, href: attr(element, "href"), filterAction, disclosure, approvalCandidate, tagName: element.tagName.toLocaleLowerCase(), type: attr(element, "type"),
         disabled: !enabled(element), stableKind,
       });
     }
-    return { controls, total: controls.length };
+    // Read-only visual landmarks follow actionable controls in the bounded public list.
+    return { controls: controls.concat(graphics), total: controls.length + graphics.length };
   };
 }
 

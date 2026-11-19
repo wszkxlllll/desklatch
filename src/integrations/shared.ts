@@ -103,6 +103,14 @@ export function safeJson(value: unknown): string {
   }
 }
 
+/** Content blocks shared by native DSH tool projection and MCP. No transports or SDKs are loaded here. */
+export function toDesktopContent(value: unknown, policy: ImagePolicy = "native") {
+  const normalized = observationWithoutPixels(value);
+  const text = { type: "text" as const, text: safeJson(normalized.value) };
+  if (!normalized.image || policy === "omit") return [text];
+  return [text, { type: "image" as const, data: normalized.image.dataBase64, mimeType: normalized.image.mimeType }];
+}
+
 const publicToolErrors = new Set(["closed", "invalid_view", "invalid_observe", "invalid_observe_filter",
   "image_delivery_not_authorized", "observe_failed", "cancelled"]);
 

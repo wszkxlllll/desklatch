@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { AIMessage } from "@langchain/core/messages";
+import { AIMessage, HumanMessage, ToolMessage } from "@langchain/core/messages";
+import { ChatOpenAI } from "@langchain/openai";
 import { ToolNode } from "@langchain/langgraph/prebuilt";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
-import { createLangChainTools } from "desklatch/langchain";
+import { createLangChainTools, prepareDeskChatCompletionsMessages } from "desklatch/langchain";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createDeskMcpServer } from "desklatch/mcp";
 import { createDeskTools } from "desklatch";
@@ -35,6 +36,35 @@ test("LangGraph ToolNode invokes only observe and act and keeps image bytes nati
   assert.equal(content.some((block) => block.type === "image" && block.data === PIXELS), true);
   const text = content.find((block) => block.type === "text")?.text ?? "";
   assert.equal(text.includes(PIXELS), false);
+});
+
+test("Chat Completions receives requested screen pixels once, after all tool replies, without changing graph history", async () => {
+  const ask = new AIMessage({ content: "", tool_calls: [
+    { name: "observe", args: { view: "both" }, id: "screen", type: "tool_call" },
+    { name: "another", args: {}, id: "sibling", type: "tool_call" },
+  ] });
+  const observation = new ToolMessage({ name: "observe", tool_call_id: "screen", content: [
+    { type: "text", text: '{"observationId":"one"}' }, { type: "image", mimeType: "image/png", data: PIXELS },
+  ] });
+  const sibling = new ToolMessage({ name: "another", tool_call_id: "sibling", content: "ok" });
+  const history = [new HumanMessage("Use the displayed value"), ask, observation, sibling];
+  const adapted = prepareDeskChatCompletionsMessages(history);
+  assert.deepEqual(prepareDeskChatCompletionsMessages(adapted), adapted);
+  assert.equal(observation.content[1].data, PIXELS);
+  assert.equal(prepareDeskChatCompletionsMessages([observation])[0], observation);
+  let sent;
+  const model = new ChatOpenAI({ apiKey: "local-fixture", model: "glm-5.3-flash", maxRetries: 0,
+    configuration: { fetch: async (_url, init) => {
+      sent = JSON.parse(init.body).messages;
+      return Response.json({ id: "local", object: "chat.completion", model: "fixture", created: 0,
+        choices: [{ index: 0, finish_reason: "stop", message: { role: "assistant", content: "done" } }] });
+    } } });
+  await model.invoke(adapted);
+  assert.deepEqual(sent.map(message => message.role), ["user", "assistant", "tool", "tool", "user"]);
+  assert.deepEqual(sent.slice(2, 4).map(message => message.tool_call_id), ["screen", "sibling"]);
+  assert.equal(sent[2].content, '{"observationId":"one"}');
+  assert.match(sent[4].content[0].text, /observe \(screen\)/);
+  assert.deepEqual(sent[4].content[1], { type: "image_url", image_url: { url: `data:image/png;base64,${PIXELS}` } });
 });
 
 test("official MCP Client lists and calls the same endpoints over InMemoryTransport", async t => {

@@ -93,7 +93,7 @@ export interface DeskSession {
   readonly allowModelImages: boolean;
   readonly limits: Readonly<{ maxSteps: number; maxTextLength: number; maxScrollAmount: number }>;
   observe(options?: DeskObserveOptions): Promise<DeskObservation>;
-  act(raw: unknown): Promise<ActResult>;
+  act(raw: unknown, signal?: AbortSignal): Promise<ActResult>;
   resolveApproval(requestId: string, decision: ApprovalDecision): Promise<ApprovalResolution>;
   correct(reason?: string): void;
   cancel(reason?: string): void;

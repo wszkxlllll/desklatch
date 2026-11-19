@@ -5,7 +5,7 @@ export interface ToolEndpoint {
   name: "observe" | "act";
   description: string;
   inputSchema: Record<string, unknown>;
-  invoke(input: unknown): Promise<unknown>;
+  invoke(input: unknown, signal?: AbortSignal): Promise<unknown>;
 }
 
 /** Optional fragment for an existing agent's own instructions. It does not select a tool on its behalf. */
@@ -14,7 +14,8 @@ export const desktopToolInstructions = [
   "DeskLatch performs its own live lookup inside act. An initial observe just to check whether a named field exists is redundant.",
   "Include a named target that appears after an earlier step in the same batch. Each step is resolved immediately before it runs.",
   "Use observe when you must discover a target, compare candidates, or obtain genuinely necessary visual information.",
-  "Use actual receipts to decide how to continue. Stop on pending approval or uncertain delivery; the host owns consent.",
+  "A control name identifies the control. Take a value to enter from the user or from the relevant observed source. A graphic's name alone does not describe its pixels.",
+  "Use actual receipts to decide how to continue. Stop on pending approval or uncertain delivery. The host owns consent.",
 ].join(" ");
 
 /** The agent side receives these two capabilities only. Control-plane methods stay with the host. */
@@ -22,8 +23,8 @@ export interface DesktopToolSession {
   readonly capabilities: readonly Capability[];
   readonly allowModelImages: boolean;
   readonly limits?: { maxSteps?: number; maxTextLength?: number; maxScrollAmount?: number };
-  observe(input: { view?: View; where?: Selector }): Promise<unknown>;
-  act(input: unknown): Promise<unknown>;
+  observe(input: { view?: View; where?: Selector; signal?: AbortSignal }): Promise<unknown>;
+  act(input: unknown, signal?: AbortSignal): Promise<unknown>;
 }
 
 const states = ["visible", "enabled", "editable", "focused", "checked", "selected"] as const;
@@ -48,7 +49,8 @@ export function createDeskTools(session: DesktopToolSession): ToolEndpoint[] {
   const allowImages = session.allowModelImages === true;
   const observe: ToolEndpoint = {
       name: "observe",
-      description: "Discover unspecified controls or resolve ambiguity. Known names can go directly to act without calling this tool. Default to text controls. Request a picture only when new visual information is necessary and authorized.",
+      description: "Discover controls and named graphics, or resolve ambiguity. Known targets can go directly to act. The controls view lists actual names, roles and available public values."
+        + (allowImages ? " Use image or both to read information depicted in a graphic." : " This session permits text observations."),
       inputSchema: {
         type: "object", additionalProperties: false, properties: {
           view: { type: "string", enum: allowImages ? ["controls", "image", "both"] : ["controls"], default: "controls" },
@@ -57,7 +59,7 @@ export function createDeskTools(session: DesktopToolSession): ToolEndpoint[] {
           } },
         },
       },
-      invoke: async input => session.observe(readObserveArgs(input, allowImages)),
+      invoke: async (input, signal) => session.observe({ ...readObserveArgs(input, allowImages), signal }),
     };
   if (session.capabilities.length === 0) return [observe];
   const examples = [];
@@ -71,7 +73,7 @@ export function createDeskTools(session: DesktopToolSession): ToolEndpoint[] {
       description: "Use act first for known targets. Put successive actions together in the steps array. Only refs or pixels require observationId." + parameters
         + ' Each step uses only its own keys. Omit unused keys entirely. If checking a result, add "expect":{"target":{"name":"City"},"valueEquals":"Paris"} inside the action that produces it.',
       inputSchema: actToolSchema(session.capabilities, session.limits),
-      invoke: async input => session.act(input),
+      invoke: async (input, signal) => session.act(input, signal),
     },
   ];
 }

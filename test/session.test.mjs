@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createDeskSession } from "../dist/session.js";
+import { createDeskTools } from "desklatch";
 
 const capabilities = [
   { kind: "click", targets: ["selector"], buttons: ["left"], counts: [1] },
@@ -154,6 +155,24 @@ test("cancel while risk policy is in flight returns without dispatch", async () 
   assert.equal(result.code, "cancelled");
   assert.equal(backend.calls.dispatch.length, 0);
   await session.close();
+});
+
+test("a host tool-call cancellation invalidates only that batch's pending approval", async () => {
+  const backend = makeBackend();
+  const session = createDeskSession(backend, { policy: () => ({ decision: "approve", code: "needs_host" }) });
+  const first = new AbortController();
+  const [, act] = createDeskTools(session);
+  const request = { steps: [{ kind: "click", target: { name: "Save" } }] };
+  try {
+    const a = await act.invoke(request, first.signal);
+    const b = await act.invoke(request);
+    assert.equal(a.code, "approval_required");
+    assert.equal(b.code, "approval_required");
+    first.abort();
+    assert.equal((await session.resolveApproval(a.requestId, "approve")).code, "cancelled");
+    assert.equal((await session.resolveApproval(b.requestId, "approve")).status, "completed");
+    assert.equal(backend.calls.dispatch.length, 1);
+  } finally { await session.close(); }
 });
 
 test("approval binding rejects a material context-token change", async () => {

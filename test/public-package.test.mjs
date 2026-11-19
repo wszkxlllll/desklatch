@@ -10,7 +10,7 @@ test("installing a host does not require loading any framework, browser, CUA or 
   const code = `
     import { registerHooks } from 'node:module';
     registerHooks({resolve(name, context, next) {
-      if (/^(?:@langchain|@openai|@e2b|@trycua|@modelcontextprotocol|playwright-core|koffi|openai)(?:\\/|$)/.test(name)) {
+      if (/^(?:@deepseek-ai|@langchain|@openai|@e2b|@trycua|@modelcontextprotocol|playwright-core|koffi|openai)(?:\\/|$)/.test(name)) {
         throw Error('unexpected core dependency ' + name);
       }
       return next(name, context);

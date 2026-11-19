@@ -18,12 +18,12 @@ export function createOpenAIAgentsTools(endpoints: readonly ToolEndpoint[]): Fun
       },
       // Compound capability schemas are validated by DeskLatch on every invocation.
       strict: false, isEnabled: async () => true, needsApproval: async () => false,
-      invoke: async (_context, input) => {
+      invoke: async (_context, input, details) => {
         let args: unknown;
         try { args = JSON.parse(input); }
         catch { return JSON.stringify({ status: "rejected", code: "invalid_json" }); }
         let output: unknown;
-        try { output = await endpoint.invoke(args); }
+        try { output = await endpoint.invoke(args, details?.signal); }
         catch (error) { return JSON.stringify({ error: errorText(error) }); }
         const result = observationWithoutPixels(output);
         const text = JSON.stringify(result.value);

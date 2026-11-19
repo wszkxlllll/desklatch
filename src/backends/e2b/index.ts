@@ -172,7 +172,9 @@ export async function openE2BManagedPage(guest: E2BGuest, options: E2BBrowserOpt
 export async function createE2BBrowserBackend(guest: E2BGuest, options: E2BBrowserOptions = {}): Promise<DesktopBackend> {
   const managed = await openE2BManagedPage(guest, options);
   try {
-    const scoped = await createBrowserBackend(managed.page, options.browser);
+    // Playwright actionability and delivery span multiple round trips to the guest.
+    const scoped = createBrowserBackend(managed.page, { ...options.browser,
+      actionTimeoutMs: options.browser?.actionTimeoutMs ?? 15_000 });
     // Preserve method receivers; the caller owns the enclosing sandbox.
     return {
       capabilities: scoped.capabilities,

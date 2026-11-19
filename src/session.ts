@@ -78,7 +78,7 @@ interface ActiveExecution {
   pinnedObservations: Set<StoredObservation>;
   focusRecords: Map<number, FocusRecord>;
   timeoutTimer?: ReturnType<typeof setTimeout>;
-  removeGlobalAbort?: () => void;
+  removeParentAbort?: () => void;
   suspended?: SuspendedBatch;
 }
 
@@ -414,7 +414,7 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
     }
   }
 
-  function startExecution(): ActiveExecution {
+  function startExecution(callSignal?: AbortSignal): ActiveExecution {
     const controller = new AbortController();
     const execution: ActiveExecution = {
       controller,
@@ -433,16 +433,17 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
       }
     }, limit);
     if (typeof execution.timeoutTimer === "object" && "unref" in execution.timeoutTimer) execution.timeoutTimer.unref();
-    const onGlobalAbort = (): void => {
+    const parent = callSignal ? AbortSignal.any([globalAbort.signal, callSignal]) : globalAbort.signal;
+    const onAbort = (): void => {
       if ((active !== execution && !execution.suspended) || controller.signal.aborted) return;
       execution.reason = "cancelled";
       controller.abort("cancelled");
       cancelPending(execution, "cancelled");
     };
-    if (globalAbort.signal.aborted) onGlobalAbort();
+    if (parent.aborted) onAbort();
     else {
-      globalAbort.signal.addEventListener("abort", onGlobalAbort, { once: true });
-      execution.removeGlobalAbort = () => globalAbort.signal.removeEventListener("abort", onGlobalAbort);
+      parent.addEventListener("abort", onAbort, { once: true });
+      execution.removeParentAbort = () => parent.removeEventListener("abort", onAbort);
     }
     return execution;
   }
@@ -450,7 +451,7 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
   function finishExecution(execution: ActiveExecution): void {
     if (active === execution) active = undefined;
     if (execution.timeoutTimer) clearTimeout(execution.timeoutTimer);
-    execution.removeGlobalAbort?.();
+    execution.removeParentAbort?.();
     if (!execution.suspended) {
       cancelPending(execution, execution.reason === "corrected" ? "corrected" : execution.reason === "closed" ? "closed" : "cancelled");
     }
@@ -744,7 +745,7 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
     }
   }
 
-  async function execute(raw: unknown, queuedEpoch: number): Promise<ActResult> {
+  async function execute(raw: unknown, queuedEpoch: number, signal?: AbortSignal): Promise<ActResult> {
     let request: ActRequest | undefined;
     try {
       request = preflight(raw);
@@ -752,9 +753,9 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
       return rejectedResult(undefined, safeValidationCode(error, "invalid_request"));
     }
     if (closed) return stoppedResult(request, 1, "closed");
-    if (queuedEpoch !== epoch || globalAbort.signal.aborted) return stoppedResult(request, 1, "cancelled");
+    if (queuedEpoch !== epoch || globalAbort.signal.aborted || signal?.aborted) return stoppedResult(request, 1, "cancelled");
 
-    const execution = startExecution();
+    const execution = startExecution(signal);
     // focusFromStep is scoped to this act batch, never to a prior batch.
     execution.focusRecords.clear();
     return runBatch(request, execution, 0, []);
@@ -780,9 +781,10 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
     }
   }
 
-  function act(raw: unknown): Promise<ActResult> {
+  function act(raw: unknown, signal?: AbortSignal): Promise<ActResult> {
     const queuedEpoch = epoch;
-    const next = actQueue.then(() => execute(raw, queuedEpoch), () => execute(raw, queuedEpoch));
+    const run = () => execute(raw, queuedEpoch, signal);
+    const next = actQueue.then(run, run);
     actQueue = next.then(() => undefined, () => undefined);
     return next;
   }

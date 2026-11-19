@@ -17,12 +17,13 @@ try {
   assert.equal(basename(packed.filename), packed.filename);
   const files = new Set(packed.files.map(file => file.path));
   for (const path of ["schema/act-input.schema.json", "dist/bin/mcp.js", "dist/backends/e2b/chromium_pipe.py",
-    "dist/evidence/rapidocr_worker.py", "docs/architecture.md", "examples/frameworks/langgraph.mjs"]) assert.ok(files.has(path), path);
+    "dist/evidence/rapidocr_worker.py", "dist/integrations/dsh.js", "dist/integrations/langchain-images.js",
+    "docs/architecture.md", "examples/frameworks/langgraph.mjs"]) assert.ok(files.has(path), path);
   await writeFile(join(consumer, "package.json"), '{"name":"independent-host","private":true,"type":"module"}', "utf8");
   run([npm, "install", "--offline", "--omit=optional", "--ignore-scripts", "--no-package-lock", "--no-audit", "--no-fund", join(consumer, packed.filename)], consumer);
   const probe = `import assert from 'node:assert/strict';
     import { createDeskSession, createDeskTools } from 'desklatch';
-    for (const peer of ['playwright-core', '@langchain/core', '@modelcontextprotocol/sdk', '@openai/agents', '@trycua/cua-driver']) {
+    for (const peer of ['playwright-core', '@langchain/core', '@modelcontextprotocol/sdk', '@openai/agents', '@trycua/cua-driver', '@deepseek-ai/dsh-mcp-client']) {
       assert.throws(() => import.meta.resolve(peer), {code:'ERR_MODULE_NOT_FOUND'});
     }
     const field = { id:'id1', role:'Edit', name:'Title', states:['visible','enabled','editable'], actions:['type'], effect:'edit' };

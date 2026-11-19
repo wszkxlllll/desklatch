@@ -1,4 +1,5 @@
 import { tool, type StructuredToolInterface } from "@langchain/core/tools";
+export { prepareDeskChatCompletionsMessages } from "./langchain-images.js";
 
 import type { ToolEndpoint } from "../tools.js";
 import {
@@ -52,7 +53,7 @@ export function createLangChainTools(
 ): StructuredToolInterface[] {
   const normalized = normalizeEndpoints(endpoints);
   const makeTool = tool as unknown as (
-    func: (input: unknown) => Promise<unknown>,
+    func: (input: unknown, config?: { signal?: AbortSignal }) => Promise<unknown>,
     fields: {
       name: string;
       description: string;
@@ -63,8 +64,8 @@ export function createLangChainTools(
 
   return normalized.map((endpoint) =>
     makeTool(
-      async (input) => {
-        try { return toLangChainResult(await endpoint.invoke(input), options); }
+      async (input, config) => {
+        try { return toLangChainResult(await endpoint.invoke(input, config?.signal), options); }
         catch (error) { throw new Error(errorText(error)); }
       },
       {

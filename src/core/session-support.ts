@@ -2,7 +2,7 @@ import type { Capability } from "../contracts.js";
 
 const SAFE_ADAPTER_CODES = new Set([
   "backend_refused", "invalid_delivery", "dispatch_unknown", "cancelled_before_dispatch", "target_changed", "material_target_changed", "stale", "partial",
-  "unknown", "cancelled", "timeout", "closed", "target_occluded", "point_occluded", "target_unavailable",
+  "unknown", "cancelled", "timeout", "closed", "target_occluded", "point_occluded", "occluded", "focus_changed", "target_unavailable",
   "target_not_verified", "background_target_unavailable", "background_target_not_verified", "stale_observation",
   "stale_origin", "stale_point", "stale_snapshot", "point_outside_target", "invalid_window_point",
   "invalid_desktop_point", "background_point_not_verified", "point_not_unique", "window_evidence_unavailable",

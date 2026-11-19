@@ -72,6 +72,97 @@ test("DOM observe and form actions stay zero-image", async (t) => {
   if (result.skipped) t.skip("No installed Edge/Chrome/Chromium executable");
 });
 
+test("scoped remote actions bind only matching controls, scroll clipped targets, and distinguish a timeout from detachment", async t => {
+  const result = await withPage(async page => {
+    await page.setContent('<input id="visible" aria-label="Visible"><div style="height:45px;overflow:auto"><div style="height:160px"></div><input id="clipped" aria-label="Clipped"></div>');
+    const locator = page.locator.bind(page);
+    const bound = new Set();
+    let scrolls = 0, rejectScroll = true;
+    page.locator = selector => {
+      const loc = locator(selector);
+      const getHandle = loc.elementHandle.bind(loc);
+      loc.elementHandle = async (...args) => {
+        const handle = await getHandle(...args);
+        if (handle) {
+          bound.add(selector);
+          const scroll = handle.scrollIntoViewIfNeeded.bind(handle);
+          handle.scrollIntoViewIfNeeded = async options => {
+            scrolls++;
+            if (rejectScroll) throw Object.assign(new Error("synthetic transport deadline"), { name: "TimeoutError" });
+            await scroll(options);
+          };
+        }
+        return handle;
+      };
+      return loc;
+    };
+    const session = createDeskSession(createBrowserBackend(page));
+    const [, act] = createDeskTools(session);
+    const write = name => act.invoke({ steps: [{ kind: "setValue", target: { name }, value: "ok" }] });
+    try {
+      assert.equal((await write("Visible")).status, "completed");
+      assert.equal(scrolls, 0);
+      assert.deepEqual([...bound], ["#visible"]);
+      const refused = await write("Clipped");
+      assert.equal(refused.code, "timeout");
+      assert.equal(refused.steps[0].status, "not_dispatched");
+      assert.equal(await locator("#clipped").inputValue(), "");
+      rejectScroll = false;
+      assert.equal((await write("Clipped")).status, "completed");
+      assert.equal(await locator("#clipped").inputValue(), "ok");
+    } finally { await session.close(); }
+    return { skipped: false };
+  });
+  if (result.skipped) t.skip("Installed Chromium required");
+});
+
+test("a focus-relative step stops if the active input changes just before dispatch", async t => {
+  const result = await withPage(async page => {
+    await page.setContent('<input id="first" aria-label="First"><input id="next" aria-label="Next">');
+    const native = createBrowserBackend(page);
+    const session = createDeskSession({ ...native, async dispatch(request) {
+      if (request.step.target?.focusFromStep) await page.locator("#next").focus();
+      return native.dispatch(request);
+    } });
+    try {
+      const [, act] = createDeskTools(session);
+      const batch = await act.invoke({ steps: [
+        { kind: "type", target: { name: "First" }, text: "A" },
+        { kind: "type", target: { focusFromStep: 1 }, text: "B" },
+      ] });
+      assert.equal(batch.code, "focus_changed");
+      assert.equal(batch.steps[1].status, "not_dispatched");
+      assert.equal(await page.locator("#first").inputValue(), "A");
+      assert.equal(await page.locator("#next").inputValue(), "");
+    } finally { await session.close(); }
+    return { skipped: false };
+  });
+  if (result.skipped) t.skip("Installed Chromium required");
+});
+
+test("a text observation identifies a named visual source without exposing its pixels or granting actions", async t => {
+  const result = await withPage(async page => {
+    await page.setContent('<canvas aria-label="Serial plate"></canvas><canvas></canvas><canvas aria-label="Hidden" hidden></canvas><input aria-label="Record 7051">');
+    await page.locator("canvas").first().evaluate(el => el.getContext("2d").fillText("543763", 1, 12));
+    const session = createDeskSession(createBrowserBackend(page, { includePublicValues: true }));
+    const [observe, act] = createDeskTools(session);
+    try {
+      const frame = await observe.invoke({});
+      const graphics = frame.controls.filter(c => c.role === "img");
+      assert.deepEqual(graphics.map(c => c.name), ["Serial plate"]);
+      assert.deepEqual(graphics[0].actions, []);
+      assert.equal(graphics[0].value, undefined);
+      assert.equal(frame.image, undefined);
+      assert.equal(JSON.stringify(frame).includes("543763"), false);
+      assert.equal(frame.controls[0].name, "Record 7051");
+      const clicked = await act.invoke({ observationId: frame.observationId, steps: [{ kind: "click", target: { ref: graphics[0].ref } }] });
+      assert.equal(clicked.steps[0].status, "not_dispatched");
+    } finally { await session.close(); }
+    return { skipped: false };
+  });
+  if (result.skipped) t.skip("Installed Chromium required");
+});
+
 test("image capture requires explicit host opt-in and is viewport-scoped", async (t) => {
   const result = await withPage(async (page) => {
     await page.setContent(await fixture("browser-form.html"));

@@ -28,6 +28,9 @@ const node = new ToolNode(createLangChainTools(endpoints));
 | LangChain / LangGraph JS | `createLangChainTools(endpoints)` 返回框架工具。宿主自己绑定模型或创建 `ToolNode`。[可运行的 ToolNode 示例](examples/frameworks/langgraph.mjs) |
 | OpenAI Agents SDK for TypeScript | 从 `desklatch/openai-agents` 导入 `createOpenAIAgentsTools(endpoints)`，把结果传给已有 `Agent` 的 `tools`。模型及 API 端点由宿主选择。[智谱实例](examples/zhipu-acceptance.mjs) |
 | MCP 客户端 | 从 `desklatch/mcp` 导入 `createDeskMcpServer(endpoints)`，连接宿主的 MCP transport。stdio 启动器可加载宿主提供的本地模块，模块导出 `openDeskSession()`。[宿主示例](examples/frameworks/browser-host.mjs) |
+| DeepSeek Harness（DSH） | 从 `desklatch/dsh` 导入 `createDeskDshPlugin`，用 `ctx.plugin(createDeskDshPlugin(openSession))` 加载进现有 Cordis 应用。它在本进程注册 `desklatch_observe` 和已授权的 `desklatch_act`。也可使用官方 MCP 插件经 stdio 对接，此时工具名带 `mcp__desklatch__` 前缀。[DSH 官方 MCP 配置](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/mcp/mcp-client/README.md) |
+
+对使用智谱 Chat Completions 的 LangGraph 宿主，调用 `model.invoke(prepareDeskChatCompletionsMessages(messages))` 即可把模型主动索取的截图发回去。此函数从 `desklatch/langchain` 导出。原工具回复保留控件文字和调用编号，截图跟在该批工具回复之后，标注为桌面观察。图状态仍保存原始工具回复。
 
 构建完成后，MCP 客户端可将启动命令配置为 `node`，参数依次为 `dist/bin/mcp.js` 和宿主模块的绝对路径。此仓库内可试用 `node dist/bin/mcp.js examples/frameworks/browser-host.mjs`。它打开新建的无头浏览器测试表单，stdio 专用于 MCP。
 
@@ -59,5 +62,7 @@ npm test
 要从另一个项目接入，可在本仓库构建后运行 `npm pack`，将生成的 `.tgz` 路径交给宿主项目的 `npm install`。宿主按接入方式安装对应的框架或驱动，例如 `playwright-core` 和 `@langchain/core`。核心包的直接运行依赖只有 Ajv。
 
 真实浏览器用例使用隔离的 Chromium 实例。可用 `DESKLATCH_CHROMIUM` 指定已安装的浏览器路径。主动运行 `npm run verify:zhipu` 时才使用 `ZHIPU_API_KEY` 调用智谱 `glm-5.3-flash`。工具参数只涉及脚本自己创建的表单，最终值由浏览器独立回读。该脚本同时记录模型请求、图片、工具调用及执行器观察次数。
+
+同时配置 `E2B_API_KEY` 后，`npm run verify:zhipu -- e2b` 会创建一台临时 E2B Desktop，复跑关闭取图和开局提供一张图的两个用例。`npm run verify:zhipu -- e2b-choice` 则开放文字控件与截图，由模型自行选择。每次命令共用一台沙箱，限制为 8 分钟，结束时释放并查询确认。
 
 [首版验收记录](docs/verification.md)

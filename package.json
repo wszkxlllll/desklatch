@@ -37,6 +37,10 @@
       "types": "./dist/integrations/langchain.d.ts",
       "import": "./dist/integrations/langchain.js"
     },
+    "./dsh": {
+      "types": "./dist/integrations/dsh.d.ts",
+      "import": "./dist/integrations/dsh.js"
+    },
     "./mcp": {
       "types": "./dist/integrations/mcp.d.ts",
       "import": "./dist/integrations/mcp.js"
@@ -68,6 +72,9 @@
     "ajv": "8.20.0"
   },
   "peerDependencies": {
+    "@deepseek-ai/cordis": "~4.1.0",
+    "@deepseek-ai/dsh-mcp-client": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-tools": "0.2.2-rc.5",
     "@langchain/core": "^1.4.2",
     "@modelcontextprotocol/sdk": "^1.32.2",
     "@openai/agents": "^0.22.0",
@@ -76,6 +83,9 @@
     "playwright-core": "^1.65.1"
   },
   "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": { "optional": true },
+    "@deepseek-ai/dsh-mcp-client": { "optional": true },
+    "@deepseek-ai/dsh-tools": { "optional": true },
     "@openai/agents": {
       "optional": true
     },
@@ -96,6 +106,12 @@
     }
   },
   "devDependencies": {
+    "@deepseek-ai/cordis": "4.1.0",
+    "@deepseek-ai/dsh-mcp-client": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-system-prompt": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-tool-executor-native": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-tool-testkit": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-tools": "0.2.2-rc.5",
     "@e2b/desktop": "2.5.0",
     "@langchain/core": "1.4.2",
     "@langchain/langgraph": "1.7.5",

@@ -221,17 +221,30 @@ export function createBrowserBackend(page: Page | BrowserPageLike, options: Brow
   const stableIds = new Map<string, string>();
   const usedIds = new Map<string, string>();
   let identitySerial = 0;
-  let identityHandles = new Map<string, { id: string; handle: BrowserElementHandleLike }>();
+  const identityHandles = new Map<string, { id: string; handle: BrowserElementHandleLike }>();
+  const handleOwners = new WeakMap<BrowserElementHandleLike, number>();
   const retainedStates: FrameState[] = [];
   let closed = false;
   let serial = 0;
   let currentUrl = pageUrl(browserPage);
   let scope = `${scopePrefix}:${serial}:${stableHash(`${currentUrl}:${Math.random()}`)}`;
 
+  // A pinned observation and the identity cache each own a handle until they retire independently.
+  function retainHandle(handle: BrowserElementHandleLike) {
+    handleOwners.set(handle, (handleOwners.get(handle) ?? 0) + 1);
+  }
+  async function releaseHandle(handle: BrowserElementHandleLike) {
+    const owners = handleOwners.get(handle);
+    if (!owners) return;
+    if (owners > 1) { handleOwners.set(handle, owners - 1); return; }
+    handleOwners.delete(handle);
+    try { await handle.dispose?.(); } catch { /* the page may already be closed */ }
+  }
+
   const rotateScope = () => {
     for (const state of retainedStates.splice(0)) void releaseHandles(state);
-    for (const entry of identityHandles.values()) void entry.handle.dispose?.();
-    identityHandles = new Map();
+    for (const entry of identityHandles.values()) void releaseHandle(entry.handle);
+    identityHandles.clear();
     serial += 1;
     stableIds.clear();
     usedIds.clear();
@@ -397,14 +410,6 @@ export function createBrowserBackend(page: Page | BrowserPageLike, options: Brow
     return { candidates: [] };
   }
 
-  async function nodeStillConnected(handle: BrowserElementHandleLike): Promise<boolean> {
-    try {
-      return Boolean(await handle.evaluate?.((element) => Boolean((element as Node).isConnected)));
-    } catch {
-      return false;
-    }
-  }
-
   async function sameDomNode(previous: BrowserElementHandleLike, current: BrowserElementHandleLike): Promise<boolean> {
     try {
       return Boolean(await previous.evaluate?.((oldElement, currentElement) => oldElement === currentElement, current));
@@ -416,54 +421,51 @@ export function createBrowserBackend(page: Page | BrowserPageLike, options: Brow
   async function bindObservedControls(controls: readonly InternalControl[]): Promise<{ controls: InternalControl[]; handles: Map<string, BrowserElementHandleLike> }> {
     const rebound: InternalControl[] = [];
     const handles = new Map<string, BrowserElementHandleLike>();
-    const nextIdentity = new Map<string, { id: string; handle: BrowserElementHandleLike }>();
-    for (const control of controls) {
-      const locator = browserPage.locator(selectorForControl(control));
-      const handle = await locator.elementHandle?.();
-      const previous = identityHandles.get(control.__stableKey);
-      if (!handle) {
-        if (previous) rebound.push(control.id === previous.id ? control : { ...control, id: previous.id });
-        else rebound.push(control);
-        continue;
+    try {
+      for (const control of controls) {
+        if (control.role === "img" && control.actions.length === 0) { rebound.push(control); continue; }
+        const locator = browserPage.locator(selectorForControl(control));
+        const handle = await locator.elementHandle?.();
+        const previous = identityHandles.get(control.__stableKey);
+        if (!handle) {
+          if (previous) rebound.push(control.id === previous.id ? control : { ...control, id: previous.id });
+          else rebound.push(control);
+          continue;
+        }
+        const sameNode = previous ? await sameDomNode(previous.handle, handle) : false;
+        const current = identityHandles.get(control.__stableKey);
+        const id = sameNode && current === previous
+          ? previous!.id
+          : `${scope}:control:${stableHash(`${control.__stableKey}:node:${identitySerial++}`)}`;
+        if (current?.handle !== handle) retainHandle(handle);
+        stableIds.set(control.__stableKey, id);
+        usedIds.set(id, control.__stableKey);
+        const bound = control.id === id ? control : { ...control, id };
+        rebound.push(bound);
+        retainHandle(handle);
+        handles.set(id, handle);
+        identityHandles.delete(control.__stableKey);
+        identityHandles.set(control.__stableKey, { id, handle });
+        if (current && current.handle !== handle) await releaseHandle(current.handle);
       }
-      const sameNode = previous ? await sameDomNode(previous.handle, handle) : false;
-      const id = sameNode
-        ? previous!.id
-        : `${scope}:control:${stableHash(`${control.__stableKey}:node:${identitySerial++}`)}`;
-      if (previous && previous.handle !== handle) {
-        try { await previous.handle.dispose?.(); } catch { /* already detached */ }
-      }
-      stableIds.set(control.__stableKey, id);
-      usedIds.set(id, control.__stableKey);
-      const bound = control.id === id ? control : { ...control, id };
-      rebound.push(bound);
-      handles.set(id, handle);
-      nextIdentity.set(control.__stableKey, { id, handle });
+    } catch (error) {
+      await Promise.all([...handles.values()].map(releaseHandle));
+      throw error;
     }
-    for (const [key, previous] of identityHandles) {
-      if (nextIdentity.has(key)) continue;
-      if (await nodeStillConnected(previous.handle)) nextIdentity.set(key, previous);
-      else {
-        try { await previous.handle.dispose?.(); } catch { /* stale identity */ }
-      }
-    }
-    while (nextIdentity.size > searchLimit) {
-      const oldest = nextIdentity.keys().next().value as string | undefined;
+    while (identityHandles.size > searchLimit) {
+      const oldest = identityHandles.keys().next().value as string | undefined;
       if (!oldest) break;
-      const entry = nextIdentity.get(oldest);
-      nextIdentity.delete(oldest);
-      try { await entry?.handle.dispose?.(); } catch { /* bounded identity cache */ }
+      const entry = identityHandles.get(oldest)!;
+      identityHandles.delete(oldest);
+      await releaseHandle(entry.handle);
     }
-    identityHandles = nextIdentity;
     return { controls: rebound, handles };
   }
 
   async function releaseHandles(state: FrameState): Promise<void> {
     const handles = [...state.handles.values()];
     state.handles.clear();
-    await Promise.all(handles.map(async (handle) => {
-      try { await handle.dispose?.(); } catch { /* stale handles are already released by the page */ }
-    }));
+    await Promise.all(handles.map(releaseHandle));
   }
 
   function retainFrameState(state: FrameState): void {
@@ -474,26 +476,36 @@ export function createBrowserBackend(page: Page | BrowserPageLike, options: Brow
     }
   }
 
-  async function physicalTarget(handle: BrowserElementHandleLike, control: InternalControl, point?: { x: number; y: number }, signal?: AbortSignal): Promise<{ connected: boolean; actionable: boolean; topmost: boolean; approvalChanged: boolean }> {
+  async function physicalTarget(handle: BrowserElementHandleLike, control: InternalControl, point?: { x: number; y: number }, signal?: AbortSignal) {
     abortIfNeeded(signal);
     try {
       const result = await handle.evaluate?.((element, requestedPoint) => {
-      const target = element as HTMLElement;
-      if (!target.isConnected) return { connected: false, actionable: false, topmost: false };
-      const rect = target.getBoundingClientRect();
-      const style = getComputedStyle(target);
-      const actionable = rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity) !== 0 && !target.hasAttribute("disabled") && target.getAttribute("aria-disabled") !== "true";
-      const x = requestedPoint && Number.isFinite(requestedPoint.x) ? requestedPoint.x : rect.left + rect.width / 2;
-      const y = requestedPoint && Number.isFinite(requestedPoint.y) ? requestedPoint.y : rect.top + rect.height / 2;
-      const top = document.elementFromPoint(x, y);
-      return { connected: true, actionable, topmost: Boolean(top && (top === target || target.contains(top))) };
+        const target = element as HTMLElement;
+        if (!target.isConnected) return { connected: false, actionable: false, inViewport: false, topmost: false, focused: false };
+        const rect = target.getBoundingClientRect();
+        const style = getComputedStyle(target);
+        const actionable = rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity) !== 0 && !target.hasAttribute("disabled") && target.getAttribute("aria-disabled") !== "true";
+        const x = requestedPoint?.x ?? rect.left + rect.width / 2;
+        const y = requestedPoint?.y ?? rect.top + rect.height / 2;
+        const top = document.elementFromPoint(x, y);
+        const topmost = Boolean(top && (top === target || target.contains(top)));
+        let inViewport = x >= 0 && y >= 0 && x < innerWidth && y < innerHeight;
+        if (!topmost) {
+          for (let parent = target.parentElement; parent && inViewport; parent = parent.parentElement) {
+            const clip = parent.getBoundingClientRect();
+            const { overflowX, overflowY } = getComputedStyle(parent);
+            if ((overflowX !== "visible" && (x < clip.left || x >= clip.right)) ||
+              (overflowY !== "visible" && (y < clip.top || y >= clip.bottom))) inViewport = false;
+          }
+        }
+        return { connected: true, actionable, inViewport, topmost, focused: document.activeElement === target };
       }, point);
-      if (!result || !result.connected) return { connected: false, actionable: false, topmost: false, approvalChanged: false };
+      if (!result) return undefined;
       if (!control.approvalContext || !handle.evaluate) return { ...result, approvalChanged: false };
       const currentContext = await handle.evaluate(readApprovalContext, undefined);
       return { ...result, approvalChanged: currentContext?.token !== control.approvalContext.token };
     } catch {
-      return { connected: false, actionable: false, topmost: false, approvalChanged: false };
+      return undefined;
     }
   }
 
@@ -547,12 +559,18 @@ export function createBrowserBackend(page: Page | BrowserPageLike, options: Brow
       const target = resolved.target;
       if (!supportsAction(step.kind, target)) return { status: "refused", code: "action_not_supported", risk: riskFor(step, target) };
       const risk = riskFor(step, target);
-      if (!resolved.point) {
-        try { await resolved.handle.scrollIntoViewIfNeeded?.({ timeout: actionTimeoutMs }); }
-        catch { return { status: "refused", code: "target_changed", risk }; }
+      let physical = await physicalTarget(resolved.handle, target, resolved.point, request.signal);
+      if (!resolved.point && physical?.connected && physical.actionable && !physical.approvalChanged
+        && !physical.inViewport && resolved.handle.scrollIntoViewIfNeeded) {
+        try { await resolved.handle.scrollIntoViewIfNeeded({ timeout: actionTimeoutMs }); }
+        catch (error) {
+          return { status: "refused", code: error instanceof Error && error.name === "TimeoutError" ? "timeout" : "target_not_verified", risk };
+        }
+        physical = await physicalTarget(resolved.handle, target, undefined, request.signal);
       }
-      const physical = await physicalTarget(resolved.handle, target, resolved.point, request.signal);
+      if (!physical) return { status: "refused", code: "target_not_verified", risk };
       if (!physical.connected) return { status: "refused", code: "target_changed", risk };
+      if (isFocusTarget(targetOf(step)) && !physical.focused) return { status: "refused", code: "focus_changed", risk };
       if (physical.approvalChanged) return { status: "refused", code: "approval_context_changed", risk };
       if (!physical.actionable) return { status: "refused", code: "target_not_actionable", risk };
       if ((step.kind === "click" || step.kind === "keypress" || step.kind === "hotkey" || step.kind === "type" || step.kind === "setValue") && !physical.topmost) {
@@ -614,28 +632,36 @@ export function createBrowserBackend(page: Page | BrowserPageLike, options: Brow
     let controls: InternalControl[];
     let complete: boolean;
     let handles: Map<string, BrowserElementHandleLike>;
+    let scanned: InternalControl[];
     if (request.where) {
       const scoped = await locate(request.where as Selector, request.signal);
-      const source = (scoped.all ?? scoped.candidates).filter(visible);
-      const bound = await bindObservedControls(source);
-      const byStableKey = new Map(bound.controls.map((control) => [control.__stableKey, control]));
-      controls = scoped.candidates.map((candidate) => byStableKey.get(candidate.__stableKey)).filter((control): control is InternalControl => control !== undefined && visible(control));
-      handles = new Map(controls.map((control) => [control.id, bound.handles.get(control.id)]).filter((entry): entry is [string, BrowserElementHandleLike] => Boolean(entry[1])));
+      scanned = scoped.all ?? scoped.candidates;
+      const bound = await bindObservedControls(scoped.candidates.filter(visible));
+      controls = bound.controls;
+      handles = bound.handles;
       complete = scoped.complete ?? false;
     } else {
       const collected = await collect(observeLimit, request.signal);
+      scanned = collected.controls;
       const bound = await bindObservedControls(collected.controls.filter(visible));
       controls = bound.controls;
       handles = bound.handles;
       complete = collected.complete;
     }
-    const focusId = await activeId(request.signal);
-    const image = request.view === "controls" ? undefined : await captureImage(request.signal);
-    const frame: Frame = { scope, controls: controls.map(publicControl), complete, ...(focusId ? { focusId } : {}), ...(image ? { image } : {}) };
-    const state: FrameState = { scope, controls: new Map(controls.map((control) => [control.id, control])), handles };
-    privateState.frames.set(frame, state);
-    retainFrameState(state);
-    return frame;
+    try {
+      const focusedControl = scanned.find(control => control.states.includes("focused"));
+      const focusId = focusedControl ? (stableIds.get(focusedControl.__stableKey) ?? focusedControl.id)
+        : complete ? undefined : await activeId(request.signal);
+      const image = request.view === "controls" ? undefined : await captureImage(request.signal);
+      const frame: Frame = { scope, controls: controls.map(publicControl), complete, ...(focusId ? { focusId } : {}), ...(image ? { image } : {}) };
+      const state: FrameState = { scope, controls: new Map(controls.map((control) => [control.id, control])), handles };
+      privateState.frames.set(frame, state);
+      retainFrameState(state);
+      return frame;
+    } catch (error) {
+      await Promise.all([...handles.values()].map(releaseHandle));
+      throw error;
+    }
   }
 
   async function hitTest(frame: Frame, point: { x: number; y: number }, signal?: AbortSignal): Promise<Control | undefined> {
@@ -660,6 +686,8 @@ export function createBrowserBackend(page: Page | BrowserPageLike, options: Brow
     browserPage.off?.("framenavigated", onNavigated);
     browserPage.off?.("close", onClosed);
     await Promise.all(retainedStates.splice(0).map((state) => releaseHandles(state)));
+    await Promise.all([...identityHandles.values()].map(entry => releaseHandle(entry.handle)));
+    identityHandles.clear();
   }
 
   const capabilities: readonly Capability[] = [
