@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>DeskLatch modal fixture</title>
+    <style>
+      body { font: 16px sans-serif; margin: 2rem; }
+      #underlay { width: 12rem; height: 4rem; }
+      #modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.5); }
+      #dialog { background: white; margin: 8rem auto; padding: 2rem; width: 18rem; }
+    </style>
+  </head>
+  <body>
+    <button id="underlay" type="button">Underlying action</button>
+    <button id="open-modal" type="button">Open modal</button>
+    <div id="modal" role="presentation">
+      <div id="dialog" role="dialog" aria-label="Confirmation dialog" aria-modal="true">
+        <p>Modal overlay</p>
+        <button id="close-modal" type="button">Close</button>
+      </div>
+    </div>
+    <script>
+      document.getElementById('open-modal').addEventListener('click', function () {
+        document.getElementById('modal').style.display = 'block';
+      });
+      document.getElementById('close-modal').addEventListener('click', function () {
+        document.getElementById('modal').style.display = 'none';
+      });
+      document.getElementById('underlay').addEventListener('click', function () {
+        this.dataset.clicked = 'true';
+      });
+    </script>
+  </body>
+</html>

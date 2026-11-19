@@ -1,0 +1,123 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DeskLatch act request",
+  "description": "Protocol vocabulary. A host exposes only branches and parameter combinations available in its authorized session. This file does not grant permission or register a tool.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["steps"],
+  "properties": {
+    "observationId": { "$ref": "#/$defs/nonblank" },
+    "steps": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/step" } }
+  },
+  "if": {
+    "properties": {
+      "steps": {
+        "contains": {
+          "anyOf": [
+            { "type": "object", "properties": { "kind": { "const": "drag" } }, "required": ["kind"] },
+            { "type": "object", "properties": { "target": { "type": "object", "anyOf": [{ "required": ["ref"] }, { "required": ["point"] }] } }, "required": ["target"] }
+          ]
+        }
+      }
+    }
+  },
+  "then": { "required": ["observationId"] },
+  "$defs": {
+    "nonblank": { "type": "string", "minLength": 1, "pattern": "\\S" },
+    "positiveInteger": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "point": {
+      "type": "object", "additionalProperties": false, "required": ["x", "y"],
+      "properties": {
+        "x": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "y": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+      }
+    },
+    "state": { "enum": ["visible", "enabled", "editable", "focused", "checked", "selected"] },
+    "selector": {
+      "description": "Supply the role, accessible name, or both according to the available evidence. If both are supplied, either can retrieve candidates. Resolve conflicts and establish one matching target in scope before acting or verifying a result.",
+      "type": "object", "additionalProperties": false, "anyOf": [{ "required": ["role"] }, { "required": ["name"] }],
+      "properties": {
+        "role": { "$ref": "#/$defs/nonblank" },
+        "name": { "$ref": "#/$defs/nonblank", "description": "Supply one label. For an action the host checks actual labels first and may use a scoped, corroborated low-risk alias. Other approximate matches provide candidates only." },
+        "within": { "$ref": "#/$defs/nonblank" }, "state": { "$ref": "#/$defs/state" }
+      }
+    },
+    "refTarget": {
+      "type": "object", "additionalProperties": false, "required": ["ref"], "properties": { "ref": { "$ref": "#/$defs/nonblank" } }
+    },
+    "pointTarget": {
+      "type": "object", "additionalProperties": false, "required": ["point"], "properties": { "point": { "$ref": "#/$defs/point" } }
+    },
+    "focusTarget": {
+      "type": "object", "additionalProperties": false, "required": ["focusFromStep"],
+      "properties": { "focusFromStep": { "$ref": "#/$defs/positiveInteger" } },
+      "description": "Must refer to an earlier step in the same request. The host must recheck the specific focus receiver recorded for that step."
+    },
+    "controlTarget": { "oneOf": [{ "$ref": "#/$defs/selector" }, { "$ref": "#/$defs/refTarget" }] },
+    "pointerTarget": { "oneOf": [{ "$ref": "#/$defs/controlTarget" }, { "$ref": "#/$defs/pointTarget" }] },
+    "keyboardTarget": { "oneOf": [{ "$ref": "#/$defs/controlTarget" }, { "$ref": "#/$defs/focusTarget" }] },
+    "text": { "type": "string", "minLength": 1, "not": { "pattern": "[\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029]" } },
+    "literal": { "type": "string", "not": { "pattern": "[\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f-\\u009f]" } },
+    "expect": {
+      "description": "Optional post-action check. Read the named target in fresh state and verify exactly one observable state or public field value. This describes the condition to check, not proof that the action caused it.",
+      "type": "object", "additionalProperties": false, "required": ["target"],
+      "oneOf": [{ "required": ["state"] }, { "required": ["valueEquals"] }],
+      "properties": {
+        "target": { "$ref": "#/$defs/selector" },
+        "state": { "enum": ["present", "visible", "enabled", "editable", "focused", "checked", "selected"] },
+        "valueEquals": { "$ref": "#/$defs/literal" }
+      }
+    },
+    "key": { "type": "string", "pattern": "^(?:[a-z0-9]|[A-Z][A-Za-z0-9]*)$", "not": { "pattern": "[^a-zA-Z0-9]" }, "description": "The session supplies the canonical allowed key names." },
+    "modifier": { "enum": ["ctrl", "alt", "shift", "meta"] },
+    "chord": {
+      "type": "array", "uniqueItems": true,
+      "oneOf": [
+        { "minItems": 2, "items": false, "prefixItems": [{ "$ref": "#/$defs/modifier" }, { "$ref": "#/$defs/key" }] },
+        { "minItems": 3, "items": false, "prefixItems": [{ "$ref": "#/$defs/modifier" }, { "$ref": "#/$defs/modifier" }, { "$ref": "#/$defs/key" }] },
+        { "minItems": 4, "items": false, "prefixItems": [{ "$ref": "#/$defs/modifier" }, { "$ref": "#/$defs/modifier" }, { "$ref": "#/$defs/modifier" }, { "$ref": "#/$defs/key" }] },
+        { "minItems": 5, "items": false, "prefixItems": [{ "$ref": "#/$defs/modifier" }, { "$ref": "#/$defs/modifier" }, { "$ref": "#/$defs/modifier" }, { "$ref": "#/$defs/modifier" }, { "$ref": "#/$defs/key" }] }
+      ]
+    },
+    "step": {
+      "oneOf": [
+        {
+          "type": "object", "additionalProperties": false, "required": ["kind", "target"],
+          "properties": {
+            "kind": { "const": "click" }, "target": { "$ref": "#/$defs/pointerTarget" },
+            "button": { "enum": ["left", "right"], "default": "left" }, "count": { "enum": [1, 2], "default": 1 }, "expect": { "$ref": "#/$defs/expect" }
+          },
+          "not": { "required": ["button", "count"], "properties": { "button": { "const": "right" }, "count": { "const": 2 } } }
+        },
+        {
+          "type": "object", "additionalProperties": false, "required": ["kind", "target", "text"],
+          "properties": { "kind": { "const": "type" }, "target": { "$ref": "#/$defs/keyboardTarget" }, "text": { "$ref": "#/$defs/text" }, "expect": { "$ref": "#/$defs/expect" } }
+        },
+        {
+          "type": "object", "additionalProperties": false, "required": ["kind", "target", "value"],
+          "properties": { "kind": { "const": "setValue" }, "target": { "$ref": "#/$defs/controlTarget" }, "value": { "$ref": "#/$defs/literal" }, "expect": { "$ref": "#/$defs/expect" } }
+        },
+        {
+          "type": "object", "additionalProperties": false, "required": ["kind", "target", "direction", "amount"],
+          "properties": {
+            "kind": { "const": "scroll" }, "target": { "$ref": "#/$defs/pointerTarget" },
+            "direction": { "enum": ["up", "down", "left", "right"] }, "amount": { "$ref": "#/$defs/positiveInteger" },
+            "by": { "enum": ["line", "page"], "default": "line" }, "expect": { "$ref": "#/$defs/expect" }
+          }
+        },
+        {
+          "type": "object", "additionalProperties": false, "required": ["kind", "target", "key"],
+          "properties": { "kind": { "const": "keypress" }, "target": { "$ref": "#/$defs/keyboardTarget" }, "key": { "$ref": "#/$defs/key" }, "expect": { "$ref": "#/$defs/expect" } }
+        },
+        {
+          "type": "object", "additionalProperties": false, "required": ["kind", "target", "keys"],
+          "properties": { "kind": { "const": "hotkey" }, "target": { "$ref": "#/$defs/keyboardTarget" }, "keys": { "$ref": "#/$defs/chord" }, "expect": { "$ref": "#/$defs/expect" } }
+        },
+        {
+          "type": "object", "additionalProperties": false, "required": ["kind", "from", "to"],
+          "properties": { "kind": { "const": "drag" }, "from": { "$ref": "#/$defs/point" }, "to": { "$ref": "#/$defs/point" }, "expect": { "$ref": "#/$defs/expect" } }
+        }
+      ]
+    }
+  }
+}

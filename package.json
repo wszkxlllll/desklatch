@@ -1,0 +1,119 @@
+{
+  "name": "desklatch",
+  "version": "0.1.0-dev.0",
+  "private": true,
+  "description": "A host-controlled computer-use runtime for AI agents",
+  "type": "module",
+  "bin": { "desklatch-mcp": "./dist/bin/mcp.js" },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wszkxlllll/desklatch.git"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./browser": {
+      "types": "./dist/backends/browser/index.d.ts",
+      "import": "./dist/backends/browser/index.js"
+    },
+    "./windows": {
+      "types": "./dist/backends/windows/index.d.ts",
+      "import": "./dist/backends/windows/index.js"
+    },
+    "./cua-background": {
+      "types": "./dist/backends/cua-background/index.d.ts",
+      "import": "./dist/backends/cua-background/index.js"
+    },
+    "./e2b": {
+      "types": "./dist/backends/e2b/index.d.ts",
+      "import": "./dist/backends/e2b/index.js"
+    },
+    "./langchain": {
+      "types": "./dist/integrations/langchain.d.ts",
+      "import": "./dist/integrations/langchain.js"
+    },
+    "./mcp": {
+      "types": "./dist/integrations/mcp.d.ts",
+      "import": "./dist/integrations/mcp.js"
+    },
+    "./openai-agents": {
+      "types": "./dist/integrations/openai-agents.d.ts",
+      "import": "./dist/integrations/openai-agents.js"
+    },
+    "./evidence": {
+      "types": "./dist/evidence/index.d.ts",
+      "import": "./dist/evidence/index.js"
+    },
+    "./schema": "./schema/act-input.schema.json"
+  },
+  "files": [
+    "dist/",
+    "schema/",
+    "docs/",
+    "examples/",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node scripts/copy-assets.mjs",
+    "test": "npm run build && node --test test/*.test.mjs",
+    "verify:zhipu": "npm run build && node examples/zhipu-acceptance.mjs",
+    "verify:package": "npm run build && node scripts/verify-package.mjs"
+  },
+  "dependencies": {
+    "ajv": "8.20.0"
+  },
+  "peerDependencies": {
+    "@langchain/core": "^1.4.2",
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "@openai/agents": "^0.22.0",
+    "@trycua/cua-driver": "0.54.0",
+    "koffi": "^3.3.8",
+    "playwright-core": "^1.65.1"
+  },
+  "peerDependenciesMeta": {
+    "@openai/agents": {
+      "optional": true
+    },
+    "@langchain/core": {
+      "optional": true
+    },
+    "@modelcontextprotocol/sdk": {
+      "optional": true
+    },
+    "@trycua/cua-driver": {
+      "optional": true
+    },
+    "koffi": {
+      "optional": true
+    },
+    "playwright-core": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@e2b/desktop": "2.5.0",
+    "@langchain/core": "1.4.2",
+    "@langchain/langgraph": "1.7.5",
+    "@langchain/openai": "1.8.4",
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "@openai/agents": "0.22.0",
+    "@trycua/cua-driver": "0.54.0",
+    "@types/node": "22.10.2",
+    "koffi": "3.3.8",
+    "openai": "7.45.1",
+    "playwright-core": "1.65.1",
+    "typescript": "5.7.2",
+    "zod": "4.6.7"
+  },
+  "bugs": {
+    "url": "https://github.com/wszkxlllll/desklatch/issues"
+  },
+  "homepage": "https://github.com/wszkxlllll/desklatch#readme",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts"
+}

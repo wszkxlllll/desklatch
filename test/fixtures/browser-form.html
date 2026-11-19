@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>DeskLatch browser fixture</title>
+    <style>
+      body { font: 16px sans-serif; margin: 2rem; }
+      label { display: block; margin: .75rem 0; }
+      input, textarea { display: block; width: 24rem; padding: .35rem; }
+      #filters { border: 1px solid #aaa; padding: 1rem; }
+      #advanced { display: none; }
+    </style>
+  </head>
+  <body>
+    <form id="profile-form" aria-label="Public profile">
+      <label for="title">Title</label>
+      <input id="title" name="title" type="text" autocomplete="off">
+      <label for="notes">Notes</label>
+      <textarea id="notes" name="notes"></textarea>
+    </form>
+
+    <form id="filters" aria-label="Public filters">
+      <label for="query">Query</label>
+      <input id="query" name="query" type="search">
+      <button id="search" type="submit">Search</button>
+      <button id="disclosure" type="button" aria-controls="advanced" aria-expanded="false">Show advanced</button>
+      <div id="advanced" role="region" aria-label="Advanced filters">
+        <label for="tag">Tag</label>
+        <input id="tag" name="tag" type="text">
+      </div>
+    </form>
+
+    <script>
+      document.getElementById('disclosure').addEventListener('click', function () {
+        const panel = document.getElementById('advanced');
+        const open = panel.style.display !== 'none';
+        panel.style.display = open ? 'none' : 'block';
+        this.setAttribute('aria-expanded', String(!open));
+      });
+      document.getElementById('filters').addEventListener('submit', function (event) {
+        event.preventDefault();
+        this.dataset.searched = document.getElementById('query').value;
+      });
+    </script>
+  </body>
+</html>

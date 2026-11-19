@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>DeskLatch approval fixture</title></head>
+  <body>
+    <form id="send-form" aria-label="Send public message" action="/send" method="post">
+      <label for="recipient">Recipient</label>
+      <input id="recipient" name="recipient" type="text" value="alice@example.test">
+      <label for="message">Message</label>
+      <textarea id="message" name="message">Hello</textarea>
+      <button id="send" type="submit">Send</button>
+    </form>
+    <script>
+      document.getElementById('send-form').addEventListener('submit', function (event) {
+        event.preventDefault();
+        this.dataset.sent = 'true';
+      });
+    </script>
+  </body>
+</html>

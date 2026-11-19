@@ -1,0 +1,673 @@
+import type {
+  ActionKind,
+  Control,
+  Effect,
+  Rect,
+  RiskDecision,
+  RiskInput,
+  RiskPolicy,
+  Step,
+  State,
+} from "./contracts.js";
+
+/**
+ * The policy deliberately has no model, OCR, desktop, or network dependency.
+ * A host may inject a local OCR adapter and/or a text-only reviewer through
+ * `createRiskPolicy`; the default policy never asks either one for help.
+ */
+export const RISK_POLICY_VERSION = "desklatch-risk-v1";
+
+export type RiskCategory =
+  | "external"
+  | "financial"
+  | "destructive"
+  | "security"
+  | "sensitive"
+  | "unknown";
+
+export interface TextRiskControl {
+  id: string;
+  role: string;
+  name?: string;
+  within?: string;
+  states: readonly State[];
+  actions: readonly ActionKind[];
+  effect?: Effect;
+  sensitive?: boolean;
+  /** Values are intentionally not included: reviewers receive text facts, not input contents. */
+  valueLength?: number;
+}
+
+export interface TextRiskReviewRequest {
+  /** The action kind and safe parameter facts; text/setValue contents are reduced to lengths. */
+  action: {
+    kind: ActionKind;
+    textLength?: number;
+    valueLength?: number;
+    key?: string;
+    keys?: readonly string[];
+    button?: "left" | "right";
+    count?: 1 | 2;
+    direction?: "up" | "down" | "left" | "right";
+    amount?: number;
+    by?: "line" | "page";
+  };
+  target: TextRiskControl;
+  destination?: TextRiskControl;
+  /** Bounded local OCR text, when the host opted into OCR. No image is ever passed here. */
+  localText?: readonly TextRiskOcrLine[];
+  /** Why the structural path could not determine the immediate consequence. */
+  reason: string;
+}
+
+export interface TextRiskOcrLine {
+  text: string;
+  confidence?: number;
+  /** A box is evidence metadata only; it does not grant geometry permission. */
+  box?: readonly [number, number, number, number];
+}
+
+export type TextRiskReview =
+  | {
+      classification: "clear" | "low";
+      reason?: string;
+    }
+  | {
+      classification: "suspicious" | "high" | "unknown" | "unclear";
+      reason?: string;
+    }
+  | {
+      /** A reviewer may explicitly deny, but can never override a local hard denial. */
+      decision: "allow" | "approve" | "deny";
+      reason?: string;
+      classification?: "clear" | "low" | "suspicious" | "high" | "unknown" | "unclear";
+    };
+
+/**
+ * A reviewer is intentionally text-only. Implementations may call a local
+ * model or another host service, but they receive no FrameImage and have no
+ * dispatch/approval capability.
+ */
+export type TextRiskReviewer =
+  | ((request: TextRiskReviewRequest, signal: AbortSignal) => Promise<TextRiskReview> | TextRiskReview)
+  | {
+      review(request: TextRiskReviewRequest, signal: AbortSignal): Promise<TextRiskReview> | TextRiskReview;
+    }
+  | {
+      classify(request: TextRiskReviewRequest, signal: AbortSignal): Promise<TextRiskReview> | TextRiskReview;
+    };
+
+export interface LocalOcrRequest {
+  input: RiskInput;
+  /** Only a host-provided bounded region is allowed. Omitted means no OCR call. */
+  region: Rect;
+  /** Optional host-local image/crop. It is passed only to the local OCR hook. */
+  image?: unknown;
+  /** The host adapter owns image acquisition; policy never stores or forwards pixels. */
+  signal: AbortSignal;
+}
+
+export interface LocalOcrResult {
+  lines: readonly TextRiskOcrLine[];
+  /** A host should identify the model; policy rejects non-local/download-backed adapters. */
+  source?: "local";
+  model?: "PP-OCRv5-mobile" | string;
+}
+
+/** Host-owned, lazy OCR adapter. No OCR engine is bundled in DeskLatch core. */
+export interface LocalOcrProvider {
+  readonly localOnly?: true;
+  readonly model?: string;
+  /** Optional host-local image acquisition, called only on the OCR path. */
+  getImage?(request: Omit<LocalOcrRequest, "image">): Promise<unknown>;
+  recognize(request: LocalOcrRequest): Promise<LocalOcrResult>;
+}
+
+export type HostRuleResult =
+  | boolean
+  | string
+  | {
+      match: boolean;
+      code?: string;
+    };
+
+export type RiskHostRule = (input: RiskInput, signal: AbortSignal) => HostRuleResult | Promise<HostRuleResult>;
+
+export interface RiskHostRules {
+  /** Cannot be overridden by a reviewer or a low-risk structural result. */
+  hardDeny?: RiskHostRule;
+  /** Requires the host's one-time approval flow; it never silently allows. */
+  requireApproval?: RiskHostRule;
+}
+
+export interface RiskPolicyOptions {
+  /** The sole reviewer hook. It receives a text-only request. */
+  reviewer?: TextRiskReviewer;
+  /** Optional lazy local OCR. It is only used when structural evidence is insufficient. */
+  ocr?: LocalOcrProvider;
+  /** Region provider. If absent, policy will use target.rect only. */
+  ocrRegion?: (input: RiskInput) => Rect | undefined;
+  /** Maximum reviewer/OCR time. Defaults to 1 second and is always bounded. */
+  timeoutMs?: number;
+  /** Maximum reviewer/OCR requests made by this policy instance. Defaults to two. */
+  maxExternalRequests?: number;
+  /** Host rules run before any optional reviewer and OCR. */
+  hostRules?: RiskHostRules;
+  /** Additional key combinations that are forbidden for this host. */
+  forbiddenHotkeys?: readonly (readonly string[])[];
+}
+
+interface LocalClassification {
+  decision: "allow" | "approve" | "deny" | "review";
+  code: string;
+  category?: RiskCategory;
+  reason: string;
+}
+
+const DEFAULT_TIMEOUT_MS = 1_000;
+// One bounded local OCR pass plus one bounded text-only review pass may be
+// useful for a single ambiguous action. The host can lower this to one (or
+// zero) when its budget only permits one external operation.
+const DEFAULT_MAX_EXTERNAL_REQUESTS = 2;
+const MAX_REVIEW_TEXT = 320;
+const MAX_OCR_LINES = 24;
+const HIGH_RISK_EFFECTS = new Map<Effect, RiskCategory>([
+  ["external", "external"],
+  ["financial", "financial"],
+  ["destructive", "destructive"],
+  ["security", "security"],
+  ["sensitive", "sensitive"],
+]);
+
+const ACTION_VERBS = {
+  external: /(?:^|[\s_:-])(?:send|publish|post|submit|share|transfer|发送|发布|提交|转发|共享)(?:$|[\s_:-])/iu,
+  financial: /(?:^|[\s_:-])(?:pay|purchase|buy|checkout|charge|refund|付款|支付|购买|结算|退款)(?:$|[\s_:-])/iu,
+  destructive: /(?:^|[\s_:-])(?:delete|erase|wipe|remove|destroy|overwrite|replace|revoke|永久删除|彻底删除|清空|删除|覆盖|替换|撤销)(?:$|[\s_:-])/iu,
+  security: /(?:^|[\s_:-])(?:grant|permission|permissions|admin|administrator|role|authorize|密码|凭据|权限|管理员|授权)(?:$|[\s_:-])/iu,
+};
+
+const SAFE_ACTION_TEXT = /(?:^|[\s_:-])(?:cancel|close|back|next|previous|open|view|show|inspect|browse|filter|search|query|find|expand|collapse|刷新|取消|关闭|返回|下一步|上一步|打开|查看|浏览|筛选|搜索|查询|展开|折叠)(?:$|[\s_:-])/iu;
+
+const NEGATED_RISK_TEXT = /(?:\bdo\s+not\s+(?:send|publish|post|submit)\b|\bdon['’]t\s+(?:send|publish|post|submit)\b|\bnot\s+(?:send|publish|post|submit)\b|不要(?:发送|发布|提交))/iu;
+
+/** Default local-only policy. It never invokes OCR, a reviewer, or external code. */
+export const defaultRiskPolicy: RiskPolicy = createRiskPolicy();
+
+/**
+ * Construct an independent policy for one host/session. The returned function
+ * is stateful only for its bounded external-request budget; no approval is
+ * cached, so a host must explicitly handle each `approve` result once.
+ */
+export function createRiskPolicy(options: RiskPolicyOptions = {}): RiskPolicy {
+  const timeoutMs = boundedTimeout(options.timeoutMs);
+  const maxExternalRequests = boundedRequestBudget(options.maxExternalRequests);
+  const hostRules = options.hostRules ?? {};
+  const reviewer = options.reviewer;
+  const ocr = options.ocr;
+  const forbiddenHotkeys = new Set((options.forbiddenHotkeys ?? []).map(normalizeHotkey));
+  let externalRequests = 0;
+
+  return async function riskPolicy(input: RiskInput): Promise<RiskDecision> {
+    const basic = validateInput(input);
+    if (basic !== undefined) return basic;
+
+    const aborted = input.signal?.aborted === true;
+    if (aborted) return decision("deny", "aborted", "The action was cancelled before risk evaluation.");
+
+    const hardRule = hostRules.hardDeny;
+    if (hardRule !== undefined) {
+      const result = await runHostRule(hardRule, input, timeoutMs, input.signal);
+      if (result.kind === "aborted") return decision("deny", "aborted", "The action was cancelled during host policy evaluation.");
+      if (result.kind === "error") return decision("deny", "host_rule_failed_closed", "The host denial rule failed; the action is stopped.");
+      if (result.match) return decision("deny", result.code ?? "host_denied", "The host policy denied this action.");
+    }
+
+    const local = classifyStructurally(input, forbiddenHotkeys);
+    if (local.decision === "deny") return decision("deny", local.code, local.reason);
+
+    const approvalRule = hostRules.requireApproval;
+    if (approvalRule !== undefined) {
+      const result = await runHostRule(approvalRule, input, timeoutMs, input.signal);
+      if (result.kind === "aborted") return decision("deny", "aborted", "The action was cancelled during host policy evaluation.");
+      if (result.kind === "error") return decision("approve", "host_rule_failed_closed", "The host approval rule could not be checked; approval is required.");
+      if (result.match) return decision("approve", result.code ?? "host_approval_required", "The host policy requires approval for this action.");
+    }
+
+    if (local.decision === "allow" || local.decision === "approve") {
+      return decision(local.decision, local.code, local.reason);
+    }
+
+    // Structural evidence is insufficient. OCR is deliberately lazy and only
+    // gets a host-bounded region; its text is never sent to an image-capable API.
+    let localText: readonly TextRiskOcrLine[] | undefined;
+    let region: Rect | undefined;
+    try {
+      region = options.ocrRegion?.(input) ?? input.target.rect;
+    } catch {
+      return decision("approve", "ocr_region_failed", "The bounded OCR region could not be determined; host approval is required.");
+    }
+    if (ocr !== undefined && region !== undefined && isBoundedRegion(region) && externalRequests < maxExternalRequests) {
+      externalRequests += 1;
+      const ocrResult = await runOcr(ocr, { input, region, signal: input.signal ?? new AbortController().signal }, timeoutMs);
+      if (ocrResult.kind === "ok") {
+        localText = ocrResult.lines;
+        const ocrRisk = classifyOcrText(localText);
+        if (ocrRisk !== undefined) return decision("approve", ocrRisk.code, ocrRisk.reason);
+      } else if (ocrResult.kind === "aborted") {
+        return decision("deny", "aborted", "The action was cancelled during local evidence collection.");
+      }
+    }
+
+    if (reviewer === undefined || externalRequests >= maxExternalRequests) {
+      return decision("approve", reviewer === undefined ? "ambiguous_requires_approval" : "review_budget_exhausted", "The immediate consequence is ambiguous; host approval is required.");
+    }
+
+    externalRequests += 1;
+    const reviewRequest = makeTextReviewRequest(input, local.reason, localText);
+    const reviewed = await runReviewer(reviewer, reviewRequest, timeoutMs, input.signal);
+    if (reviewed.kind === "aborted") return decision("deny", "aborted", "The action was cancelled during risk review.");
+    if (reviewed.kind !== "ok") return decision("approve", reviewed.code, reviewed.reason);
+
+    return decisionFromReview(reviewed.value);
+  };
+}
+
+function validateInput(input: RiskInput): RiskDecision | undefined {
+  if (input === undefined || input === null || typeof input !== "object") {
+    return decision("deny", "invalid_risk_input", "Risk input is missing.");
+  }
+  if (input.step === undefined || input.step === null || typeof input.step !== "object") {
+    return decision("deny", "invalid_step", "The action step is missing.");
+  }
+  if (!(new Set<ActionKind>(["click", "type", "setValue", "scroll", "keypress", "hotkey", "drag"])).has(input.step.kind)) {
+    return decision("deny", "invalid_step", "The action kind is not supported.");
+  }
+  if (input.target === undefined || input.target === null || typeof input.target !== "object") {
+    return decision("deny", "missing_target", "The action target is missing.");
+  }
+  if (typeof input.target.id !== "string" || input.target.id.trim().length === 0 || typeof input.target.role !== "string" || input.target.role.trim().length === 0) {
+    return decision("deny", "invalid_target", "The action target is not structurally identified.");
+  }
+  return undefined;
+}
+
+function classifyStructurally(input: RiskInput, forbiddenHotkeys: ReadonlySet<string>): LocalClassification {
+  const step = input.step;
+  const target = input.target;
+  const effect = target.effect;
+
+  if (step.kind === "hotkey") {
+    const normalized = normalizeHotkey(step.keys);
+    if (normalized.length === 0 || forbiddenHotkeys.has(normalized) || isKnownForbiddenHotkey(normalized)) {
+      return { decision: "deny", code: "forbidden_hotkey", category: "security", reason: "This host-forbidden shortcut cannot be dispatched." };
+    }
+  }
+
+  const stateError = checkStateForAction(step, target);
+  if (stateError !== undefined) return stateError;
+
+  const explicitRisk = effect === undefined ? undefined : HIGH_RISK_EFFECTS.get(effect);
+  if (explicitRisk !== undefined) {
+    return { decision: "approve", code: `effect_${explicitRisk}_requires_approval`, category: explicitRisk, reason: `The target is structurally marked as ${effect}.` };
+  }
+  if (target.filterAction === true && (step.kind === "click" || step.kind === "keypress" || step.kind === "scroll" || step.kind === "type" || step.kind === "setValue")) {
+    return { decision: "allow", code: "structural_filter_action", reason: "The host marked this as a bounded search/filter action." };
+  }
+  if (effect === "unknown") {
+    return { decision: "review", code: "unknown_effect", category: "unknown", reason: "The target's immediate consequence is unknown." };
+  }
+
+  // Protected input is an approval boundary, but it is not a reason to expose
+  // the value to OCR/review. The policy only sees the target's sensitivity bit.
+  if (target.sensitive === true) {
+    return { decision: "approve", code: "protected_target", category: "sensitive", reason: "The target is marked sensitive; host approval is required." };
+  }
+
+  // Text contents are intentionally not inspected. A draft body containing
+  // “do not send”, “pay”, or similar words is still merely typed text.
+  if (step.kind === "type" || step.kind === "setValue") {
+    if (effect === "read" || effect === "navigate" || effect === "edit" || effect === undefined) {
+      return { decision: "allow", code: "structural_text_input", reason: "Typing into a non-sensitive editable target is a local structural action." };
+    }
+  }
+
+  if (effect === "read" || effect === "navigate" || effect === "edit") {
+    return { decision: "allow", code: "structural_low_impact", reason: "The target has a non-consequential structural effect." };
+  }
+
+  // A target without a declared effect is only safe when the action and role
+  // make the immediate consequence clear. Labels/nearby text are ignored.
+  const targetName = normalizeText(target.name);
+  const targetRole = normalizeText(target.role);
+  const actionLabel = targetName && !isNonActionRole(targetRole) ? targetName : "";
+  if (isExplicitNegation(actionLabel)) {
+    return { decision: "allow", code: "negated_action_label", reason: "A negated label is not evidence of a send/payment operation." };
+  }
+
+  if (step.kind === "scroll") {
+    if (target.filterAction === true || targetRole.includes("scroll") || targetRole.includes("list") || targetRole.includes("document") || targetRole.includes("pane")) {
+      return { decision: "allow", code: "structural_scroll", reason: "Scrolling within a structurally identified region is low impact." };
+    }
+    return { decision: "review", code: "ambiguous_scroll_target", reason: "The scroll recipient is not structurally identified as a bounded view." };
+  }
+
+  if (step.kind === "click") {
+    const namedRisk = actionLabelRisk(actionLabel);
+    if (namedRisk !== undefined) {
+      return { decision: "approve", code: `label_${namedRisk}_requires_approval`, category: namedRisk, reason: "The action target itself suggests a consequential operation." };
+    }
+    if (SAFE_ACTION_TEXT.test(actionLabel) || isReadOnlyHistoryLabel(actionLabel) || isDraftActionLabel(actionLabel) || target.filterAction === true) {
+      return { decision: "allow", code: "structural_safe_click", reason: "The action target is a clear navigation/filter control." };
+    }
+    return { decision: "review", code: "ambiguous_click_target", reason: "The click target's immediate consequence is not established." };
+  }
+
+  if (step.kind === "drag") {
+    if (input.destination === undefined) return { decision: "review", code: "ambiguous_drag_destination", reason: "A drag destination is not available for consequence checking." };
+    if (input.destination.effect !== undefined && HIGH_RISK_EFFECTS.has(input.destination.effect)) {
+      const category = HIGH_RISK_EFFECTS.get(input.destination.effect)!;
+      return { decision: "approve", code: `destination_${category}_requires_approval`, category, reason: "The drag destination is consequential." };
+    }
+    return { decision: "review", code: "ambiguous_drag", reason: "A drag can transfer or alter data and needs consequence evidence." };
+  }
+
+  // Keypress/focus actions can submit forms or invoke browser/app commands;
+  // only a structurally known low-impact key gets an unconditional allow.
+  if (step.kind === "keypress" && isNavigationKey(step.key) && targetRole.includes("search")) {
+    return { decision: "allow", code: "structural_navigation_key", reason: "The key is a navigation key on a search target." };
+  }
+  return { decision: "review", code: "ambiguous_action", reason: "The action's immediate consequence is not established." };
+}
+
+function checkStateForAction(step: Step, target: Control): LocalClassification | undefined {
+  const states = new Set(target.states ?? []);
+  if (step.kind === "click" && states.size > 0 && !states.has("enabled")) {
+    return { decision: "deny", code: "target_not_enabled", reason: "The click target is not currently enabled." };
+  }
+  if ((step.kind === "type" || step.kind === "setValue") && states.size > 0 && !states.has("editable")) {
+    return { decision: "deny", code: "target_not_editable", reason: "The input target is not currently editable." };
+  }
+  if ((step.kind === "keypress" || step.kind === "hotkey") && states.size > 0 && !states.has("focused")) {
+    return { decision: "deny", code: "target_not_focused", reason: "A key action requires a currently focused recipient." };
+  }
+  return undefined;
+}
+
+function actionLabelRisk(value: string): RiskCategory | undefined {
+  if (value.length === 0 || isExplicitNegation(value)) return undefined;
+  if (ACTION_VERBS.external.test(value)) return "external";
+  if (ACTION_VERBS.financial.test(value)) return "financial";
+  if (ACTION_VERBS.destructive.test(value)) return "destructive";
+  if (ACTION_VERBS.security.test(value)) return "security";
+  return undefined;
+}
+
+function classifyOcrText(lines: readonly TextRiskOcrLine[]): LocalClassification | undefined {
+  for (const line of lines.slice(0, MAX_OCR_LINES)) {
+    if (line.confidence !== undefined && (!Number.isFinite(line.confidence) || line.confidence < 0.8)) continue;
+    const risk = actionLabelRisk(normalizeText(line.text));
+    if (risk !== undefined) return { decision: "approve", code: `ocr_${risk}_requires_approval`, category: risk, reason: "Bounded local OCR found a consequential action label." };
+  }
+  return undefined;
+}
+
+function makeTextReviewRequest(input: RiskInput, reason: string, localText?: readonly TextRiskOcrLine[]): TextRiskReviewRequest {
+  const step = input.step;
+  const action: TextRiskReviewRequest["action"] = { kind: step.kind };
+  if (step.kind === "type") action.textLength = step.text.length;
+  if (step.kind === "setValue") action.valueLength = step.value.length;
+  if (step.kind === "keypress") action.key = redactText(step.key, 64);
+  if (step.kind === "hotkey") action.keys = step.keys.map((key) => redactText(key, 32));
+  if (step.kind === "click") {
+    action.button = step.button;
+    action.count = step.count;
+  }
+  if (step.kind === "scroll") {
+    action.direction = step.direction;
+    action.amount = step.amount;
+    action.by = step.by;
+  }
+  return {
+    action,
+    target: toTextControl(input.target),
+    ...(input.destination === undefined ? {} : { destination: toTextControl(input.destination) }),
+    ...(localText === undefined ? {} : { localText: localText.slice(0, MAX_OCR_LINES).map(sanitizeOcrLine) }),
+    reason: redactText(reason, MAX_REVIEW_TEXT),
+  };
+}
+
+function toTextControl(control: Control): TextRiskControl {
+  return {
+    id: redactText(control.id, 128),
+    role: redactText(control.role, 64),
+    ...(control.name === undefined ? {} : { name: redactText(control.name, MAX_REVIEW_TEXT) }),
+    ...(control.within === undefined ? {} : { within: redactText(control.within, 128) }),
+    states: [...(control.states ?? [])],
+    actions: [...(control.actions ?? [])],
+    ...(control.effect === undefined ? {} : { effect: control.effect }),
+    ...(control.sensitive === undefined ? {} : { sensitive: control.sensitive }),
+    ...(control.value === undefined ? {} : { valueLength: control.value.length }),
+  };
+}
+
+function sanitizeOcrLine(line: TextRiskOcrLine): TextRiskOcrLine {
+  return {
+    text: redactText(line.text, MAX_REVIEW_TEXT),
+    ...(line.confidence === undefined ? {} : { confidence: clamp01(line.confidence) }),
+    ...(line.box === undefined ? {} : { box: line.box.slice(0, 4) as [number, number, number, number] }),
+  };
+}
+
+function decisionFromReview(review: TextRiskReview): RiskDecision {
+  if ("decision" in review) {
+    if (review.decision === "deny") return decision("deny", "review_denied", review.reason ?? "The text-only reviewer denied this action.");
+    if (review.decision === "approve") return decision("approve", "review_approval_required", review.reason ?? "The text-only reviewer requires host approval.");
+    if (review.classification === "clear" || review.classification === "low" || review.classification === undefined) {
+      return decision("allow", "review_clear", review.reason ?? "The text-only reviewer found no consequential effect.");
+    }
+    return decision("approve", "review_ambiguous", review.reason ?? "The text-only reviewer did not establish a low-risk effect.");
+  }
+  if (review.classification === "clear" || review.classification === "low") {
+    return decision("allow", "review_clear", review.reason ?? "The text-only reviewer found no consequential effect.");
+  }
+  return decision("approve", `review_${review.classification}`, review.reason ?? `The text-only reviewer classified this action as ${review.classification}.`);
+}
+
+async function runReviewer(
+  reviewer: TextRiskReviewer,
+  request: TextRiskReviewRequest,
+  timeoutMs: number,
+  parentSignal?: AbortSignal,
+): Promise<{ kind: "ok"; value: TextRiskReview } | { kind: "timeout" | "error"; code: string; reason: string } | { kind: "aborted" }> {
+  const controller = new AbortController();
+  const signal = combineSignals(parentSignal, controller.signal);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const value = await Promise.race([
+      invokeReviewer(reviewer, request, signal),
+      abortPromise(signal),
+    ]);
+    if (signal.aborted) return parentSignal?.aborted ? { kind: "aborted" } : { kind: "timeout", code: "review_timeout", reason: "The text-only reviewer exceeded its bounded time." };
+    if (!isReview(value)) return { kind: "error", code: "review_invalid", reason: "The text-only reviewer returned an invalid classification." };
+    return { kind: "ok", value };
+  } catch {
+    if (parentSignal?.aborted) return { kind: "aborted" };
+    if (signal.aborted) return { kind: "timeout", code: "review_timeout", reason: "The text-only reviewer exceeded its bounded time." };
+    return { kind: "error", code: "review_failed", reason: "The text-only reviewer failed; host approval is required." };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function runOcr(
+  provider: LocalOcrProvider,
+  request: LocalOcrRequest,
+  timeoutMs: number,
+): Promise<{ kind: "ok"; lines: readonly TextRiskOcrLine[] } | { kind: "timeout" | "error"; code: string } | { kind: "aborted" }> {
+  if (provider.localOnly !== true) return { kind: "error", code: "ocr_not_local" };
+  const controller = new AbortController();
+  const signal = combineSignals(request.signal, controller.signal);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const value = await Promise.race([runLocalOcr(provider, { ...request, signal }), abortPromise(signal)]);
+    if (signal.aborted) return request.signal.aborted ? { kind: "aborted" } : { kind: "timeout", code: "ocr_timeout" };
+    if (!isOcrResult(value)) return { kind: "error", code: "ocr_invalid" };
+    return { kind: "ok", lines: value.lines.slice(0, MAX_OCR_LINES).map(sanitizeOcrLine) };
+  } catch {
+    if (request.signal.aborted) return { kind: "aborted" };
+    if (signal.aborted) return { kind: "timeout", code: "ocr_timeout" };
+    return { kind: "error", code: "ocr_failed" };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function runLocalOcr(provider: LocalOcrProvider, request: LocalOcrRequest): Promise<LocalOcrResult> {
+  const image = provider.getImage === undefined ? undefined : await provider.getImage({ input: request.input, region: request.region, signal: request.signal });
+  return provider.recognize({ ...request, ...(image === undefined ? {} : { image }) });
+}
+
+function invokeReviewer(reviewer: TextRiskReviewer, request: TextRiskReviewRequest, signal: AbortSignal): Promise<TextRiskReview> | TextRiskReview {
+  if (typeof reviewer === "function") return reviewer(request, signal);
+  if ("review" in reviewer) return reviewer.review(request, signal);
+  return reviewer.classify(request, signal);
+}
+
+function isReview(value: unknown): value is TextRiskReview {
+  if (value === null || typeof value !== "object") return false;
+  const record = value as Record<string, unknown>;
+  if (record.decision !== undefined && !["allow", "approve", "deny"].includes(String(record.decision))) return false;
+  if (record.classification !== undefined && !["clear", "low", "suspicious", "high", "unknown", "unclear"].includes(String(record.classification))) return false;
+  return record.decision !== undefined || record.classification !== undefined;
+}
+
+function isOcrResult(value: unknown): value is LocalOcrResult {
+  if (value === null || typeof value !== "object") return false;
+  const lines = (value as { lines?: unknown }).lines;
+  return Array.isArray(lines) && lines.every((line) => line !== null && typeof line === "object" && typeof (line as { text?: unknown }).text === "string");
+}
+
+async function runHostRule(rule: RiskHostRule, input: RiskInput, timeoutMs: number, parentSignal?: AbortSignal): Promise<{ kind: "ok"; match: boolean; code?: string } | { kind: "error" } | { kind: "aborted" }> {
+  const controller = new AbortController();
+  const signal = combineSignals(parentSignal, controller.signal);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const result = await Promise.race([Promise.resolve(rule(input, signal)), abortPromise(signal)]);
+    if (signal.aborted) return parentSignal?.aborted ? { kind: "aborted" } : { kind: "error" };
+    return parseHostRuleResult(result);
+  } catch {
+    return parentSignal?.aborted ? { kind: "aborted" } : { kind: "error" };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function parseHostRuleResult(value: unknown): { kind: "ok"; match: boolean; code?: string } | { kind: "error" } {
+  if (typeof value === "boolean") return { kind: "ok", match: value };
+  if (typeof value === "string") return { kind: "ok", match: true, code: normalizeCode(value) };
+  if (value !== null && typeof value === "object" && typeof (value as { match?: unknown }).match === "boolean") {
+    const code = (value as { code?: unknown }).code;
+    return { kind: "ok", match: (value as { match: boolean }).match, ...(typeof code === "string" ? { code: normalizeCode(code) } : {}) };
+  }
+  return { kind: "error" };
+}
+
+function decision(decisionValue: RiskDecision["decision"], code: string, _reason: string): RiskDecision {
+  // RiskDecision intentionally exposes only a stable code. Keep reason out of
+  // the public contract so no accidental sensitive text is logged by callers.
+  return { decision: decisionValue, code: normalizeCode(code) };
+}
+
+function boundedTimeout(value: number | undefined): number {
+  if (value === undefined) return DEFAULT_TIMEOUT_MS;
+  if (!Number.isFinite(value) || value < 1) throw new Error("timeoutMs must be a positive finite number");
+  return Math.min(Math.floor(value), 60_000);
+}
+
+function boundedRequestBudget(value: number | undefined): number {
+  if (value === undefined) return DEFAULT_MAX_EXTERNAL_REQUESTS;
+  if (!Number.isInteger(value) || value < 0) throw new Error("maxExternalRequests must be a non-negative integer");
+  return Math.min(value, 8);
+}
+
+function combineSignals(parent: AbortSignal | undefined, local: AbortSignal): AbortSignal {
+  if (parent === undefined) return local;
+  if (typeof AbortSignal.any === "function") return AbortSignal.any([parent, local]);
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  if (parent.aborted || local.aborted) controller.abort();
+  else {
+    parent.addEventListener("abort", abort, { once: true });
+    local.addEventListener("abort", abort, { once: true });
+  }
+  return controller.signal;
+}
+
+function abortPromise(signal: AbortSignal): Promise<never> {
+  return new Promise((_, reject) => {
+    if (signal.aborted) {
+      reject(new Error("aborted"));
+      return;
+    }
+    signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+  });
+}
+
+function normalizeText(value: string | undefined): string {
+  return value?.replace(/\s+/gu, " ").trim() ?? "";
+}
+
+function redactText(value: string, maxLength: number): string {
+  return normalizeText(value)
+    .replace(/(?:sk-[A-Za-z0-9_-]{16,}|AIza[0-9A-Za-z_-]{20,})/gu, "[redacted-credential]")
+    .replace(/\b\d{13,19}\b/gu, "[redacted-number]")
+    .replace(/((?:password|token|secret|api[_ -]?key|验证码|密码|密钥)\s*[:：=]\s*)\S+/giu, "$1[redacted]")
+    .slice(0, maxLength);
+}
+
+function normalizeCode(value: string): string {
+  const code = value.trim().replace(/[^A-Za-z0-9_.:-]+/gu, "_").slice(0, 80);
+  return code.length > 0 ? code : "host_rule";
+}
+
+function normalizeHotkey(keys: readonly string[] | string): string {
+  const values: readonly string[] = typeof keys === "string" ? keys.split("+") : keys;
+  return values.map((key) => normalizeText(key).toLowerCase()).filter(Boolean).sort().join("+");
+}
+
+function isKnownForbiddenHotkey(value: string): boolean {
+  return value === "alt+ctrl+delete" || value === "ctrl+alt+delete" || value === "command+q" || value === "ctrl+alt+del";
+}
+
+function isNavigationKey(value: string): boolean {
+  return new Set(["enter", "return", "tab", "escape", "esc", "arrowdown", "arrowup"]).has(normalizeText(value).toLowerCase());
+}
+
+function isNonActionRole(role: string): boolean {
+  return /(?:static|text|label|heading|description|image|icon|textbox|searchbox|combobox|edit|input|list|option|cell)/iu.test(role);
+}
+
+function isExplicitNegation(value: string): boolean {
+  return NEGATED_RISK_TEXT.test(value);
+}
+
+function isReadOnlyHistoryLabel(value: string): boolean {
+  return /^(?:(?:view|show|inspect|browse|open)\s+)?(?:payment|transaction|billing|purchase)\s+(?:history|records?|logs?)$/iu.test(value)
+    || /^(?:(?:查看|浏览|查阅|打开)\s*)?(?:付款|支付|账单)\s*(?:历史|记录|日志)$/u.test(value);
+}
+
+function isDraftActionLabel(value: string): boolean {
+  return /^(?:save|store|保存)\s+(?:as\s+)?(?:draft|locally|草稿)$/iu.test(value);
+}
+
+function isBoundedRegion(region: Rect): boolean {
+  return Number.isFinite(region.x) && Number.isFinite(region.y)
+    && Number.isFinite(region.width) && Number.isFinite(region.height)
+    && region.width > 0 && region.height > 0
+    && region.width <= 4096 && region.height <= 4096;
+}
+
+function clamp01(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return Math.max(0, Math.min(1, value));
+}

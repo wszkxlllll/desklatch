@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>DeskLatch late fixture</title></head>
+  <body>
+    <main id="late-root" aria-label="Late content"></main>
+    <script>
+      setTimeout(function () {
+        const button = document.createElement('button');
+        button.id = 'late-button';
+        button.type = 'button';
+        button.textContent = 'Late action';
+        document.getElementById('late-root').appendChild(button);
+      }, 80);
+    </script>
+  </body>
+</html>
