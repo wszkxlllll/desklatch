@@ -53,6 +53,10 @@
       "types": "./dist/evidence/index.d.ts",
       "import": "./dist/evidence/index.js"
     },
+    "./reuse": {
+      "types": "./dist/reuse.d.ts",
+      "import": "./dist/reuse.js"
+    },
     "./schema": "./schema/act-input.schema.json"
   },
   "files": [

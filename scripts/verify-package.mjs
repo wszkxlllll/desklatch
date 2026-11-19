@@ -16,13 +16,14 @@ try {
   const [packed] = JSON.parse(run([npm, "pack", "--json", "--ignore-scripts", "--pack-destination", consumer], root));
   assert.equal(basename(packed.filename), packed.filename);
   const files = new Set(packed.files.map(file => file.path));
-  for (const path of ["schema/act-input.schema.json", "dist/bin/mcp.js", "dist/backends/e2b/chromium_pipe.py",
+  for (const path of ["schema/act-input.schema.json", "dist/bin/mcp.js", "dist/reuse.js", "dist/reuse.d.ts", "dist/backends/e2b/chromium_pipe.py",
     "dist/evidence/rapidocr_worker.py", "dist/integrations/dsh.js", "dist/integrations/langchain-images.js",
     "docs/architecture.md", "examples/frameworks/langgraph.mjs"]) assert.ok(files.has(path), path);
   await writeFile(join(consumer, "package.json"), '{"name":"independent-host","private":true,"type":"module"}', "utf8");
   run([npm, "install", "--offline", "--omit=optional", "--ignore-scripts", "--no-package-lock", "--no-audit", "--no-fund", join(consumer, packed.filename)], consumer);
   const probe = `import assert from 'node:assert/strict';
     import { createDeskSession, createDeskTools } from 'desklatch';
+    import { createVerifiedStepReuse } from 'desklatch/reuse';
     for (const peer of ['playwright-core', '@langchain/core', '@modelcontextprotocol/sdk', '@openai/agents', '@trycua/cua-driver', '@deepseek-ai/dsh-mcp-client']) {
       assert.throws(() => import.meta.resolve(peer), {code:'ERR_MODULE_NOT_FOUND'});
     }
@@ -31,12 +32,19 @@ try {
     const session = createDeskSession({ capabilities:[{kind:'type',targets:['selector']}],
       async observe() { return {scope:'host',complete:true,controls:[{...field,value}]}; },
       async dispatch(input) { value=input.step.text; return {status:'dispatched'}; }, async close() {} });
-    const tools = createDeskTools(session);
+    const cache = createVerifiedStepReuse({session});
+    const tools = createDeskTools({...session,act:cache.act});
     assert.deepEqual(tools.map(t=>t.name), ['observe','act']);
-    const result = await tools[1].invoke({steps:[{kind:'type',target:{name:'Title'},text:'ok',expect:{target:{name:'Title'},valueEquals:'ok'}}]});
-    assert.equal(result.steps[0].status, 'verified'); assert.equal(value,'ok'); await session.close();`;
+    const request = {steps:[{kind:'type',target:{name:'Title'},text:'ok',expect:{target:{name:'Title'},valueEquals:'ok'}}]};
+    const result = await tools[1].invoke(request);
+    assert.equal(result.steps[0].status, 'verified'); assert.equal(value,'ok');
+    const scope = {context:{app:'consumer',view:'draft'},coverage:'title field'};
+    await cache.remember('draft-title',request,result,{...scope,parameters:[{name:'title',paths:['steps.0.text','steps.0.expect.valueEquals']}]});
+    const replay = await cache.run('draft-title',{...scope,values:{title:'revised'}});
+    assert.equal(replay.result.steps[0].status,'verified'); assert.equal(value,'revised');
+    await session.close();`;
   run(["--input-type=module", "--eval", probe], consumer);
-  console.log(`Installed ${packed.name}@${packed.version} from tarball. Independent host verified one step with zero optional peers.`);
+  console.log(`Installed ${packed.name}@${packed.version} from tarball. Independent host verified an action and parameterized replay with zero optional peers.`);
 } finally {
   const createdPath = await realpath(consumer);
   if (dirname(createdPath) === tempParent && basename(createdPath).startsWith("desklatch-pack-")) {
