@@ -60,6 +60,40 @@ test("LangChain workspace tools invoke navigate and reject mixed workspace forms
   }
 });
 
+test("LangChain keeps document query and continuation parameters when the editor is registered first", async () => {
+  const reads = [];
+  const session = (allowModelDocumentText) => ({
+    capabilities: [], allowModelImages: false, allowModelDocumentText,
+    limits: { maxSteps: 4, maxTextLength: 1_000, maxScrollAmount: 10 },
+    async observe({ read } = {}) {
+      reads.push(read);
+      return { observationId: `fixture-${reads.length}`, view: "document", complete: true, controls: [] };
+    },
+    async act() { return { status: "rejected", steps: [] }; },
+    correct() {},
+    cancel() {},
+    async close() {},
+  });
+  const workspace = createWorkspace({
+    applications: [
+      { id: "editor", name: "Editor", session: session(false) },
+      { id: "browser", name: "Browser", session: session(true) },
+    ],
+    initialActive: "browser",
+  });
+  try {
+    const tools = createLangChainTools(workspace.tools);
+    assert.deepEqual(tools.map((tool) => tool.name), ["observe", "act"]);
+    const observe = tools.find((tool) => tool.name === "observe");
+    await observe.invoke({ read: { query: "opening hours" } });
+    await observe.invoke({ read: { cursor: "document-page-two" } });
+    await assert.rejects(() => observe.invoke({ read: { query: "new query", cursor: "wrong cursor" } }));
+    assert.deepEqual(reads, [{ query: "opening hours" }, { cursor: "document-page-two" }]);
+  } finally {
+    await workspace.close();
+  }
+});
+
 test("OpenAI Agents workspace function tools use normal bound invocation and preserve mixed-form rejection", async () => {
   const { workspace, state } = makeWorkspace();
   try {

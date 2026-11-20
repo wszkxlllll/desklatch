@@ -42,19 +42,78 @@ function readObserveArgs(input: unknown, allowImages: boolean, allowDocumentText
   if (view === "document" && !allowDocumentText) throw Error("document_delivery_not_authorized");
   if (!allowImages && (view === "image" || view === "both")) throw Error("image_delivery_not_authorized");
   let read: DocumentRead | undefined;
+  let searchRead = false;
   if (input.read !== undefined) {
     if (!allowDocumentText) throw Error("document_delivery_not_authorized");
-    if (input.read !== "document") throw Error("invalid_document_read");
-    read = "document";
+    if (input.read === "document") {
+      read = "document";
+    } else {
+      const requested = input.read;
+      if (!record(requested) || Object.keys(requested).some((key) => !["query", "cursor"].includes(key))) {
+        throw Error("invalid_document_read");
+      }
+      const query = requested.query;
+      const cursor = requested.cursor;
+      if ((query !== undefined && (!isNonBlank(query) || query.length > 256))
+        || (cursor !== undefined && (!isNonBlank(cursor) || cursor.length > 512))
+        || (query !== undefined && cursor !== undefined)
+        || (query === undefined && cursor === undefined)) throw Error("invalid_document_read");
+      read = { ...requested } as DocumentRead;
+      searchRead = true;
+    }
     if (!hasView) view = "document";
   }
-  if (view === "document") read = "document";
+  if (view === "document" && read === undefined) read = "document";
+  if (searchRead && (view === "image" || view === "both")) throw Error("invalid_document_view");
   if (input.where === undefined) return { view, ...(read ? { read } : {}) };
   const where = input.where;
   if (!record(where) || !Object.keys(where).length || Object.keys(where).some(k =>
     !fields.includes(k) || typeof where[k] !== "string" || !(where[k] as string).trim() || (where[k] as string).length > 1024)
     || (where.state !== undefined && !states.some(s => s === where.state))) throw Error("invalid_observe_filter");
   return { view, where: { ...where }, ...(read ? { read } : {}) };
+}
+
+function isNonBlank(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+/** Shared model-facing observe schema used by DeskTools and workspace wrappers. */
+export function observeInputSchema(allowImages: boolean, allowDocumentText: boolean): Record<string, unknown> {
+  return {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      view: {
+        type: "string",
+        enum: [...(allowImages ? ["controls", "image", "both"] : ["controls"]), ...(allowDocumentText ? ["document"] : [])],
+        default: "controls",
+      },
+      where: {
+        type: "object", additionalProperties: false, minProperties: 1,
+        properties: {
+          role: { type: "string" }, name: { type: "string" }, within: { type: "string" }, state: { type: "string", enum: [...states] },
+        },
+      },
+      ...(allowDocumentText ? {
+        read: {
+          oneOf: [
+            { type: "string", enum: ["document"] },
+            {
+              type: "object", additionalProperties: false,
+              properties: {
+                query: { type: "string", minLength: 1, maxLength: 256 },
+                cursor: { type: "string", minLength: 1, maxLength: 512 },
+              },
+              oneOf: [
+                { required: ["query"] },
+                { required: ["cursor"] },
+              ],
+            },
+          ],
+        },
+      } : {}),
+    },
+  };
 }
 
 export function createDeskTools(session: DesktopToolSession): ToolEndpoint[] {
@@ -64,16 +123,8 @@ export function createDeskTools(session: DesktopToolSession): ToolEndpoint[] {
       name: "observe",
       description: "Discover controls and named graphics, or resolve ambiguity. Known targets can go directly to act. The controls view lists actual names, roles and available public values."
         + (allowImages ? " Use image or both to read information depicted in a graphic." : " This session permits text observations.")
-        + (allowDocumentText ? ' To read rendered page text, call {"read":"document"} without where. A where query returns matching controls only.' : ""),
-      inputSchema: {
-        type: "object", additionalProperties: false, properties: {
-          view: { type: "string", enum: [...(allowImages ? ["controls", "image", "both"] : ["controls"]), ...(allowDocumentText ? ["document"] : [])], default: "controls" },
-          where: { type: "object", additionalProperties: false, minProperties: 1, properties: {
-            role: { type: "string" }, name: { type: "string" }, within: { type: "string" }, state: { type: "string", enum: [...states] },
-          } },
-          ...(allowDocumentText ? { read: { type: "string", enum: ["document"] } } : {}),
-        },
-      },
+        + (allowDocumentText ? ' To read rendered page text, call {"read":"document"}; use {"read":{"query":"keyword"}} for literal rendered-text search and continue with the returned document.nextCursor. If a cursor is stale, start a fresh read.' : ""),
+      inputSchema: observeInputSchema(allowImages, allowDocumentText),
       invoke: async (input, signal) => session.observe({ ...readObserveArgs(input, allowImages, allowDocumentText), signal }),
     };
   if (session.capabilities.length === 0) return [observe];

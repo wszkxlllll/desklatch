@@ -167,6 +167,9 @@ export class ObservationRegistry {
       viewportOnly: document.viewportOnly === true,
       totalChars: Math.max(0, Math.min(64_000, Math.floor(document.totalChars))),
       totalChunks: Math.max(0, Math.min(256, Math.floor(document.totalChunks))),
+      ...(document.query === undefined ? {} : { query: sanitizeText(document.query, 256) }),
+      ...(document.matchCount === undefined ? {} : { matchCount: Math.max(0, Math.min(256, Math.floor(document.matchCount))) }),
+      ...(document.nextCursor === undefined ? {} : { nextCursor: sanitizeText(document.nextCursor, 512) }),
       ...(sourceUrl ? { sourceUrl } : {}),
     };
   }

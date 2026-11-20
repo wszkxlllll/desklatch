@@ -78,6 +78,11 @@ export interface BrowserBackendOptions {
   protectedFieldNames?: readonly string[];
 }
 
+/** Bounds for model-visible document search and continuation state. */
+export const MAX_DOCUMENT_QUERY_LENGTH = 256;
+export const MAX_DOCUMENT_CURSOR_LENGTH = 512;
+export const MAX_DOCUMENT_CURSORS = 32;
+
 export interface BrowserBackend extends DesktopBackend {
   readonly allowDocumentText: boolean;
 }

@@ -22,7 +22,11 @@
 
 在 Windows 实机上，智谱从空白的 Chrome 打开用户给出的上博东馆参观指南，查到普通周二闭馆和 17:00 停止入场，再自行切换到 Word，把说明及官网链接写入本次已打开的空白 DOCX 并保存。一次委托用了 8 次模型请求，传图 0 张，正文写入和保存各一次。宿主从磁盘解析 DOCX，确认全文与模型提交的正文一致，两项事实和链接均正确。早期测试曾在一次成功保存后又写入相同的段落，因此复跑在落盘内容匹配时结束，并在轨迹中记录 `delivery.verified`。[实机验收入口](../examples/local-workspace-acceptance.mjs)
 
-复跑时为 `ZHIPU_API_KEY` 配置智谱密钥，`DESKLATCH_RESULTS_DIR` 指向输出目录，`DESKLATCH_LOCAL_WORD_TEMPLATE_PATH` 指向由 Word 或 LibreOffice 保存的空白 DOCX。设置 `DESKLATCH_LOCAL_FOCUSED=1` 后运行 `node examples/local-workspace-acceptance.mjs`。程序为本次任务复制空白文档、启动独立应用，之后网页导航、切换、输入和保存均由模型发起。结果目录包含操作记录和最终文档。
+复跑时为 `ZHIPU_API_KEY` 配置智谱密钥，`DESKLATCH_RESULTS_DIR` 指向输出目录，`DESKLATCH_LOCAL_WORD_TEMPLATE_PATH` 指向由 Word 或 LibreOffice 保存的空白 DOCX。设置 `DESKLATCH_LOCAL_FOCUSED=1` 后运行 `node examples/local-workspace-acceptance.mjs`。程序复制空白文档并声明可用应用，模型经 `act` 选择 Chrome 或 Word 时才启动相应的独立窗口。测试缩小了正文的单次段数，要求模型实际使用续读和关键词查找。验收逐项核对成功的工具调用、Word 的派发回执及最终落盘的文档。
+
+使用同一个上博官网页面做正文验证时，宿主将单次返回限制为 1 段。首读报截断，传回 `nextCursor` 后取得下一段。直接搜索“停止入场”可命中首段以外原文。应用清单可在未启动 Chrome 的情况下读取，调用 `act` 选中 Chrome 后才启动该浏览器。[上博东馆参观指南](https://www.shanghaimuseum.cn/mu/frontend/pg/service/visit-east)
+
+按需启动的 Windows 实测使用智谱 `glm-5.3-flash`。会话开始时 Chrome 和 Word 的测试窗口均未启动。模型选择浏览器后，完成首批读取、一次续读和两次关键词查找，随后选择 Word，写入并保存说明。整个任务用了 9 次模型请求，传图 0 张。宿主核对了两个应用的进程与前台窗口、保存后的文档内容和引用的官网地址。[实机验收入口](../examples/local-workspace-acceptance.mjs)
 
 同一问题也在托管 E2B Desktop 上跑通。智谱从空白 Chromium 打开东馆指南，读取网页正文，切换到已打开空白 ODT 的 LibreOffice Writer，写入中文说明并保存。共 12 次模型请求、0 张传给模型的截图，写入和保存各一次。下载后重新解析 ODT，正文与模型提交的文字一致，闭馆日、停止入场时间和所引官网均通过核验。默认模板缺少原生控件绑定，本次 Writer 操作使用经过焦点核验的窗口。测试使用独立的 Writer 配置关闭首次启动教程。开发中还复现过 SDK 键盘接口能写入英文、对中文返回成功但输入框仍为空的情况，因此本次使用授权的临时剪贴板传递中文，并独立读取成品。配置 `E2B_API_KEY`、`ZHIPU_API_KEY` 与结果目录后运行 `node examples/cloud-workspace-acceptance.mjs`。程序在结束时释放沙箱。[云端验收入口](../examples/cloud-workspace-acceptance.mjs)
 

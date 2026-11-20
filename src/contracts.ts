@@ -5,6 +5,10 @@ export type View = "controls" | "image" | "both" | "document";
 /** A read-only request for bounded, rendered page text. This is opt-in at the browser host. */
 export interface DocumentReadOptions {
   kind?: "document";
+  /** Literal text search over all scoped rendered text (ASCII case-insensitive). */
+  query?: string;
+  /** Opaque continuation token returned by a prior document observation. */
+  cursor?: string;
   maxChars?: number;
   maxChunks?: number;
   chunkSize?: number;
@@ -27,6 +31,9 @@ export interface DocumentObservation {
   viewportOnly: boolean;
   totalChars: number;
   totalChunks: number;
+  query?: string;
+  matchCount?: number;
+  nextCursor?: string;
   sourceUrl?: string;
 }
 export interface Point { x: number; y: number }

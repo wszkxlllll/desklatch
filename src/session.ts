@@ -836,7 +836,11 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
         signal: merged.signal,
       }, true, read !== undefined);
       return observationRegistry.publicObservation(stored, view);
-    } catch {
+    } catch (error) {
+      if (typeof read === "object" && read.cursor && error instanceof Error
+        && ["document_cursor_stale", "document_route_changed"].includes(error.message)) {
+        throw new Error("document_cursor_stale");
+      }
       throw new Error("observe_failed");
     } finally {
       merged.dispose();

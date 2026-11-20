@@ -3,6 +3,7 @@ import test from "node:test";
 import { runWorkspaceAgent } from "../examples/support/workspace-agent.mjs";
 import { auditWorkspaceDelivery, verifySavedVisitNote } from "../examples/support/workspace-audit.mjs";
 import { eastVisitGuide } from "../examples/support/museum-visit-oracle.mjs";
+import { observeInputSchema } from "../dist/tools.js";
 
 test("a length-limited provider response never dispatches an incomplete proposal", async () => {
   let dispatched = false;
@@ -15,6 +16,22 @@ test("a length-limited provider response never dispatches an incomplete proposal
   assert.equal(dispatched, false);
   assert.equal(run.status, "error");
   assert.equal(run.events.at(-1).error.code, "model_output_limit");
+});
+
+test("the provider bridge restores stringified search and cursor arguments while preserving the document literal", async () => {
+  const original = [{ read: "document" }, { read: JSON.stringify({ query: "停止入场" }) }, { read: JSON.stringify({ cursor: "test-page" }) }];
+  const observed = [];
+  const endpoint = { name: "observe", description: "Read the authorized page", inputSchema: observeInputSchema(false, true),
+    async invoke(input) { observed.push(input); return { complete: true }; } };
+  let requestCount = 0;
+  const run = await runWorkspaceAgent({ tools: [endpoint], task: "Read the page", apiKey: "local-test-only", fetch: async () => {
+    const calls = requestCount++ === 0 ? original.map((args, index) => ({ id: `read-${index}`, type: "function",
+      function: { name: "observe", arguments: JSON.stringify(args) } })) : [];
+    return Response.json({ choices: [{ index: 0, finish_reason: calls.length ? "tool_calls" : "stop",
+      message: { role: "assistant", content: calls.length ? null : "Done", tool_calls: calls } }] });
+  } });
+  assert.equal(run.status, "completed");
+  assert.deepEqual(observed, [{ read: "document" }, { read: { query: "停止入场" } }, { read: { cursor: "test-page" } }]);
 });
 
 test("the delivery audit requires ordered model actions and actual editor receipts", () => {

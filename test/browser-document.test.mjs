@@ -252,6 +252,120 @@ test("document reads reject an exact-route race from the live evaluation", async
   if (result.skipped) t.skip("No installed Edge/Chrome/Chromium executable");
 });
 
+test("document query finds a late rendered match before output truncation", async (t) => {
+  const result = await withPage(async (page) => {
+    const late = "late-keyword";
+    await page.setContent(`<main><p>${"prefix text ".repeat(800)}${late} trailing text</p></main>`);
+    const backend = createBrowserBackend(page, { allowDocumentText: true, documentTextLimit: 24, documentChunkLimit: 1, documentChunkSize: 24 });
+    try {
+      const frame = await backend.observe({ view: "document", read: { query: late } });
+      assert.equal(frame.document?.query, late);
+      assert.equal(frame.document?.matchCount, 1);
+      assert.match(frame.document?.chunks.map((chunk) => chunk.text).join(" ") ?? "", /late-keyword/);
+      await page.setContent("<main><p>停<strong>止</strong>入场</p></main>");
+      const inline = await backend.observe({ view: "document", read: { query: "停止入场" } });
+      assert.equal(inline.document?.matchCount, 1);
+      assert.match(inline.document?.chunks.map((chunk) => chunk.text).join(" ") ?? "", /停止入场/);
+      await page.setContent("<main><p>First<br>Second</p></main>");
+      const lineBreak = await backend.observe({ view: "document", read: { query: "FIRST SECOND" } });
+      assert.equal(lineBreak.document?.matchCount, 1);
+      assert.match(lineBreak.document?.chunks[0]?.text ?? "", /First Second/);
+      await page.setContent("<main><p>needle one filler needle two filler needle three</p></main>");
+      const paged = createBrowserBackend(page, { allowDocumentText: true, documentTextLimit: 20, documentChunkLimit: 1, documentChunkSize: 20 });
+      try {
+        let document = (await paged.observe({ view: "document", read: { query: "needle" } })).document;
+        let snippets = document?.chunks.map((chunk) => chunk.text).join(" ") ?? "";
+        let pages = 1;
+        while (document?.nextCursor && pages < 10) {
+          document = (await paged.observe({ view: "document", read: { cursor: document.nextCursor } })).document;
+          snippets += ` ${document?.chunks.map((chunk) => chunk.text).join(" ") ?? ""}`;
+          pages += 1;
+        }
+        assert.equal(document?.matchCount, 3);
+        assert.equal((snippets.match(/needle/gi) ?? []).length, 3);
+        assert.ok(pages > 1);
+      } finally {
+        await paged.close();
+      }
+    } finally {
+      await backend.close();
+    }
+    return { skipped: false };
+  });
+  if (result.skipped) t.skip("No installed Edge/Chrome/Chromium executable");
+});
+
+test("document cursors continue without gaps at an exact character cutoff and are retry-safe", async (t) => {
+  const result = await withPage(async (page) => {
+    await page.setContent(`<main><p>${Array.from({ length: 24 }, (_, index) => `segment-${index}-text`).join(" ")}</p></main>`);
+    const backend = createBrowserBackend(page, { allowDocumentText: true });
+    try {
+      const full = await backend.observe({ view: "document", read: { kind: "document", maxChars: 20_000, maxChunks: 256, chunkSize: 12 } });
+      const expected = full.document?.chunks.map((chunk) => chunk.text).join("") ?? "";
+      let next = (await backend.observe({ view: "document", read: { kind: "document", maxChars: 12, maxChunks: 10, chunkSize: 12 } })).document;
+      assert.ok(next?.nextCursor);
+      const firstCursor = next.nextCursor;
+      let collected = next.chunks.map((chunk) => chunk.text).join("");
+      let retry = await backend.observe({ view: "document", read: { cursor: firstCursor } });
+      assert.deepEqual(retry.document?.chunks.map((chunk) => chunk.text), (await backend.observe({ view: "document", read: { cursor: firstCursor } })).document?.chunks.map((chunk) => chunk.text));
+      assert.notEqual(retry.document?.nextCursor, firstCursor);
+      collected += retry.document?.chunks.map((chunk) => chunk.text).join("") ?? "";
+      next = retry.document;
+      while (next?.nextCursor) {
+        next = (await backend.observe({ view: "document", read: { cursor: next.nextCursor } })).document;
+        collected += next?.chunks.map((chunk) => chunk.text).join("") ?? "";
+      }
+      assert.equal(collected, expected);
+    } finally {
+      await backend.close();
+    }
+    return { skipped: false };
+  });
+  if (result.skipped) t.skip("No installed Edge/Chrome/Chromium executable");
+});
+
+test("document cursors become stale after rendered text changes", async (t) => {
+  const result = await withPage(async (page) => {
+    await page.setContent("<main><p>before cursor text</p></main>");
+    const backend = createBrowserBackend(page, { allowDocumentText: true });
+    try {
+      const first = await backend.observe({ view: "document", read: { kind: "document", maxChars: 5, maxChunks: 1, chunkSize: 5 } });
+      assert.ok(first.document?.nextCursor);
+      await page.locator("main").evaluate((element) => { element.textContent = "after cursor text changed"; });
+      await assert.rejects(
+        () => backend.observe({ view: "document", read: { cursor: first.document.nextCursor } }),
+        (error) => error?.code === "document_cursor_stale",
+      );
+    } finally {
+      await backend.close();
+    }
+    return { skipped: false };
+  });
+  if (result.skipped) t.skip("No installed Edge/Chrome/Chromium executable");
+});
+
+test("query and cursor reads are model-visible only with the document grant", async (t) => {
+  const result = await withPage(async (page) => {
+    await page.setContent("<main><p>Visible keyword result</p></main>");
+    const backend = createBrowserBackend(page, { allowDocumentText: true });
+    const session = createDeskSession(backend, { allowModelDocumentText: true });
+    try {
+      const observe = createDeskTools(session).find((tool) => tool.name === "observe");
+      assert.ok(observe);
+      const read = observe.inputSchema.properties.read;
+      assert.equal(read.oneOf[1].properties.query.maxLength, 256);
+      const observation = await observe.invoke({ read: { query: "keyword" } });
+      assert.equal(observation.view, "document");
+      assert.equal(observation.document?.query, "keyword");
+      assert.match(observation.document?.chunks.map((chunk) => chunk.text).join(" ") ?? "", /keyword/i);
+    } finally {
+      await session.close();
+    }
+    return { skipped: false };
+  });
+  if (result.skipped) t.skip("No installed Edge/Chrome/Chromium executable");
+});
+
 test("plain same-page GET search requires a uniquely named public query field", async (t) => {
   const result = await withPage(async (page) => {
     await page.setContent(`

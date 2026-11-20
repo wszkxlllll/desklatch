@@ -1,7 +1,7 @@
 import type { ActResult, ApprovalDecision, ApprovalResolution, DeskSession } from "./core/session-types.js";
 import type { Capability } from "./contracts.js";
 import { actToolSchema } from "./request.js";
-import { createDeskTools, type ToolEndpoint } from "./tools.js";
+import { createDeskTools, observeInputSchema, type ToolEndpoint } from "./tools.js";
 
 export interface WorkspaceApplicationInfo {
   readonly id: string;
@@ -40,15 +40,35 @@ export interface WorkspaceApplication {
   readonly navigate?: WorkspaceNavigator;
 }
 
+export interface WorkspaceOpenedApplication {
+  readonly session: DeskSession;
+  readonly activate?: WorkspaceActivator;
+  readonly verifyFront?: WorkspaceFrontVerifier;
+  readonly navigate?: WorkspaceNavigator;
+}
+
+export interface OnDemandWorkspaceApplication {
+  readonly id: string;
+  readonly name: string;
+  readonly description?: string;
+  readonly capabilities: readonly Capability[];
+  readonly allowModelDocumentText?: boolean;
+  readonly allowModelImages?: boolean;
+  readonly allowNavigation?: boolean;
+  readonly open: (signal?: AbortSignal) => WorkspaceApplication | WorkspaceOpenedApplication | Promise<WorkspaceApplication | WorkspaceOpenedApplication>;
+}
+
+export type WorkspaceApplicationEntry = WorkspaceApplication | OnDemandWorkspaceApplication;
+
 export type WorkspaceDiscovery = (context: {
   readonly active: string | null;
   readonly applications: readonly WorkspaceApplicationInfo[];
   readonly signal?: AbortSignal;
-}) => readonly WorkspaceApplication[] | Promise<readonly WorkspaceApplication[]>;
+}) => readonly WorkspaceApplicationEntry[] | Promise<readonly WorkspaceApplicationEntry[]>;
 
 export interface WorkspaceOptions {
-  readonly applications?: readonly WorkspaceApplication[];
-  readonly initialActive?: string | WorkspaceApplication | null;
+  readonly applications?: readonly WorkspaceApplicationEntry[];
+  readonly initialActive?: string | WorkspaceApplicationEntry | null;
   readonly discover?: WorkspaceDiscovery;
 }
 
@@ -72,7 +92,7 @@ export interface Workspace {
   resolveApproval(requestId: string, decision: ApprovalDecision): Promise<ApprovalResolution>;
   correct(reason?: string): void;
   cancel(reason?: string): void;
-  registerApplication(application: WorkspaceApplication): WorkspaceApplicationInfo;
+  registerApplication(application: WorkspaceApplicationEntry): WorkspaceApplicationInfo;
   close(): Promise<void>;
 }
 
@@ -109,12 +129,18 @@ function validId(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0 && value.length <= 256;
 }
 
-function infoFor(application: WorkspaceApplication): WorkspaceApplicationInfo {
+function infoFor(application: WorkspaceApplicationEntry): WorkspaceApplicationInfo {
   return Object.freeze({
     id: application.id,
     name: application.name,
     ...(application.description === undefined ? {} : { description: application.description }),
   });
+}
+
+const normalizedOnDemand = new WeakMap<object, OnDemandWorkspaceApplication>();
+
+function isOnDemandApplication(value: WorkspaceApplicationEntry): value is OnDemandWorkspaceApplication {
+  return isRecord(value) && !hasOwn(value, "session") && Array.isArray(value.capabilities) && typeof value.open === "function";
 }
 
 function normalizeApplication(application: WorkspaceApplication): WorkspaceApplication {
@@ -127,6 +153,37 @@ function normalizeApplication(application: WorkspaceApplication): WorkspaceAppli
     throw new TypeError("invalid_workspace_session");
   }
   return application;
+}
+
+function normalizeOnDemandApplication(application: OnDemandWorkspaceApplication): OnDemandWorkspaceApplication {
+  if (!isRecord(application) || !validId(application.id)
+    || typeof application.name !== "string" || !application.name.trim()
+    || !Array.isArray(application.capabilities) || typeof application.open !== "function") {
+    throw new TypeError("invalid_on_demand_workspace_application");
+  }
+  const cached = normalizedOnDemand.get(application);
+  if (cached) return cached;
+  if (Object.isFrozen(application)) return application;
+  const normalized = Object.freeze({
+    id: application.id,
+    name: application.name,
+    ...(application.description === undefined ? {} : { description: application.description }),
+    capabilities: Object.freeze([...application.capabilities]),
+    ...(application.allowModelDocumentText === undefined ? {} : { allowModelDocumentText: application.allowModelDocumentText === true }),
+    ...(application.allowModelImages === undefined ? {} : { allowModelImages: application.allowModelImages === true }),
+    ...(application.allowNavigation === undefined ? {} : { allowNavigation: application.allowNavigation === true }),
+    open: application.open,
+  });
+  normalizedOnDemand.set(application, normalized);
+  return normalized;
+}
+
+function sameOnDemandDeclaration(left: OnDemandWorkspaceApplication, right: OnDemandWorkspaceApplication): boolean {
+  return left.id === right.id && left.name === right.name && left.description === right.description
+    && left.allowModelDocumentText === right.allowModelDocumentText
+    && left.allowModelImages === right.allowModelImages
+    && left.allowNavigation === right.allowNavigation
+    && JSON.stringify(left.capabilities) === JSON.stringify(right.capabilities);
 }
 
 const SAFE_HOST_CODES = new Set([
@@ -205,8 +262,16 @@ function callbackResult(value: unknown, active: string): WorkspaceActResult {
   return completed("dispatched", active);
 }
 
+/** Register host-owned metadata now and defer session creation until activation. */
+export function createOnDemandWorkspaceApplication(
+  options: OnDemandWorkspaceApplication,
+): OnDemandWorkspaceApplication {
+  return normalizeOnDemandApplication(options);
+}
+
 /** Create a workspace whose only model surface is the existing observe/act pair. */
 export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
+  const entries = new Map<string, WorkspaceApplicationEntry>();
   const applications = new Map<string, WorkspaceApplication>();
   const sessionTools = new Map<string, readonly ToolEndpoint[]>();
   const observations = new Map<string, ObservationBinding>();
@@ -271,21 +336,32 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     runningOperation?.controller.abort(reason);
   }
 
-  function addApplication(value: WorkspaceApplication): WorkspaceApplicationInfo {
-    const application = normalizeApplication(value);
-    const prior = applications.get(application.id);
-    if (prior && prior.session !== application.session) throw new Error("duplicate_workspace_application");
-    applications.set(application.id, application);
+  function addApplication(value: WorkspaceApplicationEntry): WorkspaceApplicationInfo {
+    const application = isOnDemandApplication(value) ? normalizeOnDemandApplication(value) : normalizeApplication(value);
+    const prior = entries.get(application.id);
+    if (prior && prior !== application) {
+      const priorLazy = isOnDemandApplication(prior);
+      const currentLazy = isOnDemandApplication(application);
+      if (priorLazy && currentLazy && prior.open === application.open) {
+        if (!sameOnDemandDeclaration(prior, application)) throw new Error("duplicate_workspace_application");
+        return infoFor(prior);
+      }
+      if (priorLazy || currentLazy) throw new Error("duplicate_workspace_application");
+      if (prior.session !== application.session) throw new Error("duplicate_workspace_application");
+    }
+    entries.set(application.id, application);
+    if (!isOnDemandApplication(application)) applications.set(application.id, application);
     sessionTools.delete(application.id);
     return infoFor(application);
   }
 
   for (const application of options.applications ?? []) addApplication(application);
 
-  function seedId(value: string | WorkspaceApplication | null | undefined): string | null {
+  function seedId(value: string | WorkspaceApplicationEntry | null | undefined): string | null {
     if (value === undefined || value === null) return null;
     const id = typeof value === "string" ? value : value.id;
-    if (!validId(id) || !applications.has(id)) throw new Error("unknown_workspace_application");
+    if (!validId(id) || !entries.has(id)) throw new Error("unknown_workspace_application");
+    if (isOnDemandApplication(entries.get(id)!)) throw new Error("initial_active_requires_open_application");
     return id;
   }
 
@@ -297,7 +373,7 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     if (discoveryInFlight) return discoveryInFlight;
     discoveryInFlight = Promise.resolve(options.discover({
       active: activeId,
-      applications: [...applications.values()].map(infoFor),
+      applications: [...entries.values()].map(infoFor),
       signal,
     })).then((found) => {
       if (closed || signal?.aborted) return;
@@ -318,6 +394,37 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
 
   function current(): WorkspaceApplication | undefined {
     return activeId === null ? undefined : applications.get(activeId);
+  }
+
+  async function materialize(entry: OnDemandWorkspaceApplication, signal: AbortSignal, record: OperationRecord): Promise<WorkspaceApplication> {
+    const cached = applications.get(entry.id);
+    if (cached) return cached;
+    const opened = await entry.open(signal);
+    const candidate = isRecord(opened) && "session" in opened
+      ? {
+        id: typeof opened.id === "string" ? opened.id : entry.id,
+        name: typeof opened.name === "string" ? opened.name : entry.name,
+        ...(typeof opened.description === "string" ? { description: opened.description } : entry.description === undefined ? {} : { description: entry.description }),
+        session: opened.session,
+        ...(typeof opened.activate === "function" ? { activate: opened.activate.bind(opened) } : {}),
+        ...(typeof opened.verifyFront === "function" ? { verifyFront: opened.verifyFront.bind(opened) } : {}),
+        ...(entry.allowNavigation === true && typeof opened.navigate === "function" ? { navigate: opened.navigate.bind(opened) } : {}),
+      } : undefined;
+    let application: WorkspaceApplication;
+    try {
+      if (!candidate || candidate.id !== entry.id) throw new TypeError("invalid_on_demand_open_result");
+      application = normalizeApplication(candidate);
+    } catch (error) {
+      if (candidate?.session) await candidate.session.close().catch(() => undefined);
+      throw error;
+    }
+    if (operationStop(record)) {
+      await application.session.close().catch(() => undefined);
+      return application;
+    }
+    applications.set(entry.id, application);
+    sessionTools.delete(entry.id);
+    return application;
   }
 
   function rememberObservation(value: unknown, applicationId: string): void {
@@ -400,17 +507,55 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
   }
 
   async function activate(id: string, signal: AbortSignal, _generation: number, record: OperationRecord): Promise<WorkspaceActResult> {
-    try {
-      await discover(signal);
-    } catch {
-      return stopped("discovery_failed", undefined, activeId);
-    }
-    const duringDiscovery = operationStop(record);
-    if (duringDiscovery) return duringDiscovery;
-    if (closed) return stopped("closed", undefined, activeId);
     if (!validId(id)) return rejected("invalid_application_id");
-    const application = applications.get(id);
-    if (!application) return stopped("application_not_found", undefined, activeId);
+    const knownEntry = entries.get(id);
+    if (!knownEntry || !isOnDemandApplication(knownEntry)) {
+      try {
+        await discover(signal);
+      } catch {
+        return stopped("discovery_failed", undefined, activeId);
+      }
+      const duringDiscovery = operationStop(record);
+      if (duringDiscovery) return duringDiscovery;
+    }
+    if (closed) return stopped("closed", undefined, activeId);
+    const entry = entries.get(id);
+    if (!entry) return stopped("application_not_found", undefined, activeId);
+    const priorBeforeOpen = current();
+    let application = applications.get(id);
+    if (!application && isOnDemandApplication(entry)) {
+      try {
+        application = await materialize(entry, signal, record);
+      } catch (error) {
+        const interrupted = operationStop(record);
+        if (interrupted) {
+          await retainPreviousOrClear(priorBeforeOpen, signal);
+          activeId = null;
+          return { ...interrupted, active: null };
+        }
+        await retainPreviousOrClear(priorBeforeOpen, signal);
+        return stopped(hostCode(error, "activation_failed"), undefined, activeId);
+      }
+      const interrupted = operationStop(record);
+      if (interrupted) {
+        await retainPreviousOrClear(priorBeforeOpen, signal);
+        activeId = null;
+        return { ...interrupted, active: null };
+      }
+    }
+    if (!application) return stopped("activation_unsupported", undefined, activeId);
+    if (isOnDemandApplication(entry) && !application.verifyFront) {
+      applications.delete(id);
+      sessionTools.delete(id);
+      await application.session.close().catch(() => undefined);
+      await retainPreviousOrClear(priorBeforeOpen, signal);
+      const interrupted = operationStop(record);
+      if (interrupted) {
+        activeId = null;
+        return { ...interrupted, active: null };
+      }
+      return stopped("activation_unverified", undefined, activeId);
+    }
     if (activeId === id) {
       if (!application.verifyFront) return completed("already_active", id);
       try {
@@ -445,9 +590,11 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     };
     invalidateObservations();
     activation += 1;
-    if (!application.activate || !application.verifyFront) return stopped("activation_unsupported", undefined, activeId);
+    if ((!application.activate && !isOnDemandApplication(entry)) || !application.verifyFront) {
+      return stopped("activation_unsupported", undefined, activeId);
+    }
     try {
-      const activated = await application.activate(context);
+      const activated = application.activate ? await application.activate(context) : undefined;
       const interrupted = operationStop(record);
       if (interrupted) {
         activeId = null;
@@ -539,7 +686,7 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
         if (interrupted) return interrupted;
         return {
           active: activeId,
-          applications: Object.freeze([...applications.values()].map(infoFor)),
+          applications: Object.freeze([...entries.values()].map(infoFor)),
         } satisfies WorkspaceObservation;
       }, (record) => stopped(operationCode(record), undefined, activeId), signal);
     }
@@ -576,8 +723,9 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
 
   function enrolledCapabilities(): readonly Capability[] {
     const unique = new Map<string, Capability>();
-    for (const application of applications.values()) {
-      for (const capability of application.session.capabilities) {
+    for (const entry of entries.values()) {
+      const capabilities = isOnDemandApplication(entry) ? entry.capabilities : entry.session.capabilities;
+      for (const capability of capabilities) {
         unique.set(JSON.stringify(capability), capability);
       }
     }
@@ -594,16 +742,16 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
   }
 
   function advertisesActivation(): boolean {
-    return options.discover !== undefined || [...applications.values()].some((application) => application.activate && application.verifyFront);
+    return options.discover !== undefined || [...entries.values()].some((entry) => isOnDemandApplication(entry) || (entry.activate && entry.verifyFront));
   }
 
   function advertisesNavigation(): boolean {
-    return options.discover !== undefined || [...applications.values()].some((application) => application.navigate);
+    return options.discover !== undefined || [...entries.values()].some((entry) => isOnDemandApplication(entry) ? entry.allowNavigation === true : Boolean(entry.navigate));
   }
 
   function observeSchema(): AnyRecord {
-    const bases = [...applications.values()]
-      .map((application) => findTool(application, "observe")?.inputSchema)
+    const bases = [...entries.values()]
+      .map((entry) => isOnDemandApplication(entry) ? staticObserveSchema(entry) : findTool(entry, "observe")?.inputSchema)
       .filter((value): value is AnyRecord => isRecord(value));
     const base = bases[0];
     if (!isRecord(base)) {
@@ -623,8 +771,10 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
       return view && Array.isArray(view.enum) ? view.enum : [];
     });
     if (isRecord(properties.view) && viewEnums.length > 0) properties.view = { ...properties.view, enum: [...new Set(viewEnums)] };
-    const read = bases.some((schema) => isRecord(schema.properties) && isRecord(schema.properties.read));
-    if (read && !isRecord(properties.read)) properties.read = { type: "string", enum: ["document"] };
+    const readSchema = bases
+      .map((schema) => isRecord(schema.properties) && isRecord(schema.properties.read) ? schema.properties.read : undefined)
+      .find((value): value is AnyRecord => isRecord(value));
+    if (readSchema && !isRecord(properties.read)) properties.read = readSchema;
     return {
       ...base,
       additionalProperties: false,
@@ -680,13 +830,19 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     };
   }
 
+  function staticObserveSchema(application: OnDemandWorkspaceApplication): AnyRecord {
+    return observeInputSchema(application.allowModelImages === true, application.allowModelDocumentText === true);
+  }
+
   const tools: readonly ToolEndpoint[] = Object.freeze([
     {
       name: "observe",
       get description() {
-        const documents = [...applications.values()].some((application) => application.session.allowModelDocumentText === true);
+        const documents = [...entries.values()].some((entry) => isOnDemandApplication(entry)
+          ? entry.allowModelDocumentText === true
+          : entry.session.allowModelDocumentText === true);
         return "Use {workspace:true} to discover available owned applications and the actual active application; otherwise observe the active application's controls."
-          + (documents ? " The active browser may permit {read:\"document\"} for bounded rendered page text." : "");
+          + (documents ? ' When the active browser grants rendered text, start with {"read":"document"}, find a literal keyword with {"read":{"query":"..."}}, or pass the returned document.nextCursor as {"read":{"cursor":"..."}}.' : "");
       },
       get inputSchema() { return observeSchema(); },
       invoke: invokeObserve,
@@ -694,7 +850,8 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     {
       name: "act",
       get description() {
-        const base = [...applications.values()]
+        const base = [...entries.values()]
+          .filter((entry): entry is WorkspaceApplication => !isOnDemandApplication(entry))
           .map((application) => findTool(application, "act")?.description)
           .find((description): description is string => typeof description === "string");
         const modes = [
@@ -710,7 +867,7 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
 
   const workspace: Workspace = {
     get tools() { return tools; },
-    get applications() { return Object.freeze([...applications.values()].map(infoFor)); },
+    get applications() { return Object.freeze([...entries.values()].map(infoFor)); },
     get activeApplicationId() { return activeId; },
     observe: invokeObserve,
     act: invokeAct,

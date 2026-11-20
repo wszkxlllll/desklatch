@@ -75,19 +75,17 @@ function schemaRef(schema, root) {
   return schema.$ref.startsWith(prefix) ? root?.$defs?.[schema.$ref.slice(prefix)] ?? schema : schema;
 }
 
-function schemaVariants(schema, root) {
+function schemaVariants(schema, root, stopAtType = false) {
   const current = schemaRef(schema, root);
   if (!isObject(current)) return [];
+  if (stopAtType && current.type) return [current];
   const variants = [...(current.oneOf ?? []), ...(current.anyOf ?? [])];
-  return variants.length ? variants.flatMap(item => schemaVariants(item, root)) : [current];
-}
-
-function schemaType(schema, root) {
-  const types = new Set(schemaVariants(schema, root).map(item => schemaRef(item, root)?.type).filter(Boolean));
-  return types.size === 1 ? types.values().next().value : undefined;
+  return variants.length ? variants.flatMap(item => schemaVariants(item, root, stopAtType)) : [current];
 }
 
 function childSchema(schema, key, root) {
+  const declared = schemaRef(schema, root)?.properties?.[key];
+  if (declared) return declared;
   for (const variant of schemaVariants(schema, root)) {
     const current = schemaRef(variant, root);
     if (current?.properties?.[key]) return current.properties[key];
@@ -99,10 +97,15 @@ function itemSchema(schema, root) {
   return schemaVariants(schema, root).map(item => schemaRef(item, root)?.items).find(Boolean);
 }
 
-// Only decode JSON strings at schema positions that unambiguously require an object/array.
+// Decode stringified structured arguments only when the input cannot already be a valid string.
 function normalize(value, schema, root, path, audit) {
-  const expected = schemaType(schema, root);
-  if (typeof value === "string" && (expected === "object" || expected === "array")) {
+  if (typeof value === "string") {
+    const variants = schemaVariants(schema, root, true);
+    const structured = new Set(variants.filter(item => item.type !== "string").map(item => item.type));
+    const acceptsString = variants.some(item => item.type === "string"
+      && (Array.isArray(item.enum) ? item.enum.includes(value) : item.const === undefined || item.const === value));
+    const expected = !acceptsString && structured.size === 1 ? structured.values().next().value : undefined;
+    if (expected !== "object" && expected !== "array") return value;
     try {
       const parsed = JSON.parse(value);
       if ((Array.isArray(parsed) ? "array" : isObject(parsed) ? "object" : typeof parsed) === expected) {

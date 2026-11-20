@@ -505,13 +505,18 @@ export function createRawCollectionScript() {
  * accessibility labels, control values, or embedded-frame documents.
  */
 export function createDocumentTextScript() {
-  return ({ rootSelector, expectedHref, maxChars, maxChunks, chunkSize, viewportOnly }: {
+  return ({ rootSelector, expectedHref, maxChars, maxChunks, chunkSize, viewportOnly, query, startChunk, startOffset, startMatch, startMatchOffset }: {
     rootSelector?: string;
     expectedHref?: string;
     maxChars: number;
     maxChunks: number;
     chunkSize: number;
     viewportOnly: boolean;
+    query?: string;
+    startChunk?: number;
+    startOffset?: number;
+    startMatch?: number;
+    startMatchOffset?: number;
   }) => {
     const documentElement = document.documentElement;
     // The read path is non-mutating. Identity is attested by retaining the
@@ -519,7 +524,7 @@ export function createDocumentTextScript() {
     // the host's scope generation covers reloads between evaluations.
     const route = () => ({ href: window.location.href, baseURI: document.baseURI, documentToken: documentElement ? "document-element" : "missing" });
     const before = route();
-    const empty = { chunks: [], totalChars: 0, totalChunks: 0, truncated: false, attestation: { before, after: before, sameDocument: true }, routeChanged: false };
+    const empty = { chunks: [], totalChars: 0, totalChunks: 0, truncated: false, fingerprint: "0", attestation: { before, after: before, sameDocument: true }, routeChanged: false };
     if (expectedHref !== undefined && before.href !== expectedHref) return { ...empty, routeChanged: true };
     const root = rootSelector ? document.querySelector<HTMLElement>(rootSelector) : document.body ?? document.documentElement;
     if (!root) return empty;
@@ -600,29 +605,93 @@ export function createDocumentTextScript() {
       return readable(root) ? root : undefined;
     };
     const runs: Array<{ owner: Element; parts: string[] }> = [];
-    let currentRun: { owner: Element; parts: string[] } | undefined;
+    let currentRun: (typeof runs)[number] | undefined;
     const walk = (node: Node): void => {
       if (node.nodeType === Node.TEXT_NODE) {
-        const value = normalize(node.textContent);
-        if (!value) return;
+        const raw = String(node.textContent ?? "").replace(/\s+/gu, " ");
+        const value = raw.trim();
         const owner = ownerFor(node as Text);
         if (!owner || !textRendered(node as Text) || (viewportOnly && !inViewport(owner))) {
           currentRun = undefined;
+          return;
+        }
+        // Keep whitespace-only inline text as a separator when it belongs to
+        // the current block (for example between two adjacent spans).
+        if (!value) {
+          if (currentRun?.owner === owner) currentRun.parts.push(raw);
           return;
         }
         if (!currentRun || currentRun.owner !== owner) {
           currentRun = { owner, parts: [] };
           runs.push(currentRun);
         }
-        currentRun.parts.push(value);
+        currentRun.parts.push(raw);
         return;
       }
       if (!(node instanceof Element) || excluded(node)) return;
+      if (node.tagName === "BR") {
+        if (currentRun?.owner.contains(node)) currentRun.parts.push(" ");
+        return;
+      }
       for (const child of Array.from(node.childNodes)) walk(child);
     };
     walk(root);
-    const rendered = runs.map((run) => normalize(run.parts.join(" "))).filter((value) => value.length > 0);
+    const rendered = runs.map((run) => normalize(run.parts.join(""))).filter((value) => value.length > 0);
 
+    const fingerprintSource = rendered.join("\u0000");
+    let fingerprint = 2_166_136_261;
+    for (let index = 0; index < fingerprintSource.length; index += 1) {
+      fingerprint ^= fingerprintSource.charCodeAt(index);
+      fingerprint = Math.imul(fingerprint, 16_777_619);
+    }
+    const fingerprintText = (fingerprint >>> 0).toString(36);
+    const chunks: string[] = [];
+    let usedChars = 0;
+    let nextChunk: number | undefined;
+    let nextOffset: number | undefined;
+    if (query !== undefined) {
+      const fullText = rendered.join("\n");
+      const caseInsensitive = /^[\x00-\x7f]+$/u.test(query);
+      const asciiLower = (value: string): string => value.replace(/[A-Z]/g, (character) => character.toLowerCase());
+      const haystack = caseInsensitive ? asciiLower(fullText) : fullText;
+      const needle = caseInsensitive ? asciiLower(query) : query;
+      const context = Math.max(0, Math.floor((chunkSize - query.length) / 2));
+      const positions: number[] = [];
+      const startMatchIndex = Math.max(0, Math.floor(startMatch ?? 0));
+      const snippetSize = query.length + context * 2;
+      let matchCount = 0;
+      let totalChars = 0;
+      for (let position = haystack.indexOf(needle); position >= 0; position = haystack.indexOf(needle, position + needle.length)) {
+        if (matchCount >= startMatchIndex && positions.length < maxChunks) positions.push(position);
+        matchCount += 1;
+        const start = Math.max(0, position - context);
+        totalChars += Math.min(snippetSize, fullText.length - start);
+      }
+      let matchIndex = startMatchIndex;
+      let offset = Math.max(0, Math.floor(startMatchOffset ?? 0));
+      for (const position of positions) {
+        if (usedChars >= maxChars) break;
+        const start = Math.max(0, position - context);
+        const piece = fullText.slice(start, start + snippetSize);
+        const text = piece.slice(offset, offset + maxChars - usedChars);
+        if (text) {
+          chunks.push(text);
+          usedChars += text.length;
+          offset += text.length;
+        }
+        if (offset < piece.length) break;
+        matchIndex += 1;
+        offset = 0;
+      }
+      const truncated = matchIndex < matchCount;
+      const after = route();
+      const sameDocument = documentElement === document.documentElement && before.href === after.href && before.baseURI === after.baseURI && before.documentToken === after.documentToken;
+      return {
+        chunks, totalChars, totalChunks: matchCount, matchCount, fingerprint: fingerprintText, truncated,
+        ...(truncated ? { nextMatch: matchIndex, nextMatchOffset: offset } : {}),
+        attestation: { before, after, sameDocument }, routeChanged: !sameDocument,
+      };
+    }
     const pieces: string[] = [];
     for (const value of rendered) {
       let offset = 0;
@@ -639,16 +708,31 @@ export function createDocumentTextScript() {
     }
     const totalChars = pieces.reduce((sum, piece) => sum + piece.length, 0);
     const totalChunks = pieces.length;
-    const chunks: string[] = [];
-    let usedChars = 0;
-    for (const piece of pieces) {
-      if (chunks.length >= Math.max(1, maxChunks) || usedChars >= Math.max(1, maxChars)) break;
+    let pieceIndex = Math.max(0, Math.floor(startChunk ?? 0));
+    let offset = Math.max(0, Math.floor(startOffset ?? 0));
+    while (pieceIndex < pieces.length && chunks.length < Math.max(1, maxChunks) && usedChars < Math.max(1, maxChars)) {
+      const piece = pieces[pieceIndex];
       const remaining = Math.max(1, maxChars) - usedChars;
-      const text = piece.slice(0, remaining).trim();
-      if (!text) break;
-      chunks.push(text);
-      usedChars += text.length;
-      if (text.length < piece.length) break;
+      const text = piece.slice(offset, offset + remaining);
+      if (text) {
+        chunks.push(text);
+        usedChars += text.length;
+      }
+      if (offset + text.length < piece.length) {
+        nextChunk = pieceIndex;
+        nextOffset = offset + text.length;
+        break;
+      }
+      pieceIndex += 1;
+      offset = 0;
+      if (pieceIndex < pieces.length && chunks.length >= Math.max(1, maxChunks)) {
+        nextChunk = pieceIndex;
+        nextOffset = 0;
+      }
+    }
+    if (nextChunk === undefined && pieceIndex < pieces.length) {
+      nextChunk = pieceIndex;
+      nextOffset = offset;
     }
     const after = route();
     const sameDocument = documentElement === document.documentElement && before.href === after.href && before.baseURI === after.baseURI && before.documentToken === after.documentToken;
@@ -656,7 +740,9 @@ export function createDocumentTextScript() {
       chunks,
       totalChars,
       totalChunks,
-      truncated: chunks.length < totalChunks || usedChars < totalChars,
+      fingerprint: fingerprintText,
+      ...(nextChunk === undefined ? {} : { nextChunk, nextOffset }),
+      truncated: nextChunk !== undefined,
       attestation: { before, after, sameDocument },
       routeChanged: !sameDocument,
     };

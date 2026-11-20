@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createWorkspace, createWorkspaceTools } from "desklatch/workspace";
+import { createOnDemandWorkspaceApplication, createWorkspace, createWorkspaceTools } from "desklatch/workspace";
 
 function fakeSession(id, options = {}) {
   let observation = 0;
@@ -92,6 +92,125 @@ test("workspace discovery works before activation and exposes exactly observe/ac
   });
   assert.equal(first.calls.observe.length, 0);
   await workspace.close();
+});
+
+test("on-demand applications list and advertise statically without opening", async () => {
+  const child = fakeSession("lazy");
+  let opens = 0;
+  const lazy = createOnDemandWorkspaceApplication({
+    id: "lazy",
+    name: "Lazy editor",
+    description: "Opened only after model activation.",
+    capabilities: child.session.capabilities,
+    allowModelDocumentText: true,
+    allowNavigation: true,
+    open: async () => { opens += 1; return { session: child.session, verifyFront: () => true }; },
+  });
+  const workspace = createWorkspace({ applications: [lazy] });
+  assert.deepEqual(await workspace.observe({ workspace: true }), {
+    active: null,
+    applications: [{ id: "lazy", name: "Lazy editor", description: "Opened only after model activation." }],
+  });
+  assert.equal(opens, 0);
+  assert.match(JSON.stringify(workspace.tools[1].inputSchema), /"const"\s*:\s*"click"/u);
+  assert.equal(workspace.tools[1].inputSchema.properties.navigate.type, "string");
+  await workspace.close();
+  assert.throws(() => createWorkspace({ applications: [lazy], initialActive: "lazy" }), /initial_active_requires_open_application/u);
+});
+
+test("on-demand activation opens once, verifies, and retries a failed open", async () => {
+  const child = fakeSession("lazy");
+  let opens = 0;
+  class OpenedEditor {
+    session = child.session;
+    #front = false;
+    activate() { this.#front = true; }
+    verifyFront() { return this.#front; }
+  }
+  const lazy = createOnDemandWorkspaceApplication({
+    id: "lazy",
+    name: "Lazy editor",
+    capabilities: child.session.capabilities,
+    open: async () => {
+      opens += 1;
+      if (opens === 1) throw Object.assign(new Error("not ready"), { code: "activation_failed" });
+      return new OpenedEditor();
+    },
+  });
+  const workspace = createWorkspace({ applications: [lazy] });
+  assert.equal((await workspace.act({ activate: "lazy" })).code, "activation_failed");
+  assert.equal((await workspace.act({ activate: "lazy" })).code, "activated");
+  assert.equal(opens, 2);
+  assert.equal((await workspace.act({ activate: "lazy" })).code, "already_active");
+  assert.equal(opens, 2);
+  await workspace.close();
+});
+
+test("repeated discovery keeps a stable lazy descriptor and activation skips relisting it", async () => {
+  const child = fakeSession("listed");
+  let opens = 0;
+  const lazy = createOnDemandWorkspaceApplication({
+    id: "listed",
+    name: "Listed editor",
+    capabilities: child.session.capabilities,
+    open: async () => { opens += 1; return { session: child.session, verifyFront: () => true }; },
+  });
+  let discoveries = 0;
+  const workspace = createWorkspace({
+    applications: [lazy],
+    discover: async () => { discoveries += 1; return [lazy]; },
+  });
+  await workspace.observe({ workspace: true });
+  assert.equal(discoveries, 1);
+  assert.equal((await workspace.act({ activate: "listed" })).code, "activated");
+  assert.equal(discoveries, 1);
+  assert.equal(opens, 1);
+  await workspace.close();
+});
+
+test("an opened lazy session without foreground verification is closed and leaves the prior app intact", async () => {
+  const prior = fakeSession("prior");
+  const opened = fakeSession("opened");
+  const lazy = createOnDemandWorkspaceApplication({
+    id: "opened",
+    name: "Unverified editor",
+    capabilities: opened.session.capabilities,
+    open: async () => ({ session: opened.session, activate: () => {} }),
+  });
+  const workspace = createWorkspace({ applications: [
+    app("prior", prior.session, { verifyFront: () => true }),
+    lazy,
+  ], initialActive: "prior" });
+  const result = await workspace.act({ activate: "opened" });
+  assert.equal(result.code, "activation_unverified");
+  assert.equal(workspace.activeApplicationId, "prior");
+  assert.equal(opened.calls.close, 1);
+  await workspace.close();
+});
+
+test("closing an on-demand open closes a late session result", async () => {
+  const child = fakeSession("late");
+  let release;
+  const lazy = createOnDemandWorkspaceApplication({
+    id: "late",
+    name: "Late editor",
+    capabilities: child.session.capabilities,
+    open: async (signal) => {
+      await new Promise((resolve) => {
+        release = resolve;
+        signal?.addEventListener("abort", resolve, { once: true });
+      });
+      return { session: child.session, verifyFront: () => true };
+    },
+  });
+  const workspace = createWorkspace({ applications: [lazy] });
+  const activating = workspace.act({ activate: "late" });
+  await new Promise((resolve) => setImmediate(resolve));
+  await workspace.close();
+  release?.();
+  const result = await activating;
+  assert.equal(result.code, "closed");
+  assert.equal(child.calls.close, 1);
 });
 
 test("workspace schemas retain the active DeskSession capability and delivery gates", async () => {

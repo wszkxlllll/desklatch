@@ -1,4 +1,5 @@
 import type { Page } from "playwright-core";
+import { randomUUID } from "node:crypto";
 import { canonicalRole } from "../../grounding.js";
 import type {
   ActionKind,
@@ -58,6 +59,9 @@ import {
   MAX_DOCUMENT_CHUNK_LIMIT,
   MAX_DOCUMENT_CHUNK_SIZE,
   MAX_DOCUMENT_TEXT_LIMIT,
+  MAX_DOCUMENT_QUERY_LENGTH,
+  MAX_DOCUMENT_CURSOR_LENGTH,
+  MAX_DOCUMENT_CURSORS,
 } from "./types.js";
 
 export type { BrowserBackend, BrowserBackendOptions, BrowserDelivery, BrowserPageLike, BrowserRiskSignal } from "./types.js";
@@ -100,8 +104,28 @@ interface DocumentTextEvaluation {
   totalChars: number;
   totalChunks: number;
   truncated: boolean;
+  fingerprint: string;
+  nextChunk?: number;
+  nextOffset?: number;
+  matchCount?: number;
+  nextMatch?: number;
+  nextMatchOffset?: number;
   attestation?: DocumentRouteAttestation;
   routeChanged?: boolean;
+}
+
+interface DocumentCursorState {
+  token: string;
+  scope: string;
+  href: string;
+  fingerprint: string;
+  query?: string;
+  bounds: { maxChars: number; maxChunks: number; chunkSize: number; viewportOnly: boolean };
+  nextChunk?: number;
+  nextOffset?: number;
+  nextMatch?: number;
+  nextMatchOffset?: number;
+  successor?: string;
 }
 
 function targetOf(step: Step): Target | undefined {
@@ -244,15 +268,27 @@ function documentReadBounds(read: DocumentRead | undefined, defaults: {
   maxChunks: number;
   chunkSize: number;
   viewportOnly: boolean;
+  query?: string;
+  cursor?: string;
 } | undefined {
   if (read === undefined) return undefined;
   const requested = read === "document" ? {} : read;
   if (!requested || (requested.kind !== undefined && requested.kind !== "document")) throw new BrowserBackendError("invalid_document_read");
+  const query = requested.query;
+  const cursor = requested.cursor;
+  if ((query !== undefined && (typeof query !== "string" || query.trim().length === 0 || query.length > MAX_DOCUMENT_QUERY_LENGTH))
+    || (cursor !== undefined && (typeof cursor !== "string" || cursor.trim().length === 0 || cursor.length > MAX_DOCUMENT_CURSOR_LENGTH))
+    || (query !== undefined && cursor !== undefined)) throw new BrowserBackendError("invalid_document_read");
+  const chunkSize = boundedInteger(requested.chunkSize, defaults.chunkSize, MAX_DOCUMENT_CHUNK_SIZE);
+  const maxChars = boundedInteger(requested.maxChars, defaults.maxChars, MAX_DOCUMENT_TEXT_LIMIT);
+  if (query !== undefined && (query.length > chunkSize || query.length > maxChars)) throw new BrowserBackendError("invalid_document_read");
   return {
-    maxChars: boundedInteger(requested.maxChars, defaults.maxChars, MAX_DOCUMENT_TEXT_LIMIT),
+    maxChars,
     maxChunks: boundedInteger(requested.maxChunks, defaults.maxChunks, MAX_DOCUMENT_CHUNK_LIMIT),
-    chunkSize: boundedInteger(requested.chunkSize, defaults.chunkSize, MAX_DOCUMENT_CHUNK_SIZE),
+    chunkSize,
     viewportOnly: requested.viewportOnly === true,
+    ...(query === undefined ? {} : { query }),
+    ...(cursor === undefined ? {} : { cursor }),
   };
 }
 
@@ -359,6 +395,7 @@ export function createBrowserBackend(page: Page | BrowserPageLike, options: Brow
   const rawScript = createRawCollectionScript();
   const documentTextScript = createDocumentTextScript();
   const privateState: BrowserPrivateState = { frames: new WeakMap() };
+  const documentCursors = new Map<string, DocumentCursorState>();
   const stableIds = new Map<string, string>();
   const usedIds = new Map<string, string>();
   let identitySerial = 0;
@@ -383,6 +420,7 @@ export function createBrowserBackend(page: Page | BrowserPageLike, options: Brow
   }
 
   const rotateScope = () => {
+    documentCursors.clear();
     for (const state of retainedStates.splice(0)) void releaseHandles(state);
     for (const entry of identityHandles.values()) void releaseHandle(entry.handle);
     identityHandles.clear();
@@ -487,14 +525,23 @@ export function createBrowserBackend(page: Page | BrowserPageLike, options: Brow
     ensureUsable();
     abortIfNeeded(signal);
     if (!allowDocumentText) throw new BrowserBackendError("document_not_allowed");
-    const bounds = documentReadBounds(read, { maxChars: documentTextLimit, maxChunks: documentChunkLimit, chunkSize: documentChunkSize });
+    let bounds = documentReadBounds(read, { maxChars: documentTextLimit, maxChunks: documentChunkLimit, chunkSize: documentChunkSize });
     if (!bounds) throw new BrowserBackendError("invalid_document_read");
     const routeBefore = pageUrl(browserPage);
     const scopeBefore = scope;
     if (!authorizedOrigin(routeBefore, authorizedOrigins, allowBlank)) throw new BrowserBackendError("unauthorized_origin");
+    const cursor = bounds.cursor ? documentCursors.get(bounds.cursor) : undefined;
+    if (bounds.cursor && (!cursor || cursor.scope !== scope || cursor.href !== routeBefore)) throw new BrowserBackendError("document_cursor_stale");
+    if (cursor) bounds = { ...cursor.bounds, ...(cursor.query === undefined ? {} : { query: cursor.query }) };
     let result: DocumentTextEvaluation;
     try {
-      result = await browserPage.evaluate(documentTextScript, { rootSelector, expectedHref: routeBefore, ...bounds });
+      result = await browserPage.evaluate(documentTextScript, {
+        rootSelector, expectedHref: routeBefore,
+        maxChars: bounds.maxChars, maxChunks: bounds.maxChunks, chunkSize: bounds.chunkSize, viewportOnly: bounds.viewportOnly,
+        ...(bounds.query === undefined ? {} : { query: bounds.query }),
+        ...(cursor?.nextChunk === undefined ? {} : { startChunk: cursor.nextChunk, startOffset: cursor.nextOffset ?? 0 }),
+        ...(cursor?.nextMatch === undefined ? {} : { startMatch: cursor.nextMatch, startMatchOffset: cursor.nextMatchOffset ?? 0 }),
+      });
     } catch (error) {
       throw new BrowserBackendError(errorCode(error, "document_read_failed"));
     }
@@ -516,8 +563,33 @@ export function createBrowserBackend(page: Page | BrowserPageLike, options: Brow
       try { ensureUsable(); } catch { /* route rejection below is intentional */ }
       throw new BrowserBackendError("document_route_changed");
     }
+    if (cursor && cursor.fingerprint !== result.fingerprint) {
+      documentCursors.delete(cursor.token);
+      throw new BrowserBackendError("document_cursor_stale");
+    }
     if (!authorizedOrigin(routeAfter, authorizedOrigins, allowBlank)) throw new BrowserBackendError("unauthorized_origin");
     const sourceUrl = publicSourceUrl(routeAfter);
+    let nextCursor: string | undefined;
+    const hasContinuation = result.nextChunk !== undefined || result.nextMatch !== undefined;
+    if (hasContinuation) {
+      // Cursor records are immutable snapshots. Retrying the same token must
+      // reproduce the same page rather than observing a position advanced by
+      // another request; every continuation receives a fresh token.
+      nextCursor = cursor?.successor && documentCursors.has(cursor.successor) ? cursor.successor : randomUUID();
+      if (!documentCursors.has(nextCursor)) documentCursors.set(nextCursor, {
+        token: nextCursor, scope, href: routeAfter, fingerprint: result.fingerprint,
+        ...(bounds.query === undefined ? {} : { query: bounds.query }),
+        bounds: { maxChars: bounds.maxChars, maxChunks: bounds.maxChunks, chunkSize: bounds.chunkSize, viewportOnly: bounds.viewportOnly },
+        ...(result.nextChunk === undefined ? {} : { nextChunk: result.nextChunk, nextOffset: result.nextOffset ?? 0 }),
+        ...(result.nextMatch === undefined ? {} : { nextMatch: result.nextMatch, nextMatchOffset: result.nextMatchOffset ?? 0 }),
+      });
+      if (cursor && cursor.successor !== nextCursor) cursor.successor = nextCursor;
+      while (documentCursors.size > MAX_DOCUMENT_CURSORS) {
+        const oldest = documentCursors.keys().next().value as string | undefined;
+        if (!oldest) break;
+        documentCursors.delete(oldest);
+      }
+    }
     return {
       kind: "page_text",
       chunks: result.chunks.map((text, index) => ({ text: text.slice(0, bounds.chunkSize), index })),
@@ -526,6 +598,9 @@ export function createBrowserBackend(page: Page | BrowserPageLike, options: Brow
       viewportOnly: bounds.viewportOnly,
       totalChars: Math.max(0, Math.floor(result.totalChars)),
       totalChunks: Math.max(0, Math.floor(result.totalChunks)),
+      ...(bounds.query === undefined ? {} : { query: bounds.query }),
+      ...(result.matchCount === undefined ? {} : { matchCount: Math.max(0, Math.floor(result.matchCount)) }),
+      ...(nextCursor ? { nextCursor } : {}),
       ...(sourceUrl ? { sourceUrl } : {}),
     };
   }
@@ -969,6 +1044,7 @@ export function createBrowserBackend(page: Page | BrowserPageLike, options: Brow
   async function close(): Promise<void> {
     if (closed) return;
     closed = true;
+    documentCursors.clear();
     browserPage.off?.("framenavigated", onNavigated);
     browserPage.off?.("close", onClosed);
     await Promise.all(retainedStates.splice(0).map((state) => releaseHandles(state)));

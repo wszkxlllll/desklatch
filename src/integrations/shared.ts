@@ -112,7 +112,7 @@ export function toDesktopContent(value: unknown, policy: ImagePolicy = "native")
 }
 
 const publicToolErrors = new Set(["closed", "invalid_view", "invalid_observe", "invalid_observe_filter",
-  "image_delivery_not_authorized", "document_delivery_not_authorized", "invalid_document_read", "observe_failed", "cancelled"]);
+  "image_delivery_not_authorized", "document_delivery_not_authorized", "invalid_document_read", "document_cursor_stale", "observe_failed", "cancelled"]);
 
 export function errorText(error: unknown): string {
   return error instanceof Error && publicToolErrors.has(error.message) ? error.message : "desktop_tool_failed";
