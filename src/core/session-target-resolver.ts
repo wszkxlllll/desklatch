@@ -166,18 +166,20 @@ export class TargetResolver {
     const sourceObservation = this.deps.getObservation(observationId);
     if (!sourceObservation) return { code: "observation_not_found" };
     this.deps.pin(sourceObservation);
-    const current = await this.deps.observe({ view: "controls", signal }, false);
+    const source = form === "ref" ? sourceObservation.refs.get((step.target as { ref: string }).ref) : undefined;
+    if (form === "ref" && !source) return { code: "stale_reference" };
+    const where = source?.windowScope ? this.selectorForControl(source) : undefined;
+    let current = await this.deps.observe({ view: "controls", ...(where ? { where } : {}), signal }, false);
     if (current.frame.scope !== sourceObservation.frame.scope) return { code: form === "point" ? "stale_point" : "stale_reference" };
 
     let target: Control | undefined;
     let origin: Frame | undefined;
     let point: Point | undefined;
-    if (form === "ref") {
-      const ref = (step.target as { ref: string }).ref;
-      const source = sourceObservation.refs.get(ref);
-      if (!source) return { code: "stale_reference" };
-      target = await this.freshEquivalentRef(source, current, signal);
-      if (!target) return { code: "stale_reference" };
+    if (source) {
+      const rebound = await this.freshEquivalentRef(source, current, signal, where !== undefined);
+      if (!rebound) return { code: "stale_reference" };
+      target = rebound.control;
+      current = rebound.stored;
     } else if (form === "point") {
       point = (step.target as { point: Point }).point;
       origin = sourceObservation.frame;
@@ -259,15 +261,17 @@ export class TargetResolver {
   }
 
   private selectorForControl(control: Control): Selector {
-    return { role: control.role, ...(control.name ? { name: control.name } : {}), ...(control.within ? { within: control.within } : {}) };
+    const within = control.windowScope ?? control.within;
+    return { role: control.role, ...(control.name ? { name: control.name } : {}), ...(within ? { within } : {}) };
   }
 
-  private async freshEquivalentRef(source: Control, current: StoredObservation, signal: AbortSignal): Promise<Control | undefined> {
+  private async freshEquivalentRef(source: Control, current: StoredObservation, signal: AbortSignal, alreadyScoped: boolean): Promise<{ stored: StoredObservation; control: Control } | undefined> {
     const direct = findEquivalentControl(current.frame, source);
-    if (direct) return direct;
-    if (current.frame.complete) return undefined;
+    if (direct) return { stored: current, control: direct };
+    if (current.frame.complete || alreadyScoped) return undefined;
     const scoped = await this.deps.observe({ view: "controls", where: this.selectorForControl(source), signal }, false);
     if (scoped.frame.scope !== current.frame.scope) return undefined;
-    return findEquivalentControl(scoped.frame, source);
+    const control = findEquivalentControl(scoped.frame, source);
+    return control ? { stored: scoped, control } : undefined;
   }
 }

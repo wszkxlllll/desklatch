@@ -243,14 +243,35 @@ export async function readApprovalContext(element: unknown, _ignored?: unknown):
 
 /** This function is serialized by Playwright and runs only in the authorized page. */
 export function createRawCollectionScript() {
-  return ({ rootSelector, includePublicValues, protectedFieldNames }: {
+  return ({ rootSelector, includePublicValues, protectedFieldNames, target }: {
     rootSelector?: string;
     includePublicValues: boolean;
     protectedFieldNames: string[];
+    target?: { role?: string; name?: string; within?: string; state?: string; filterActionOnly?: boolean; maxResults: number; scanLimit: number };
   }) => {
     const root = rootSelector ? document.querySelector(rootSelector) : document.body ?? document.documentElement;
     if (!root) return { controls: [], total: 0 };
-    const nodes = Array.from(root.querySelectorAll<HTMLElement>("*"));
+    let scanComplete = true;
+    let nodes: Iterable<HTMLElement>;
+    if (target) {
+      const scanLimit = Math.max(1, Math.floor(target.scanLimit));
+      const walker = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+      const examined: HTMLElement[] = [];
+      for (let element = walker.nextNode(); element; element = walker.nextNode()) {
+        if (examined.length === scanLimit) { scanComplete = false; break; }
+        examined.push(element as HTMLElement);
+      }
+      nodes = examined;
+    } else {
+      nodes = root.querySelectorAll<HTMLElement>("*");
+    }
+    const normalize = (value: unknown): string => String(value ?? "").replace(/\s+/gu, " ").trim().normalize("NFKC").toLocaleLowerCase();
+    const canonicalRole = (value: unknown): string => {
+      const role = normalize(value);
+      return role === "edit" || role === "input" || role === "textfield" ? "textbox" : role;
+    };
+    const wantedRole = target?.role === undefined ? undefined : canonicalRole(target.role);
+    const wantedName = target?.name === undefined ? undefined : normalize(target.name);
     const interactiveRoles = new Set(["button", "checkbox", "combobox", "link", "listbox", "menuitem", "option", "radio", "searchbox", "slider", "switch", "tab", "textbox"]);
     const interactiveTags = new Set(["A", "BUTTON", "INPUT", "SELECT", "TEXTAREA", "SUMMARY"]);
     const protectedPattern = /(?:password|passcode|passwd|secret|token|api[ _-]?key|authorization|credential|cvv|cvc|otp|pin|ssn|credit[ _-]?card|private[ _-]?key|\u5bc6\u7801|\u4ee4\u724c|\u79d8\u94a5|\u51ed\u8bc1|\u9a8c\u8bc1\u7801|\u8eab\u4efd\u8bc1|\u5361\u53f7)/iu;
@@ -395,9 +416,11 @@ export function createRawCollectionScript() {
       const role = roleFor(element);
       const graphic = role === "img";
       if (!role || (!graphic && !interactiveTags.has(element.tagName) && !interactiveRoles.has(role))) continue;
-      const style = getComputedStyle(element);
+      if (wantedRole !== undefined && canonicalRole(role) !== wantedRole) continue;
       const labels = labelsFor(element);
       const name = nameFor(element, labels);
+      if (wantedName !== undefined && ![name, ...labels].some(value => normalize(value) === wantedName)) continue;
+      const style = getComputedStyle(element);
       if (graphic && (!name || !visible(element, style) || element.closest('[aria-hidden="true"],button,a,[role="button"],[role="link"]'))) continue;
       const sensitive = isProtected(element, name, labels);
       const canonicalName = name?.normalize("NFKC").toLocaleLowerCase();
@@ -487,9 +510,10 @@ export function createRawCollectionScript() {
       const testid = attr(element, "data-testid") || attr(element, "data-test");
       const elementName = attr(element, "name");
       const stableKind = id ? "id" : testid ? "testid" : elementName ? "name" : "path";
-      const baseKey = id ? `id:${id}` : testid ? `testid:${testid}` : elementName ? `name:${elementName}:${role}` : `path:${pathFor(element)}`;
+      const path = pathFor(element);
+      const baseKey = id ? `id:${id}` : testid ? `testid:${testid}` : elementName ? `name:${elementName}:${role}` : `path:${path}`;
       (graphic ? graphics : controls).push({
-        path: pathFor(element), key: baseKey, role, name, labels, within: within.name, withinKeys: within.keys,
+        path, key: baseKey, role, name, labels, within: within.name, withinKeys: within.keys,
         states, actions, rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
         value: graphic || sensitive || !includePublicValues ? undefined : (element as HTMLInputElement).value,
         sensitive, href: attr(element, "href"), filterAction, disclosure, formSubmitter, sameDocumentTab, enterMaySubmit, approvalCandidate, tagName: element.tagName.toLocaleLowerCase(), type: attr(element, "type"),
@@ -497,7 +521,23 @@ export function createRawCollectionScript() {
       });
     }
     // Read-only visual landmarks follow actionable controls in the bounded public list.
-    return { controls: controls.concat(graphics), total: controls.length + graphics.length };
+    const allControls = controls.concat(graphics);
+    if (!target) return { controls: allControls, total: allControls.length, scanComplete: true };
+    const wantedWithin = target.within === undefined ? undefined : normalize(target.within);
+    const matched = allControls.filter((control) => {
+      if (!control.states.includes("visible")) return false;
+      if (target.filterActionOnly && !control.filterAction) return false;
+      if (target.state !== undefined && !control.states.includes(target.state)) return false;
+      if (wantedWithin !== undefined && ![control.within, ...control.withinKeys].some(value => normalize(value) === wantedWithin)
+        && !normalize(control.key).includes(wantedWithin)) return false;
+      return true;
+    });
+    const maxResults = Math.max(1, Math.floor(target.maxResults));
+    return {
+      controls: matched.slice(0, maxResults),
+      total: matched.length,
+      scanComplete,
+    };
   };
 }
 

@@ -71,6 +71,12 @@ E2B 浏览器可用 DOM 定位。云端原生应用则从 AT-SPI 读取控件，
 - **CUA 后台窗口**使用独立的 Windows WPF 适配器，限定到原生驱动 0.54.0 已验证的左键单击、单行输入和纵向按行滚动。
 - **E2B 受管浏览器**接收宿主已持有的沙箱，通过已认证的命令流连接独立 Chromium，复用同一浏览器后端。匿名管道传递浏览器协议消息。模型只获准操作该页面，沙箱生命周期由宿主管理。云端单个浏览器动作默认允许 15 秒，可用 `browser.actionTimeoutMs` 调整。宿主另行控制整批动作的时间预算，真实云测示例使用 90 秒。
 
+### Windows 控件查询范围
+
+Windows 产品用 Win32 顶层窗口清单建立已授权应用的窗口范围。UIA 观察从经核验的 PID 和 HWND 开始。CUA 每个窗口最多读取 512 个元素、32 层。独立原生 UIA 工作进程从 `AutomationElement.FromHandle` 取得窗口根节点，遍历时同时限制检查的候选数和深度。Windows 后端给一次观察设置 6 秒的扫描预算，超预算或遍历不完整时保留未确认状态。[Microsoft UI Automation 查找范围](https://learn.microsoft.com/en-us/windows/win32/api/uiautomationclient/nf-uiautomationclient-iuiautomationelement-findfirst)
+
+指定 `role + name` 的 `act` 可在程序内部定位。带 `within: windowScope` 时只查对应窗口，已有的控件引用也在原窗口刷新。独立原生 UIA 工作进程最多返回 8 个匹配候选，CUA 路径在同一已授权窗口的有界快照内匹配并保留驱动令牌。找到唯一候选后进入原有权限、遮挡和动作核验。需要 Agent 观察时，Windows 产品优先返回有焦点和可操作的控件，清单最多 128 项。该上限仅用于回传，指定目标的程序查询使用后台的扫描范围。
+
 ## 审查与留证
 
 每一步先用本地规则检查动作、目标和已知后果。普通编辑和有结构依据的页面浏览可以直接执行。对于后果不明的动作，宿主可用 `createRiskPolicy({ reviewer })` 接入自己的文字审核器，也可提供局部 OCR。审核器判明低风险时动作继续，识别到高风险或宿主明确要求同意时才发出 `approval_required`。宿主禁止的操作直接停止。

@@ -24,8 +24,8 @@ Windows x64 基础安装包含原生 CUA 驱动和窗口核验组件。OCR 和 E
 | 你在用什么 | 怎么接入 | 如何审批 |
 | --- | --- | --- |
 | DeepSeek Harness | 安装原生插件，在 DSH 内注册 `desklatch_observe` 与 `desklatch_act` | 在 DSH 的会话卡上批准或拒绝 |
-| 支持本地 stdio MCP 的客户端 | 导入向导生成的配置，由客户端启动 DeskLatch 服务，通过 MCP 调用 `observe` 与 `act` | 在 DeskLatch 的 Windows 审批窗口批准或拒绝 |
-| LangGraph、OpenAI Agents SDK 或自研应用 | 用 TypeScript SDK 将两个工具注册到现有 Agent | 通过宿主的审批回调与业务规则处理 |
+| 支持本地 stdio MCP 的客户端 | 导入向导生成的配置，由客户端启动 DeskLatch 服务。用户在授权页管理应用范围 | 在 DeskLatch 的 Windows 审批窗口批准或拒绝 |
+| LangGraph、OpenAI Agents SDK 或自研应用 | 创建已授权的 DeskLatch 会话或工作区，将工具注册到现有 Agent | 通过 `onApprovalRequested` 和 `resolveApproval` 接入自己的界面及业务规则 |
 
 三条路径共用同一套执行器。模型、对话历史和桌面会话由接入的宿主管理。[框架集成与接口](docs/integrations.md)
 

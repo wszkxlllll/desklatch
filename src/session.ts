@@ -142,6 +142,7 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
     allowModelDocumentText,
     grantedAction,
     refsGranted: effectiveCapabilities.some((capability) => capability.targets.includes("ref")),
+    maxPublicControls: options.maxPublicControls,
   });
 
   let closed = false;

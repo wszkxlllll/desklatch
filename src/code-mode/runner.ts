@@ -14,6 +14,8 @@ export interface CodeActionReceipt {
   readonly atStep?: number;
   readonly requestId?: string;
   readonly steps: readonly StepReceipt[];
+  readonly candidates?: readonly unknown[];
+  readonly observationId?: string;
 }
 
 interface Terminal {
@@ -42,6 +44,11 @@ export interface RunningCode {
 
 const MAX_RECEIPT_STEPS = 512;
 const RECEIPT_GRACE_MS = 250;
+const DEFAULT_TOOL_WAIT_TIMEOUT_MS = 120_000;
+const DEFAULT_OVERALL_TIMEOUT_MS = 180_000;
+const recoverableGroundingCodes = new Set([
+  "stale_observation", "stale_reference", "observation_not_found", "target_not_found", "target_ambiguous", "observation_incomplete",
+]);
 const guestCodes = new Set([
   "code_error", "code_syntax_error", "code_timeout", "code_budget_exceeded", "inspect_budget_exceeded",
   "tool_input_too_large", "concurrent_tool_call", "sandbox_failed", "code_stalled",
@@ -74,6 +81,7 @@ function actionReceipt(call: number, value: unknown): CodeActionReceipt {
     steps.push({ index: step.index, status: step.status as StepReceipt["status"], ...(kind && { kind }), ...(code && { code }) });
   }
   const code = safeCode(value.code);
+  const candidates = Array.isArray(value.candidates) ? value.candidates.slice(0, 8) : undefined;
   return {
     call,
     status: value.status,
@@ -81,6 +89,8 @@ function actionReceipt(call: number, value: unknown): CodeActionReceipt {
     ...(code && { code }),
     ...(typeof value.atStep === "number" && Number.isSafeInteger(value.atStep) && { atStep: value.atStep }),
     ...(typeof value.requestId === "string" && /^[\w:-]{1,160}$/.test(value.requestId) && { requestId: value.requestId }),
+    ...(candidates && { candidates }),
+    ...(typeof value.observationId === "string" && /^[\w:-]{1,200}$/.test(value.observationId) && { observationId: value.observationId }),
   };
 }
 
@@ -114,20 +124,38 @@ export function startCodeRun(
   let received = 0;
   let pending: PendingTool | undefined;
   let terminal: Terminal | undefined;
+  let recovery: "available" | "needs_observation" | "used" = "available";
+  let toolWaitTimer: ReturnType<typeof setTimeout> | undefined;
+  const toolWaitTimeoutMs = limits.toolWaitTimeoutMs ?? DEFAULT_TOOL_WAIT_TIMEOUT_MS;
+  const overallTimeoutMs = limits.overallTimeoutMs ?? DEFAULT_OVERALL_TIMEOUT_MS;
   let settle!: (value: Terminal) => void;
   const completion = new Promise<Terminal>(resolve => { settle = resolve; });
-  const deadline = setTimeout(() => finish("stopped", "code_timeout", true), limits.timeoutMs);
+  const overallDeadline = setTimeout(() => finish("stopped", "code_timeout", true), overallTimeoutMs);
 
   function finish(status: Terminal["status"], code?: string, abortTool = false): void {
     if (terminal) return;
     terminal = { status, ...(code && { code }) };
-    clearTimeout(deadline);
+    clearTimeout(overallDeadline);
+    if (toolWaitTimer) clearTimeout(toolWaitTimer);
     signal.removeEventListener("abort", cancel);
     if (abortTool) work.abort(code);
     child.kill();
     settle(terminal);
   }
   const cancel = () => finish("stopped", "cancelled", true);
+
+  function armToolWait(tool: CodeTool, call: number): void {
+    if (toolWaitTimer) clearTimeout(toolWaitTimer);
+    toolWaitTimer = setTimeout(() => {
+      if (terminal || !pending || pending.call !== call) return;
+      finish("stopped", tool === "act" ? "act_result_unconfirmed" : "tool_timeout", true);
+    }, toolWaitTimeoutMs);
+  }
+
+  function clearToolWait(): void {
+    if (toolWaitTimer) clearTimeout(toolWaitTimer);
+    toolWaitTimer = undefined;
+  }
 
   function send(message: StartMessage | ReplyMessage): void {
     if (terminal) return;
@@ -137,16 +165,25 @@ export function startCodeRun(
   }
 
   async function handleTool(tool: CodeTool, id: number, input: Record<string, unknown>): Promise<void> {
+    armToolWait(tool, id);
     try {
       toolSignal.throwIfAborted();
       const value = await invoke(tool, input, toolSignal);
       if (tool === "act") {
         const receipt = actionReceipt(id, value);
         actions.push(receipt);
+        if (terminal) return;
         if (receipt.status !== "completed" || receipt.steps.some(step => step.status === "unknown"
           || step.status === "partial" || step.status === "not_dispatched")) {
-          finish("stopped", receipt.code ?? "act_stopped");
-          return;
+          const steps = Array.isArray(input.steps) ? input.steps.length : 0;
+          const recoverable = recovery === "available" && receipt.status === "stopped" && steps > 0
+            && recoverableGroundingCodes.has(receipt.code ?? "") && receipt.steps.length === steps
+            && receipt.steps.every((step, index) => step.index === index + 1 && step.status === "not_dispatched");
+          if (!recoverable) {
+            finish("stopped", receipt.code ?? "act_stopped");
+            return;
+          }
+          recovery = "needs_observation";
         }
       }
       if (tool === "observe" && record(value) && (value.status === "stopped" || value.status === "rejected")) {
@@ -154,6 +191,8 @@ export function startCodeRun(
         return;
       }
       if (terminal) return;
+      if (recovery === "needs_observation" && tool === "observe" && record(value)
+        && typeof value.observationId === "string" && Array.isArray(value.controls)) recovery = "used";
       const payload = JSON.stringify(tool === "observe" ? observationWithoutPixels(value).value : value);
       if (typeof payload !== "string" || Buffer.byteLength(payload, "utf8") > MAX_TOOL_REPLY_BYTES) {
         finish("stopped", "tool_result_too_large");
@@ -163,6 +202,8 @@ export function startCodeRun(
     } catch {
       if (tool === "act" && !actions.some(action => action.call === id)) actions.push(unknownAction(id));
       finish("stopped", tool === "act" ? "act_result_unconfirmed" : "observe_failed");
+    } finally {
+      clearToolWait();
     }
   }
 
@@ -199,6 +240,9 @@ export function startCodeRun(
     if (!record(input)) return finish("failed", "invalid_tool_input", true);
     if (message.tool === "observe" && (input.view === "image" || input.view === "both")) {
       return finish("stopped", "code_images_not_supported", true);
+    }
+    if (message.tool === "act" && recovery === "needs_observation") {
+      return finish("stopped", "recovery_requires_observation", true);
     }
     const tool = message.tool;
     const id = ++received;

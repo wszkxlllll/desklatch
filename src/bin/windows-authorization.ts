@@ -13,7 +13,7 @@ import {
 const exec = promisify(execFile);
 
 async function snapshot(file: string) {
-  const [grants, windows] = await Promise.all([readWindowsProductGrants(file), listWindowsAppWindows()]);
+  const [grants, windows] = await Promise.all([readWindowsProductGrants(file), listWindowsAppWindows({ includeMinimized: true })]);
   const apps = new Map<string, { id: string; name: string; windows: number }>();
   for (const app of grants.apps) apps.set(app.id, { ...app, windows: 0 });
   for (const window of windows) {

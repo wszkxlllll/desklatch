@@ -88,6 +88,9 @@ export type {
   WorkspaceNavigator,
 } from "./workspace-navigation.js";
 
+const MAX_TARGET_SCAN = 20_000;
+const MAX_TARGET_RESULTS = 128;
+
 interface BrowserPrivateState {
   frames: WeakMap<Frame, FrameState>;
 }
@@ -101,6 +104,16 @@ interface CandidateResult {
   pointOccluded?: boolean;
   handle?: BrowserElementHandleLike;
   bindingMissing?: boolean;
+}
+
+interface TargetScan {
+  role?: string;
+  name?: string;
+  within?: string;
+  state?: string;
+  filterActionOnly?: boolean;
+  maxResults: number;
+  scanLimit: number;
 }
 
 interface DocumentRouteAttestation {
@@ -359,14 +372,6 @@ function matchesSelector(control: InternalControl, selector: Selector): boolean 
   return true;
 }
 
-function findCandidates(controls: InternalControl[], selector: Selector): InternalControl[] {
-  const exact = controls.filter((control) => matchesSelector(control, selector));
-  if (exact.length || !selector.name || !isSearchName(selector.name)) return exact;
-  // Alias only a structurally associated filter/search control. A label such
-  // as “Search and export” is not a filter authority.
-  return controls.filter((control) => control.filterAction && matchesSelector(control, { ...selector, name: undefined }));
-}
-
 function pointInControl(frame: FrameState, point: { x: number; y: number }): InternalControl | undefined {
   return Array.from(frame.controls.values())
     .filter((control) => control.rect && containsPoint(control.rect, point))
@@ -468,18 +473,18 @@ export function createBrowserBackend(page: Page | BrowserPageLike, options: Brow
     abortIfNeeded(signal);
   }
 
-  async function collect(limit: number, signal?: AbortSignal): Promise<{ controls: InternalControl[]; complete: boolean }> {
+  async function collect(limit: number, signal?: AbortSignal, target?: TargetScan): Promise<{ controls: InternalControl[]; complete: boolean }> {
     ensureUsable();
     abortIfNeeded(signal);
-    let result: { controls: RawControl[]; total: number };
+    let result: { controls: RawControl[]; total: number; scanComplete?: boolean };
     try {
-      result = await browserPage.evaluate(rawScript, { rootSelector, includePublicValues, protectedFieldNames: protectedNames });
+      result = await browserPage.evaluate(rawScript, { rootSelector, includePublicValues, protectedFieldNames: protectedNames, ...(target ? { target } : {}) });
     } catch (error) {
       throw new BrowserBackendError(errorCode(error, "dom_observe_failed"));
     }
     const controls: InternalControl[] = [];
     const seen = new Map<string, number>();
-    let complete = result.total <= limit;
+    let complete = result.total <= limit && result.scanComplete !== false;
     const boundedRaw = result.controls.slice(0, limit);
     const approvalRaw = boundedRaw.filter((raw) => raw.approvalCandidate);
     const approvalSelectors = approvalRaw.map((raw) => selectorFor({ path: raw.path, key: raw.key, tagName: raw.tagName, stableKind: raw.stableKind }));
@@ -615,30 +620,61 @@ export function createBrowserBackend(page: Page | BrowserPageLike, options: Brow
     };
   }
 
+  async function collectTargeted(selector: Selector, signal?: AbortSignal): Promise<{ controls: InternalControl[]; complete: boolean }> {
+    const maxResults = Math.min(searchLimit, MAX_TARGET_RESULTS);
+    const target: TargetScan = {
+      ...(selector.role === undefined ? {} : { role: selector.role }),
+      ...(selector.name === undefined ? {} : { name: selector.name }),
+      ...(selector.within === undefined ? {} : { within: selector.within }),
+      ...(selector.state === undefined ? {} : { state: selector.state }),
+      maxResults,
+      scanLimit: MAX_TARGET_SCAN,
+    };
+    const exact = await collect(maxResults, signal, target);
+    let controls = exact.controls.filter((control) => matchesSelector(control, selector));
+    let complete = exact.complete;
+    // Search aliases remain restricted to controls that the page itself
+    // structurally marked as a filter/search action. They receive the same
+    // full bounded scan and never fall back to a first-page prefix.
+    if (controls.length === 0 && isSearchName(selector.name)) {
+      const alias = await collect(maxResults, signal, {
+        ...(selector.role === undefined ? {} : { role: selector.role }),
+        ...(selector.within === undefined ? {} : { within: selector.within }),
+        ...(selector.state === undefined ? {} : { state: selector.state }),
+        filterActionOnly: true,
+        maxResults,
+        scanLimit: MAX_TARGET_SCAN,
+      });
+      controls = alias.controls.filter((control) => control.filterAction && matchesSelector(control, { ...selector, name: undefined }));
+      complete = alias.complete;
+    }
+    return { controls, complete };
+  }
+
   async function locate(selector: Selector, signal?: AbortSignal): Promise<CandidateResult> {
     const deadline = Date.now() + searchTimeoutMs;
     let candidates: InternalControl[] = [];
     let all: InternalControl[] = [];
     let complete = true;
     while (Date.now() <= deadline) {
-      const current = await collect(searchLimit, signal);
+      const current = await collectTargeted(selector, signal);
       all = current.controls;
       complete = current.complete;
-      candidates = findCandidates(current.controls, selector);
-      if (candidates.length > 1) return { candidates, all, complete };
-      if (candidates.length === 1) {
+      candidates = current.controls;
+      if (candidates.length > 1 || (candidates.length === 1 && !complete)) return { candidates, all, complete };
+      if (candidates.length === 1 && complete) {
         await wait(Math.min(settleMs, Math.max(0, deadline - Date.now())), signal);
-        const settled = await collect(searchLimit, signal);
+        const settled = await collectTargeted(selector, signal);
         all = settled.controls;
-        candidates = findCandidates(settled.controls, selector);
+        candidates = settled.controls;
         complete = settled.complete;
-        if (candidates.length === 1) return { target: candidates[0], candidates, all, complete };
+        if (candidates.length === 1 && complete) return { target: candidates[0], candidates, all, complete };
         if (candidates.length > 1) return { candidates, all, complete };
       }
       if (Date.now() >= deadline) break;
       await wait(Math.min(25, deadline - Date.now()), signal);
     }
-    return { target: candidates.length === 1 ? candidates[0] : undefined, candidates, all, complete };
+    return { target: candidates.length === 1 && complete ? candidates[0] : undefined, candidates, all, complete };
   }
 
   async function refTarget(frame: FrameState, id: string, signal?: AbortSignal): Promise<CandidateResult> {

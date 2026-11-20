@@ -124,6 +124,23 @@ function deniedApprovalResult(requestId: string): Record<string, unknown> {
   return { requestId, status: "stopped", code: "approval_unavailable", steps: [] };
 }
 
+function mergeApprovalReceipts(previous: unknown, next: unknown): unknown {
+  if (typeof previous !== "object" || previous === null || !Array.isArray((previous as { steps?: unknown }).steps)) return next;
+  if (typeof next !== "object" || next === null) return next;
+  const receipts = new Map<number, unknown>();
+  for (const source of [(previous as { steps: unknown[] }).steps, Array.isArray((next as { steps?: unknown }).steps) ? (next as { steps: unknown[] }).steps : []]) {
+    for (const receipt of source) {
+      if (typeof receipt !== "object" || receipt === null) continue;
+      const index = (receipt as { index?: unknown }).index;
+      if (typeof index !== "number" || !Number.isSafeInteger(index) || index < 1) continue;
+      const prior = receipts.get(index) as { status?: unknown } | undefined;
+      if (prior && prior.status !== "not_dispatched" && (receipt as { status?: unknown }).status === "not_dispatched") continue;
+      receipts.set(index, receipt);
+    }
+  }
+  return { ...(next as Record<string, unknown>), steps: [...receipts.entries()].sort(([left], [right]) => left - right).map(([, receipt]) => receipt) };
+}
+
 function boundedApprovalSignal(parent: AbortSignal, expiresAt: number): { signal: AbortSignal; dispose(): void } {
   const controller = new AbortController();
   const onAbort = () => controller.abort(parent.reason ?? "cancelled");
@@ -210,20 +227,20 @@ export function createDeskDshApprovalBridge(ctx: Context): DeskDshApprovalBridge
     const settled = new Set<string>();
     while (isApprovalRequired(result)) {
       const requestId = result.requestId;
-      if (settled.has(requestId)) return deniedApprovalResult(requestId) as T;
+      if (settled.has(requestId)) return mergeApprovalReceipts(result, deniedApprovalResult(requestId)) as T;
       settled.add(requestId);
       const pendingApproval = pending.get(requestId);
       if (!pendingApproval) {
-        if (!host.resolveApproval) return deniedApprovalResult(requestId) as T;
+        if (!host.resolveApproval) return mergeApprovalReceipts(result, deniedApprovalResult(requestId)) as T;
         try {
-          result = await host.resolveApproval(requestId, "deny") as T;
+          result = mergeApprovalReceipts(result, await host.resolveApproval(requestId, "deny")) as T;
         } catch {
           host.cancel?.("dsh_approval_unavailable");
-          return deniedApprovalResult(requestId) as T;
+          return mergeApprovalReceipts(result, deniedApprovalResult(requestId)) as T;
         }
         continue;
       }
-      result = await pendingApproval.promise as T;
+      result = mergeApprovalReceipts(result, await pendingApproval.promise) as T;
       pending.delete(requestId);
     }
     return result;
@@ -247,7 +264,7 @@ function makeDefinition(ctx: Context, endpoint: ToolEndpoint, approval: DeskDshA
   return {
     name,
     description: endpoint.description,
-    parameters: endpoint.inputSchema,
+    get parameters() { return endpoint.inputSchema; },
     output: {
       schema: {
         type: "object",

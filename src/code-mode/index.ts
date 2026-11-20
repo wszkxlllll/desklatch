@@ -47,6 +47,8 @@ export function createDeskCodeMode(source: DeskToolSource, options: CodeModeOpti
     memoryBytes: bounded(options.memoryBytes, 8 * 1024 * 1024, 1 * 1024 * 1024, 32 * 1024 * 1024),
     maxCalls: bounded(options.maxCalls, 16, 1, 48),
     maxInspectBytes: bounded(options.maxInspectBytes, 8 * 1024, 32, 16 * 1024),
+    toolWaitTimeoutMs: bounded(options.toolWaitTimeoutMs, 120_000, 100, 300_000),
+    overallTimeoutMs: bounded(options.overallTimeoutMs, 180_000, 1_000, 600_000),
   };
   const endpoints = new Map(host.tools.map(endpoint => [endpoint.name, endpoint]));
   let active: { controller: AbortController; run: RunningCode } | undefined;
@@ -96,7 +98,7 @@ export function createDeskCodeMode(source: DeskToolSource, options: CodeModeOpti
   }));
   tools.push({
     name: "run_code",
-    description: "Run one isolated async JavaScript or erasable TypeScript function body. Use await desk.observe(args) and await desk.act(args) sequentially, and inspect(value) for selected JSON output. Observations are text and controls only. A refused, unresolved, or uncertain act stops the program. Inspect earlier receipts before continuing.",
+    description: "Run one isolated async JavaScript or erasable TypeScript function body. Use await desk.observe(args) and await desk.act(args) sequentially, and inspect(value) for selected JSON output. Observations are text and controls only. A grounding failure with every step confirmed not dispatched allows one fresh observe before continuing. A refused, revoked, partial, or uncertain action terminates the program.",
     inputSchema: codeModeSchema,
     invoke: (input, signal) => runCode(input, signal),
   });

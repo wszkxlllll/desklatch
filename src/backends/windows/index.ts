@@ -213,20 +213,31 @@ class WindowsDesktopSession implements WindowsDesktopBackend {
       // the host permits points. The model still receives only the screenshot.
       const includeGeometry = view !== "image" || this.foregroundPointAllowed();
       if (includeGeometry) {
-        for (const target of this.#authorization.targets) {
+        const deadline = AbortSignal.timeout(6_000);
+        const scanSignal = options.signal ? AbortSignal.any([options.signal, deadline]) : deadline;
+        const within = normalize(options.where?.within);
+        const exactWindow = view === "controls" && /^hwnd:\d+:\d+$/u.test(within);
+        const targets = exactWindow ? this.#authorization.targets.filter(target => windowKey(target) === within) : this.#authorization.targets;
+        const query = view === "controls" && options.where?.role && options.where.name && (!within || exactWindow)
+          ? { role: options.where.role, name: options.where.name } : undefined;
+        for (const target of targets) {
           options.signal?.throwIfAborted();
-          const evidence = await this.readPhysical(target, undefined, options.signal);
+          if (deadline.aborted) {
+            snapshots.push({ target });
+            continue;
+          }
+          const evidence = await this.readPhysical(target, undefined, scanSignal);
           let focus: WindowsFocusEvidence | undefined;
-          if (this.#authorization.allowForegroundInput === true) {
+          if (view !== "image" && this.#authorization.allowForegroundInput === true) {
             try {
-              focus = await this.readFocused(target, options.signal);
+              focus = await this.readFocused(target, scanSignal);
             } catch (error) {
               if (options.signal?.aborted) throw error;
               focus = undefined;
             }
           }
           try {
-            const snapshot = await this.#transport.observeWindow(target, { signal: options.signal });
+            const snapshot = await this.#transport.observeWindow(target, { signal: scanSignal, ...(query ? { where: query } : {}) });
             snapshots.push({ target, snapshot, ...(evidence ? { evidence } : {}), ...(focus ? { focus } : {}) });
           } catch {
             // A window can disappear between the host grant and the read. Keep
@@ -234,6 +245,7 @@ class WindowsDesktopSession implements WindowsDesktopBackend {
             snapshots.push({ target, ...(evidence ? { evidence } : {}), ...(focus ? { focus } : {}) });
           }
         }
+        options.signal?.throwIfAborted();
       }
       const built = includeGeometry ? buildControlsFrame(snapshots, options.where, this.#transport.source === "native-uia-v1") : emptyFrame();
       const controlsInFrame = await this.removeOwnedDialogCopies(built.internal, options.signal);
@@ -505,6 +517,15 @@ function capabilitiesFor(authorization: NormalizedAuthorization, transport: Wind
   }
   const foreground = physicalEvidence && authorization.allowForegroundInput === true && authorization.allowDesktopCapture === true;
   const keyboard = physicalEvidence && authorization.allowForegroundInput === true && inspector?.readFocused !== undefined;
+  return windowsCuaCapabilities({ background, foreground, keyboard });
+}
+
+/** Shared by the on-demand product catalog and the live CUA session. */
+export function windowsCuaCapabilities({ background, foreground, keyboard }: {
+  readonly background: boolean;
+  readonly foreground: boolean;
+  readonly keyboard: boolean;
+}): readonly Capability[] {
   const targetForms = foreground ? ["selector", "ref", "point"] as const : ["selector", "ref"] as const;
   const capabilities: Capability[] = [];
   if (background || foreground) {
@@ -522,8 +543,8 @@ function capabilitiesFor(authorization: NormalizedAuthorization, transport: Wind
     capabilities.push(Object.freeze({
       kind: "hotkey",
       targets: keyboardTargets,
-      keys: ["ctrl", "shift", "s"],
-      chords: [["ctrl", "s"], ["ctrl", "shift", "s"]],
+      keys: ["ctrl", "shift", "a", "s"],
+      chords: [["ctrl", "a"], ["ctrl", "s"], ["ctrl", "shift", "s"]],
     }));
   }
   return Object.freeze(capabilities);
@@ -614,6 +635,7 @@ function buildControlsFrame(
         role: element.role,
         ...(element.label !== undefined && !sensitive ? { name: element.label } : {}),
         within: parentId ?? (snapshot.title ?? item.target.title ?? key),
+        windowScope: key,
         states: Object.freeze(states),
         actions: Object.freeze(actions),
         ...(desktopRect ? { rect: desktopRect } : {}),
@@ -819,7 +841,7 @@ function validKey(key: string): boolean {
 function validHotkey(keys: readonly string[]): boolean {
   if (!Array.isArray(keys) || keys.length < 2 || keys.length > 3 || new Set(keys).size !== keys.length) return false;
   const normalized = keys.map(key => key.toLocaleLowerCase());
-  return (normalized.length === 2 && normalized[0] === "ctrl" && normalized[1] === "s")
+  return (normalized.length === 2 && normalized[0] === "ctrl" && (normalized[1] === "a" || normalized[1] === "s"))
     || (normalized.length === 3 && normalized[0] === "ctrl" && normalized[1] === "shift" && normalized[2] === "s");
 }
 
@@ -852,7 +874,7 @@ function validPoint(point: Point): boolean {
 }
 
 function normalize(value: string | undefined): string {
-  return (value ?? "").normalize("NFKC").replace(/\s+/gu, " ").trim().toLocaleLowerCase();
+  return (value ?? "").normalize("NFKC").replace(/\s+/gu, " ").trim().toLocaleLowerCase("en-US");
 }
 
 function normalizeText(value: string, max: number): string {

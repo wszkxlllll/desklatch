@@ -88,6 +88,7 @@ export interface WorkspaceOptions {
 export interface WorkspaceObservation {
   readonly active: string | null;
   readonly applications: readonly WorkspaceApplicationInfo[];
+  readonly activeCapabilities?: readonly Capability[];
 }
 
 export interface WorkspaceActResult extends ActResult {
@@ -120,6 +121,7 @@ interface ApprovalBinding {
   readonly applicationId: string;
   readonly activation: number;
   readonly session: DeskSession;
+  readonly steps: ActResult["steps"];
 }
 
 type OperationReason = "corrected" | "cancelled" | "closed";
@@ -596,7 +598,7 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     }
     rememberObservation(result, application.id);
     if (isRecord(result) && typeof result.requestId === "string") {
-      approvals.set(result.requestId, { applicationId: application.id, activation, session: application.session });
+      approvals.set(result.requestId, { applicationId: application.id, activation, session: application.session, steps: childSteps(result) });
     }
     return annotate(result, application);
   }
@@ -754,7 +756,7 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
         return { ...afterVerify, active: null };
       }
       activeId = id;
-      return completed("activated", id);
+      return completed("activated", id, { capabilities: application.session.capabilities });
     } catch (error) {
       const interrupted = operationStop(record);
       if (interrupted) {
@@ -814,9 +816,12 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
         }
         const interrupted = operationStop(record);
         if (interrupted) return interrupted;
+        const active = publicActiveId();
+        const activeApplication = active === null ? undefined : applications.get(active);
         const inventory = {
-          active: publicActiveId(),
+          active,
           applications: Object.freeze(visibleEntries().map(infoFor)),
+          ...(activeApplication ? { activeCapabilities: activeApplication.session.capabilities } : {}),
         } satisfies WorkspaceObservation;
         if (wantsReuse && inventory.active !== null && current()?.stepReuse) {
           const observation = await dispatchObserve(ordinaryObserveInput(input), operationSignal, record);
@@ -860,8 +865,9 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
 
   function enrolledCapabilities(): readonly Capability[] {
     const unique = new Map<string, Capability>();
-    for (const entry of entries.values()) {
-      const capabilities = isOnDemandApplication(entry) ? entry.capabilities : entry.session.capabilities;
+    for (const entry of visibleEntries()) {
+      const capabilities = applications.get(entry.id)?.session.capabilities
+        ?? (isOnDemandApplication(entry) ? entry.capabilities : entry.session.capabilities);
       for (const capability of capabilities) {
         unique.set(JSON.stringify(capability), capability);
       }
@@ -996,7 +1002,7 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
           ? entry.allowModelDocumentText === true
           : entry.session.allowModelDocumentText === true);
         const reuse = advertisesStepReuse();
-        return "Use {workspace:true} to discover available owned applications and the actual active application; otherwise observe the active application's controls."
+        return "Use {workspace:true} to discover available owned applications and the active application's capabilities; otherwise observe its controls."
           + (documents ? ' When the active browser grants rendered text, start with {"read":"document"}, find a literal keyword with {"read":{"query":"..."}}, or pass the returned document.nextCursor as {"read":{"cursor":"..."}}.' : "")
           + (reuse ? " When reusable verified steps are available, ordinary observe automatically lists scoped reuseCandidates; use reuseQuery only to rank them by intention." : "");
       },
@@ -1038,24 +1044,20 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
       if (!session) return { requestId, status: "stopped" as const, code: "approval_not_found", steps: [] };
       const settle = application?.stepReuse?.resolveApproval ?? session.resolveApproval.bind(session);
       const entry = binding ? entries.get(binding.applicationId) : application ? entries.get(application.id) : undefined;
-      if (!canAutomateEntry(entry)) {
-        const blocked: ApprovalResolution = { requestId, status: "stopped", code: "application_automation_blocked", steps: [] };
+      const stopCode = !canAutomateEntry(entry) ? "application_automation_blocked"
+        : binding && (binding.applicationId !== activeId || binding.activation !== activation) ? "stale_activation"
+        : undefined;
+      if (stopCode) {
+        const denied = await settle(requestId, "deny").catch(() => undefined);
+        const steps = denied?.steps.length ? denied.steps : binding?.steps ?? [];
+        const blocked: ApprovalResolution = { requestId, status: "stopped", code: stopCode, steps };
         approvalResults.set(requestId, blocked);
-        // Release the session's host approval without allowing it to dispatch.
-        void settle(requestId, "deny").catch(() => undefined);
         return blocked;
-      }
-      if (binding && (binding.applicationId !== activeId || binding.activation !== activation)) {
-        const stale: ApprovalResolution = { requestId, status: "stopped", code: "stale_activation", steps: [] };
-        approvalResults.set(requestId, stale);
-        // Release the session's host approval without allowing it to dispatch.
-        void settle(requestId, "deny").catch(() => undefined);
-        return stale;
       }
       const result = await settle(requestId, decision);
       const interrupted = operationStop(record);
       if (interrupted) {
-        const stoppedApproval = interruptedApproval(result, requestId, operationCode(record));
+        const stoppedApproval = interruptedApproval(result.steps.length ? result : binding, requestId, operationCode(record));
         approvalResults.set(requestId, stoppedApproval);
         return stoppedApproval;
       }
@@ -1063,6 +1065,7 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
         applicationId: binding?.applicationId ?? application!.id,
         activation,
         session,
+        steps: result.steps.length ? result.steps : binding?.steps ?? [],
       });
       // The original request is settled even when the session hands back a
       // fresh approval request for the next step. Cache only settled IDs;

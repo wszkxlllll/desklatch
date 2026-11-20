@@ -1,6 +1,7 @@
 import { dirname } from "node:path";
 import type { Workspace } from "../workspace.js";
 import { createWindowsProductHost, type WindowsProductHostOptions } from "./windows-host.js";
+import { createWindowsLocalBrowserApplication } from "./local-browser.js";
 import { readE2BProductEnvironment, readWindowsProductRuntimeConfig } from "./runtime-config.js";
 
 export { createWindowsProductHost };
@@ -21,10 +22,16 @@ export async function openInstalledWindowsHost(
     onApprovalRequested: options.onApprovalRequested,
   }) : undefined;
   try {
+    const localBrowser = process.platform === "win32"
+      ? createWindowsLocalBrowserApplication({ onApprovalRequested: options.onApprovalRequested })
+      : undefined;
     const workspace = await createWindowsProductHost({
       ...options,
       ocr: config.ocr,
-      extraApplications: cloud?.applications,
+      extraApplications: [
+        ...(cloud?.applications ?? []),
+        ...(localBrowser === undefined ? [] : [localBrowser]),
+      ],
     });
     let closing: Promise<void> | undefined;
     return {

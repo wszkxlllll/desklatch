@@ -148,7 +148,7 @@ function waitFor(predicate) {
   });
 }
 
-async function verifyNativeApproval(codeMode) {
+async function verifyNativeApproval(codeMode, stripDeniedReceipts = false) {
   const ctx = new Context();
   const fibers = [];
   const questions = [];
@@ -196,7 +196,8 @@ async function verifyNativeApproval(codeMode) {
           ...rawSession,
           async resolveApproval(requestId, decision) {
             resolveCalls.push([requestId, decision]);
-            return rawSession.resolveApproval(requestId, decision);
+            const result = await rawSession.resolveApproval(requestId, decision);
+            return stripDeniedReceipts && decision === "deny" ? { ...result, steps: [] } : result;
           },
         };
         const fiber = agentCtx.plugin(createDeskDshPlugin(() => session, { approval: bridge, codeMode }));
@@ -213,24 +214,36 @@ async function verifyNativeApproval(codeMode) {
     questions.shift().resolve("allowed-once");
     await waitFor(() => questions.length === 1);
     assert.equal(calls.length, 1);
-    questions.shift().resolve("allowed-once");
+    questions.shift().resolve(stripDeniedReceipts ? "rejected" : "allowed-once");
     await firstIdle;
-    assert.equal(calls.length, 2);
-    assert.equal(value.current, "approved action 2");
+    assert.equal(calls.length, stripDeniedReceipts ? 1 : 2);
+    assert.equal(value.current, stripDeniedReceipts ? "approved action" : "approved action 2");
     assert.equal(resolveCalls.length, 2);
     assert.equal(resolveCalls[0][1], "approve");
-    assert.equal(resolveCalls[1][1], "approve");
+    assert.equal(resolveCalls[1][1], stripDeniedReceipts ? "deny" : "approve");
+
+    if (stripDeniedReceipts) {
+      const results = handle.agent.session.snapshotEvents().filter(event => event.type === "tool/result");
+      const lastContent = results.at(-1)?.data?.message?.content?.[0]?.text;
+      const preserved = JSON.parse(lastContent);
+      assert.equal(preserved.steps.length, 2);
+      assert.equal(preserved.steps[0].index, 1);
+      assert.equal(preserved.steps[0].status, "dispatched");
+      assert.equal(preserved.steps[1].index, 2);
+      assert.equal(preserved.steps[1].status, "not_dispatched");
+      return;
+    }
 
     handle.agent.followup(createUserMessage({ content: [{ type: "text", text: "Do the denied action." }], source: { kind: "user" } }));
     const secondIdle = handle.agent.whenIdle();
     await waitFor(() => questions.length === 1);
     assert.equal(calls.length, 2);
-    questions.shift().resolve("rejected");
+    questions.shift().resolve(stripDeniedReceipts ? "rejected" : "allowed-once");
     await secondIdle;
-    assert.equal(calls.length, 2);
-    assert.equal(value.current, "approved action 2");
+    assert.equal(calls.length, 3);
+    assert.equal(value.current, "denied action");
     assert.equal(resolveCalls.length, 3);
-    assert.equal(resolveCalls[2][1], "deny");
+    assert.equal(resolveCalls.at(-1)[1], "approve");
     assert.equal(adapter.requests.length, 4);
   } finally {
     if (handle) await handle.dispose();
@@ -242,3 +255,4 @@ async function verifyNativeApproval(codeMode) {
 
 test("native DSH approval bridge holds act until consent and resumes or denies once", () => verifyNativeApproval(false));
 test("each Code Mode act uses the native DSH approval bridge", () => verifyNativeApproval(true));
+test("native DSH approval bridge preserves prior receipts when host denial omits them", () => verifyNativeApproval(false, true));

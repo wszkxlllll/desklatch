@@ -71,9 +71,9 @@ test("the guest only sees its isolated JavaScript globals and the bounded SDK", 
 });
 
 for (const [code, stepStatus] of [
-  ["stale_observation", "not_dispatched"], ["partial_dispatch", "partial"], ["delivery_unknown", "unknown"],
+  ["application_automation_blocked", "not_dispatched"], ["target_not_found", "partial"], ["stale_observation", "unknown"],
 ]) {
-  test(`a ${stepStatus} act stops without letting guest code replay it`, async t => {
+  test(`a ${stepStatus} act hard-stops even when the guest attempts to continue`, async t => {
     const uncertain = { status: "stopped", code, steps: [{ index: 1, kind: "type", status: stepStatus, code }] };
     const { calls, host } = makeHost(t, { act: () => calls.length === 1 ? verified : uncertain });
     const result = await host.runCode({ code: `
@@ -89,6 +89,31 @@ for (const [code, stepStatus] of [
     assert.equal(calls.length, 2);
   });
 }
+
+test("confirmed zero-dispatch grounding failure requires a fresh observation and allows one recovery", async t => {
+  const stale = { status: "stopped", code: "stale_observation", steps: [{ index: 1, status: "not_dispatched" }] };
+  const { calls, host } = makeHost(t, {
+    act: () => stale,
+    observe: () => ({ observationId: "fresh", controls: [] }),
+  });
+  const step = JSON.stringify(write);
+  const ignored = await host.runCode({ code: `await desk.act(${step}); await desk.act(${step});` });
+  assert.equal(ignored.code, "recovery_requires_observation");
+  assert.deepEqual(calls.map(call => call.name), ["act"]);
+  calls.length = 0;
+  const recovered = await host.runCode({ code: `
+    const first = await desk.act(${step});
+    if (first.code === "stale_observation") {
+      const frame = await desk.observe({});
+      await desk.act({ ...${step}, observationId: frame.observationId });
+    }
+    await desk.act(${step});
+  ` });
+  assert.equal(recovered.code, "stale_observation");
+  assert.deepEqual(recovered.actions.map(action => action.call), [1, 3]);
+  assert.deepEqual(calls.map(call => call.name), ["act", "observe", "act"]);
+  assert.equal(calls.at(-1).input.observationId, "fresh");
+});
 
 test("timeouts, unsettled promises and excess memory close the guest", async t => {
   const { host, calls } = makeHost(t, { limits: { timeoutMs: 1_500, memoryBytes: 2 * 1024 * 1024 } });
@@ -107,6 +132,27 @@ test("timeouts, unsettled promises and excess memory close the guest", async t =
   assert.match(memory.code, /^(code_error|code_memory_limit)$/u);
   assert.deepEqual(memory.inspections, []);
   assert.deepEqual(calls, []);
+});
+
+test("guest execution budget pauses during a bounded host-tool wait", async t => {
+  const { host } = makeHost(t, {
+    limits: { timeoutMs: 100, toolWaitTimeoutMs: 500, overallTimeoutMs: 2_000 },
+    act: async () => { await new Promise(resolve => setTimeout(resolve, 150)); return verified; },
+  });
+  const result = await host.runCode({ code: `await desk.act(${JSON.stringify(write)}); inspect("ok");` });
+  assert.equal(result.status, "completed");
+  assert.deepEqual(result.inspections, ["ok"]);
+});
+
+test("tool wait budget is separate from guest execution budget", async t => {
+  const { host } = makeHost(t, {
+    limits: { timeoutMs: 100, toolWaitTimeoutMs: 100, overallTimeoutMs: 2_000 },
+    act: async () => { await new Promise(resolve => setTimeout(resolve, 250)); return verified; },
+  });
+  const result = await host.runCode({ code: `await desk.act(${JSON.stringify(write)});` });
+  assert.equal(result.status, "stopped");
+  assert.equal(result.code, "act_result_unconfirmed");
+  assert.deepEqual(result.actions, [{ call: 1, ...verified }]);
 });
 
 test("tool, input and inspect budgets stop excess work before delivery", async t => {

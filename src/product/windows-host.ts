@@ -19,6 +19,7 @@ import {
   createWindowsForegroundActivator,
   CuaWindowsTransport,
   loadWindowsPhysicalInspector,
+  windowsCuaCapabilities,
   type WindowsBackgroundSource,
   type WindowsCuaDriver,
   type WindowsDesktopAuthorization,
@@ -96,28 +97,28 @@ export async function createWindowsProductHost(options: WindowsProductHostOption
   const windowsIds = new Set(initial.apps.map(app => app.id));
   if (extras.some(application => windowsIds.has(application.id))) throw productError("duplicate_workspace_application");
   const entryById = new Map<string, OnDemandWorkspaceApplication>();
-  const entryFor = (app: { readonly id: string; readonly name: string }, grants: WindowsProductGrants): OnDemandWorkspaceApplication => {
+  let currentGrants = initial;
+  const entryFor = (app: { readonly id: string; readonly name: string }): OnDemandWorkspaceApplication => {
     const existing = entryById.get(app.id);
     if (existing) return existing;
-    const entry = createOnDemandWorkspaceApplication({
+    const entry = createOnDemandWorkspaceApplication(Object.freeze({
       id: app.id,
       name: app.name,
-      capabilities: productCapabilities(grants),
-      allowModelImages: grants.allowDesktopCapture,
-      open: signal => openGrantedApplication(options, app, signal),
-    });
+      get capabilities() { return productCapabilities(currentGrants); },
+      get allowModelImages() { return currentGrants.allowDesktopCapture; },
+      open: (signal?: AbortSignal) => openGrantedApplication(options, app, signal),
+    }));
     entryById.set(app.id, entry);
     return entry;
   };
-  for (const app of initial.apps) entryFor(app, initial);
-  let currentGrants = initial;
+  for (const app of initial.apps) entryFor(app);
   return createWorkspace({
     applications: [...entryById.values(), ...extras],
     canAutomate: application => extras.some(extra => extra.id === application.id)
       || currentGrants.apps.some(app => app.id === application.id),
     discover: async () => {
       currentGrants = await readGrants(options, options.authorizationFile);
-      return [...currentGrants.apps.map(app => entryFor(app, currentGrants)), ...extras];
+      return [...currentGrants.apps.map(entryFor), ...extras];
     },
   });
 }
@@ -149,6 +150,7 @@ async function openGrantedApplication(
     // and let the dispatch guard verify only the exact recipient.
     if (hasNewOrReplacedWindow(live, runtime.windows)
       || runtime.grants.allowDesktopCapture !== currentGrants.allowDesktopCapture
+      || allowsLocalWindowEvidence(runtime.grants) !== allowsLocalWindowEvidence(currentGrants)
       || runtime.grants.allowForegroundInput !== currentGrants.allowForegroundInput) {
       ensureSignal?.throwIfAborted();
       const replacement = await openProductRuntime(options, currentGrants.apps.find(candidate => candidate.id === app.id)!, currentGrants, live, ensureSignal);
@@ -222,7 +224,7 @@ async function openProductRuntime(
     const opened = await CuaWindowsTransport.open(driver, `desklatch-product-${safeId(app.id)}`, signal);
     transport = opened;
     inspector = await loadWindowsPhysicalInspector();
-    if (options.ocr !== undefined && grants.allowDesktopCapture) {
+    if (options.ocr !== undefined && allowsLocalWindowEvidence(grants)) {
       try {
         captureDriver = await createCuaDriver();
         captureTransport = await CuaWindowsTransport.open(captureDriver, `desklatch-product-${safeId(app.id)}-ocr`, signal);
@@ -265,8 +267,11 @@ async function openProductRuntime(
       ...(foregroundActivator ? { activateForeground: foregroundActivator } : {}),
     });
     const guardedBackend = createGrantGuardedBackend(backend, options, app.id, grants);
-    const policy = options.test?.policy ?? (options.ocr === undefined ? undefined : createRiskPolicy({
-      ocr: createWindowsOcrProvider({
+    const useLocalOcr = options.ocr !== undefined && allowsLocalWindowEvidence(grants);
+    const isOfficeEditor = /^(?:winword|excel)$/iu.test(app.name);
+    const policy = options.test?.policy ?? (useLocalOcr || isOfficeEditor ? createRiskPolicy({
+      ...(isOfficeEditor ? { hostRules: { requireApproval: officeSaveApproval } } : {}),
+      ...(useLocalOcr && options.ocr ? { ocr: createWindowsOcrProvider({
         rapidOcr: options.ocr,
         transport: guardedCaptureTransport,
         regionForInput: windowsOcrRegion,
@@ -275,9 +280,11 @@ async function openProductRuntime(
       }),
       ocrRegion: windowsOcrRegion,
       timeoutMs: (options.ocr.timeoutMs ?? 8_000) + 2_000,
-    }));
+      } : {}),
+    }) : undefined);
     session = createDeskSession(guardedBackend, {
       allowModelImages: grants.allowDesktopCapture,
+      maxPublicControls: 128,
       onApprovalRequested: options.onApprovalRequested,
       ...(policy ? { policy } : {}),
     });
@@ -312,11 +319,12 @@ function createGrantGuardedTransport(
   expectedGrants: WindowsProductGrants,
   captureDesktopImage?: WindowsPhysicalInspector["captureDesktopImage"],
 ): WindowsTransport {
-  const authorizationLive = async (requireForeground = false, requireCapture = false): Promise<string | undefined> => {
+  const authorizationLive = async (requireForeground = false, capture?: "desktop" | "window"): Promise<string | undefined> => {
     try {
       const grants = await readGrants(options, options.authorizationFile);
       if (!grants.apps.some(app => app.id === appId)) return "application_automation_blocked";
-      if (requireCapture && !expectedGrants.allowDesktopCapture) return "desktop_image_not_authorized";
+      if (capture === "desktop" && !grants.allowDesktopCapture) return "desktop_image_not_authorized";
+      if (capture === "window" && !allowsLocalWindowEvidence(grants)) return "window_evidence_not_authorized";
       if (grants.allowDesktopCapture !== expectedGrants.allowDesktopCapture
         || grants.allowForegroundInput !== expectedGrants.allowForegroundInput) return "window_scope_changed";
       if (requireForeground && !grants.allowForegroundInput) return "foreground_input_not_authorized";
@@ -340,13 +348,13 @@ function createGrantGuardedTransport(
       return transport.observeWindow(target, callOptions);
     },
     observeWindowImage: transport.observeWindowImage ? async (target, callOptions) => {
-      const code = await authorizationLive(false, true);
+      const code = await authorizationLive(false, "window");
       if (code) throw productError(code);
       if (!(await verifyTarget(target))) throw productError("window_scope_changed");
       return transport.observeWindowImage!(target, callOptions);
     } : undefined,
     observeDesktopImage: captureDesktopImage || transport.observeDesktopImage ? async callOptions => {
-      const code = await authorizationLive(false, true);
+      const code = await authorizationLive(false, "desktop");
       if (code) throw productError(code);
       return captureDesktopImage ? captureDesktopImage(callOptions.signal) : transport.observeDesktopImage!(callOptions);
     } : undefined,
@@ -410,7 +418,7 @@ function wrapProductSession(
   closeProduct: () => Promise<void>,
   beforeOperation?: (signal?: AbortSignal) => Promise<void>,
 ): DeskSession {
-  const pendingApprovals = new Set<string>();
+  const pendingApprovals = new Map<string, { session: DeskSession; steps: ActResult["steps"] }>();
   const grantLive = async (): Promise<boolean> => {
     try {
       const grants = await readGrants(options, options.authorizationFile);
@@ -431,49 +439,63 @@ function wrapProductSession(
     },
     act: async (input: unknown, signal?: AbortSignal, actOptions?: DeskSessionActOptions): Promise<ActResult> => {
       if (!(await grantLive())) {
-        await denyPendingApprovals(getSession, pendingApprovals);
+        for (const requestId of pendingApprovals.keys()) await denyPendingApproval(requestId);
         return { status: "stopped", code: "application_automation_blocked", steps: stepsForInput(input) };
       }
       await beforeOperation?.(signal);
-      const result = await getSession().act(input, signal, actOptions);
-      if (result.requestId) pendingApprovals.add(result.requestId);
+      const session = getSession();
+      const result = await session.act(input, signal, actOptions);
+      if (result.requestId && result.code === "approval_required") pendingApprovals.set(result.requestId, { session, steps: result.steps });
       return result;
     },
     resolveApproval: async (requestId: string, decision: "approve" | "deny"): Promise<ApprovalResolution> => {
       if (!(await grantLive())) {
-        await denyPendingApprovals(getSession, pendingApprovals, requestId);
-        return { requestId, status: "stopped", code: "application_automation_blocked", steps: [] };
+        return denyPendingApproval(requestId);
       }
+      const pending = pendingApprovals.get(requestId);
       pendingApprovals.delete(requestId);
-      const result = await getSession().resolveApproval(requestId, decision);
-      if (result.requestId && result.code === "approval_required") pendingApprovals.add(result.requestId);
-      return result;
+      const session = pending?.session ?? getSession();
+      const result = await session.resolveApproval(requestId, decision);
+      const preserved = result.steps.length || !pending ? result : { ...result, steps: pending.steps };
+      if (result.requestId && result.code === "approval_required") pendingApprovals.set(result.requestId, { session, steps: preserved.steps });
+      return preserved;
     },
     correct: (reason?: string) => getSession().correct(reason),
     cancel: (reason?: string) => getSession().cancel(reason),
     close: closeProduct,
   };
-}
 
-async function denyPendingApprovals(
-  getSession: () => DeskSession,
-  pendingApprovals: Set<string>,
-  only?: string,
-): Promise<void> {
-  const ids = only === undefined ? [...pendingApprovals] : [only];
-  pendingApprovals.clear();
-  for (const requestId of ids) await getSession().resolveApproval(requestId, "deny").catch(() => undefined);
+  async function denyPendingApproval(requestId: string): Promise<ApprovalResolution> {
+    const pending = pendingApprovals.get(requestId);
+    pendingApprovals.delete(requestId);
+    const denied = await (pending?.session ?? getSession()).resolveApproval(requestId, "deny").catch(() => undefined);
+    return {
+      requestId, status: "stopped", code: "application_automation_blocked",
+      steps: denied?.steps.length ? denied.steps : pending?.steps ?? [],
+    };
+  }
 }
 
 function productCapabilities(grants: WindowsProductGrants): readonly Capability[] {
-  const targets = grants.allowForegroundInput && grants.allowDesktopCapture
-    ? ["selector", "ref", "point"] as const
-    : ["selector", "ref"] as const;
-  return Object.freeze([
-    Object.freeze({ kind: "click", targets, buttons: ["left"] as const, counts: [1] as const }),
-    Object.freeze({ kind: "type", targets: ["selector", "ref"] as const }),
-    Object.freeze({ kind: "scroll", targets, directions: ["up", "down", "left", "right"] as const, units: ["line", "page"] as const }),
-  ]);
+  return windowsCuaCapabilities({
+    background: true,
+    foreground: grants.allowForegroundInput && grants.allowDesktopCapture,
+    keyboard: grants.allowForegroundInput,
+  });
+}
+
+function allowsLocalWindowEvidence(grants: WindowsProductGrants): boolean {
+  return grants.allowLocalWindowEvidence ?? grants.allowDesktopCapture;
+}
+
+function officeSaveApproval({ step, target }: RiskInput): { match: true; code: string } | false {
+  const caption = target.name?.trim() ?? "";
+  const saveButton = step.kind === "click" && /^(?:button|menuitem|menu item)$/iu.test(target.role)
+    && /^(?:save|save as|保存|另存为)(?:\s*…|\s*\.\.\.)?$/iu.test(caption);
+  const saveShortcut = step.kind === "hotkey" && target.states.includes("focused")
+    && /^(?:document|edit|textbox|pane|dataitem|cell)$/iu.test(target.role)
+    && /^(?:ctrl\+s|ctrl\+s\+shift)$/u.test(step.keys.map(key => key.toLowerCase().replace(/^control$/u, "ctrl")).sort().join("+"));
+  return saveButton || saveShortcut ? { match: true, code: "office_document_save" } : false;
 }
 
 async function readGrants(options: WindowsProductHostOptions, file: string): Promise<WindowsProductGrants> {

@@ -6,6 +6,7 @@ import type {
   FrameImage,
   Point,
   Rect,
+  Selector,
   Step,
   Target,
 } from "../../contracts.js";
@@ -188,7 +189,11 @@ export interface WindowsTransport {
   /** Delivery/source identity; arbitrary transports cannot claim native background trust. */
   readonly source?: WindowsBackgroundSource;
   open?(signal?: AbortSignal): Promise<void>;
-  observeWindow(target: WindowsWindowTarget, options: { readonly signal?: AbortSignal }): Promise<WindowsWindowSnapshot>;
+  observeWindow(target: WindowsWindowTarget, options: {
+    readonly signal?: AbortSignal;
+    /** Optional exact role/name for a read-only candidate snapshot of this window. */
+    readonly where?: Selector;
+  }): Promise<WindowsWindowSnapshot>;
   /** Fresh read-only pixels for one exact authorized HWND/PID. */
   observeWindowImage?(target: WindowsWindowTarget, options: { readonly signal?: AbortSignal }): Promise<WindowsDesktopImage | undefined>;
   observeDesktopImage?(options: { readonly signal?: AbortSignal }): Promise<WindowsDesktopImage | undefined>;

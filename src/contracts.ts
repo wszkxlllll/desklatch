@@ -63,6 +63,8 @@ export type Effect = "read" | "navigate" | "edit" | "external" | "financial" | "
 export interface Control {
   /** Stable only within the current authorized scope. Distinguish distinct objects with equal labels. */
   id: string; role: string; name?: string; within?: string; states: readonly State[];
+  /** Optional exact window scope accepted by a selector's `within`. */
+  windowScope?: string;
   actions: readonly ActionKind[]; rect?: Rect; value?: string; sensitive?: boolean;
   labels?: readonly string[]; effect?: Effect;
   /** Host-private binding to material data outside the button itself (e.g. the recipient and current form values). */

@@ -11,6 +11,10 @@ export interface CodeModeLimits {
   readonly memoryBytes: number;
   readonly maxCalls: number;
   readonly maxInspectBytes: number;
+  /** Maximum bounded wait for one host observe/act call, including approval. */
+  readonly toolWaitTimeoutMs?: number;
+  /** Full run wall cap, including child startup and bounded host waits. */
+  readonly overallTimeoutMs?: number;
 }
 
 export type StartMessage = CodeProgram & CodeModeLimits & { type: "start" };

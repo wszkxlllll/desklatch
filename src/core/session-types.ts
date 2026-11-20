@@ -4,6 +4,7 @@ export interface ControlObservation {
   ref: string;
   role: string;
   name?: string;
+  windowScope?: string;
   states: readonly State[];
   actions: readonly ActionKind[];
   rect?: { x: number; y: number; width: number; height: number };
@@ -31,6 +32,7 @@ export interface CandidateSummary {
   observationId?: string;
   role: string;
   name?: string;
+  windowScope?: string;
   states: readonly State[];
   actions: readonly ActionKind[];
   rect?: { x: number; y: number; width: number; height: number };
@@ -99,6 +101,8 @@ export interface DeskSessionOptions {
   maxSteps?: number;
   maxTextLength?: number;
   maxScrollAmount?: number;
+  /** Public control list limit. Internal grounding still uses the backend's complete scope. */
+  maxPublicControls?: number;
   capabilities?: readonly Capability[];
   timeoutMs?: number;
   approvalTimeoutMs?: number;

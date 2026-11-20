@@ -31,9 +31,9 @@ const result = await host.runCode({
 
 程序在独立子进程中的 QuickJS WebAssembly 实例内运行。宿主只接收有大小限制的 JSON 消息，程序可触达的外部操作只有 `desk.observe` 和 `desk.act`。授权、目标校验、审批、核验及原生桌面动作都留在宿主端。程序内可读已授权的控件和正文，普通 `observe` 可继续使用宿主已授予的截图能力。[QuickJS WebAssembly 运行时](https://github.com/justjake/quickjs-emscripten/tree/main/packages/quickjs-emscripten-core)
 
-宿主默认预算为 30 秒、16 次工具调用和 8 KiB 的 `inspect` 数据，源码上限为 32 KiB。默认脚本内存预算为 8 MiB，Wasm 线性内存硬上限为 24 MiB，包含引擎启动预留的 16 MiB。受信任的宿主可配置 `timeoutMs`、`maxCalls`、`memoryBytes` 和 `maxInspectBytes`。一段脚本独占同一宿主的工具调度，宿主负责协调共用一个桌面的多个会话。
+默认允许脚本实际执行 30 秒，单次宿主工具等待最多 120 秒，整次调用最多 180 秒。等待审批或云电脑启动计入工具等待及整次调用时间。默认上限还有 16 次工具调用、8 KiB 的 `inspect` 数据和 32 KiB 的源码。脚本内存预算为 8 MiB，Wasm 线性内存硬上限为 24 MiB，包含引擎启动的 16 MiB。宿主可通过 `timeoutMs`、`toolWaitTimeoutMs`、`overallTimeoutMs` 和其他预算选项配置。一段脚本独占同一宿主的工具调度。
 
-遇到拒绝、目标变化、`partial`、`unknown` 或待审批结果时，脚本停止并交出已有回执。DSH 可在原生审批卡取得用户决定后返回该步的最终结果。取消或超时会停止脚本，并向正在等待的宿主操作发出取消信号。拿不到确切的动作回执时，结果记为 `unknown`，原调用收尾前同一宿主继续报告 `code_mode_busy`。是否继续由外部 Agent 根据实际页面和回执判断。
+遇到审批拒绝、撤销权限、目标变化、`partial` 或 `unknown`，运行时停止脚本并交出已有回执。对控件缺失、引用过期等定位问题，只有整批动作均确认未派发时才允许一次恢复。脚本须先取得新观察，再自行选择下一步。待审批状态由宿主处理，DSH 可通过原生审批卡取得用户决定后返回该步的最终结果。取消或超时会停止脚本并发出取消信号。原调用返回的权威回执仍会保留，等待期内无法确认的动作记为 `unknown`。同一宿主在原调用收尾前报告 `code_mode_busy`。
 
 ## 复跑真实网页
 

@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
-import type { Step, Rect } from "../../contracts.js";
+import type { Selector, Step, Rect } from "../../contracts.js";
 import {
   backendError,
   type WindowsDispatchTarget,
@@ -91,17 +91,20 @@ export class NativeUiAutomationWindowsTransport implements WindowsTransport {
     this.#opened = true;
   }
 
-  async observeWindow(target: WindowsWindowTarget, options: { readonly signal?: AbortSignal }): Promise<WindowsWindowSnapshot> {
+  async observeWindow(target: WindowsWindowTarget, options: { readonly signal?: AbortSignal; readonly where?: Selector } = {}): Promise<WindowsWindowSnapshot> {
     this.assertOpen();
     validateTarget(target);
     options.signal?.throwIfAborted();
-    const result = await this.request({
+    const request: Record<string, unknown> = {
       op: "observe",
       pid: target.pid,
       hwnd: target.hwnd.toString(),
       max_elements: this.#maxElements,
       max_depth: this.#maxDepth,
-    }, options.signal);
+    };
+    const selector = exactSelector(options.where);
+    if (selector !== undefined) request.where = selector;
+    const result = await this.request(request, options.signal);
     const raw = objectRecord(result);
     if (!raw) throw backendError("native_uia_observation_invalid");
     if (raw.ok === false) throw backendError(stringField(raw, "code") ?? "native_uia_observation_failed");
@@ -414,6 +417,18 @@ function parseRect(value: unknown): Rect | undefined {
   const height = finiteNumber(item.height ?? item.h);
   if (x === undefined || y === undefined || width === undefined || height === undefined || width <= 0 || height <= 0) return undefined;
   return { x, y, width, height };
+}
+
+/** Only canonical role+name selectors are safe to pass to the bounded worker.
+ * Window routing owns `within`; state/alias/approximate selectors stay on the
+ * existing full-tree path so this transport cannot widen or reinterpret scope.
+ */
+function exactSelector(value: Selector | undefined): { readonly role: string; readonly name: string } | undefined {
+  if (value === undefined || typeof value !== "object" || value === null) return undefined;
+  if (typeof value.role !== "string" || typeof value.name !== "string") return undefined;
+  if (value.role.trim().length === 0 || value.name.trim().length === 0) return undefined;
+  if (value.within !== undefined || value.state !== undefined) return undefined;
+  return { role: value.role, name: value.name };
 }
 
 function validateTarget(target: WindowsWindowTarget): void {

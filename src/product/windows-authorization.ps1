@@ -203,12 +203,14 @@ function ConvertTo-NormalizedSnapshot {
 
   $allowForegroundInput = [bool](Get-Field $rawGrants "allowForegroundInput" $false)
   $allowDesktopCapture = [bool](Get-Field $rawGrants "allowDesktopCapture" $false)
+  $allowLocalWindowEvidence = [bool](Get-Field $rawGrants "allowLocalWindowEvidence" $allowDesktopCapture)
   return [pscustomobject]([ordered]@{
       grants = [pscustomobject]([ordered]@{
           version = 1
           apps = $grantApps
           allowForegroundInput = $allowForegroundInput
           allowDesktopCapture = $allowDesktopCapture
+          allowLocalWindowEvidence = $allowLocalWindowEvidence
         })
       applications = $applications
     })
@@ -292,6 +294,7 @@ function Get-GrantsFromUi {
       apps = $apps
       allowForegroundInput = [bool] $script:Ui.foreground.Checked
       allowDesktopCapture = [bool] $script:Ui.screenshots.Checked
+      allowLocalWindowEvidence = [bool] $script:Ui.localEvidence.Checked
     })
 }
 
@@ -349,6 +352,7 @@ function Set-PageSnapshot {
     }
     $script:Ui.foreground.Checked = [bool] $Snapshot.grants.allowForegroundInput
     $script:Ui.screenshots.Checked = [bool] $Snapshot.grants.allowDesktopCapture
+    $script:Ui.localEvidence.Checked = [bool] $Snapshot.grants.allowLocalWindowEvidence
     $script:State.loaded = $true
     $script:State.dirty = $false
     $script:Ui.save.Enabled = $true
@@ -485,7 +489,7 @@ try {
   $permissionsGroup = New-Object System.Windows.Forms.GroupBox
   $permissionsGroup.Text = "高级权限（分别确认）"
   $permissionsGroup.Dock = [System.Windows.Forms.DockStyle]::Top
-  $permissionsGroup.Height = 150
+  $permissionsGroup.Height = 174
   $permissionsGroup.Padding = New-Object System.Windows.Forms.Padding(14, 28, 14, 10)
   $foreground = New-Object System.Windows.Forms.CheckBox
   $foreground.Text = "允许前台输入（键盘、鼠标和窗口激活）"
@@ -493,16 +497,22 @@ try {
   $foreground.Location = New-Object System.Drawing.Point(16, 32)
   $foreground.Add_CheckedChanged({ if (-not $script:State.suppressChanges) { $script:State.dirty = $true } })
   $screenshots = New-Object System.Windows.Forms.CheckBox
-  $screenshots.Text = "允许全桌面截图（画面可能包含其他应用）"
+  $screenshots.Text = "允许向模型提供全桌面截图（可能包含其他应用）"
   $screenshots.AutoSize = $true
   $screenshots.Location = New-Object System.Drawing.Point(16, 66)
   $screenshots.Add_CheckedChanged({ if (-not $script:State.suppressChanges) { $script:State.dirty = $true } })
-  $scope = New-UiLabel "首次安装默认关闭；截图权限与输入权限相互独立。" 24
-  $scope.Location = New-Object System.Drawing.Point(16, 96)
+  $localEvidence = New-Object System.Windows.Forms.CheckBox
+  $localEvidence.Text = "允许本机识别已授权窗口的局部文字（需要 OCR）"
+  $localEvidence.AutoSize = $true
+  $localEvidence.Location = New-Object System.Drawing.Point(16, 98)
+  $localEvidence.Add_CheckedChanged({ if (-not $script:State.suppressChanges) { $script:State.dirty = $true } })
+  $scope = New-UiLabel "首次安装默认关闭，三项权限可分别设置。" 24
+  $scope.Location = New-Object System.Drawing.Point(16, 130)
   $scope.Width = 660
   $scope.ForeColor = [System.Drawing.Color]::DimGray
   $permissionsGroup.Controls.Add($foreground)
   $permissionsGroup.Controls.Add($screenshots)
+  $permissionsGroup.Controls.Add($localEvidence)
   $permissionsGroup.Controls.Add($scope)
 
   $body.Controls.Add($permissionsGroup)
@@ -519,6 +529,7 @@ try {
     appFlow = $appFlow
     foreground = $foreground
     screenshots = $screenshots
+    localEvidence = $localEvidence
     appChecks = @{}
   }
 

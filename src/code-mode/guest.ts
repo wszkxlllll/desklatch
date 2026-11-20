@@ -52,7 +52,7 @@ async function execute(start: StartMessage): Promise<void> {
   try { source = javascript(start); }
   catch { send({ type: "done", status: "failed", code: "code_syntax_error" }); return; }
 
-  const deadline = performance.now() + start.timeoutMs;
+  let deadline = performance.now() + start.timeoutMs;
   const memory = new WebAssembly.Memory({
     initial: WASM_INITIAL_PAGES,
     maximum: WASM_INITIAL_PAGES + Math.ceil(start.memoryBytes / WASM_PAGE_BYTES),
@@ -70,7 +70,8 @@ async function execute(start: StartMessage): Promise<void> {
   let inspectBytes = 0;
   let pending: { id: number; promise: QuickJSDeferredPromise } | undefined;
   let program: QuickJSHandle | undefined;
-  const expired = () => performance.now() >= deadline;
+  let waitingSince: number | undefined;
+  const expired = () => waitingSince === undefined && performance.now() >= deadline;
   vm.runtime.setInterruptHandler(() => ended || expired());
 
   function finish(status: "completed" | "failed" | "stopped", code?: string): void {
@@ -93,6 +94,7 @@ async function execute(start: StartMessage): Promise<void> {
     }
     const promise = vm.newPromise();
     pending = { id: ++calls, promise };
+    waitingSince = performance.now();
     send({ type: "tool", id: pending.id, tool, json });
     return promise.handle;
   }
@@ -138,6 +140,10 @@ async function execute(start: StartMessage): Promise<void> {
     }
     const { promise } = pending;
     pending = undefined;
+    if (waitingSince !== undefined) {
+      deadline += performance.now() - waitingSince;
+      waitingSince = undefined;
+    }
     try {
       vm.newString(message.json).consume(value => promise.resolve(value));
       pump();

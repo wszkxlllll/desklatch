@@ -189,6 +189,127 @@ test('product host supports a first load with no enrolled apps without opening C
   await workspace.close();
 });
 
+test('an explicit window scope restricts selector and reference refresh to that authorized window', async t => {
+  const fixture = makeHostFixture();
+  const read = [];
+  const workspace = await createWindowsProductHost({ authorizationFile: 'ignored-for-seams', test: {
+    ...fixture.seams,
+    async transportFactory(context) {
+      const opened = await fixture.seams.transportFactory(context);
+      const observe = opened.transport.observeWindow;
+      opened.transport.observeWindow = (window, options) => {
+        read.push({ hwnd: window.hwnd, where: options.where });
+        return observe(window, options);
+      };
+      return opened;
+    },
+  } });
+  t.after(() => workspace.close());
+  assert.equal((await workspace.act({ activate: 'editor' })).status, 'completed');
+  const snapshot = await workspace.observe({ view: 'controls' });
+  const selected = snapshot.controls.find(control => control.name === 'Go' && control.windowScope === 'hwnd:1001:10001');
+  assert.ok(selected?.ref);
+  read.length = 0;
+  const targeted = await workspace.act({ steps: [{ kind: 'click', target: {
+    role: 'Button', name: 'Go', within: selected.windowScope,
+  } }] });
+  assert.equal(targeted.status, 'completed');
+  assert.ok(read.length > 0);
+  assert.ok(read.every(({ hwnd, where }) => hwnd === 10001n && where?.name === 'Go'));
+  read.length = 0;
+  const referenced = await workspace.act({ observationId: snapshot.observationId, steps: [{ kind: 'click', target: { ref: selected.ref } }] });
+  assert.equal(referenced.status, 'completed');
+  assert.ok(read.length > 0 && read.every(({ hwnd }) => hwnd === 10001n));
+  assert.equal(fixture.dispatches.at(-1).target.window.hwnd, 10001n);
+});
+
+test('the authorized Office host advertises focused saving and gates it through approval', async t => {
+  const fixture = makeHostFixture();
+  fixture.setGrants({ version: 1, apps: [{ id: 'editor', name: 'WINWORD' }], allowDesktopCapture: false, allowForegroundInput: true });
+  const { policy: _ignored, ...seams } = fixture.seams;
+  const workspace = await createWindowsProductHost({ authorizationFile: 'ignored-for-seams', test: {
+    ...seams,
+    async transportFactory(context) {
+      const opened = await seams.transportFactory(context);
+      const observe = opened.transport.observeWindow;
+      opened.transport.observeWindow = async (window, options) => {
+        const snapshot = await observe(window, options);
+        return { ...snapshot, elements: snapshot.elements.map(element => element.label === 'Value'
+          ? { ...element, role: 'Document', editable: true, runtimeId: 'document-focused' } : element) };
+      };
+      opened.inspector.readFocused = async target => ({ target, focused: true, runtimeId: 'document-focused', pid: target.pid, hwnd: target.hwnd });
+      return opened;
+    },
+  } });
+  t.after(() => workspace.close());
+  const activation = await workspace.act({ activate: 'editor' });
+  assert.ok(activation.capabilities.some(capability => capability.kind === 'hotkey'));
+  assert.ok((await workspace.observe({ workspace: true })).activeCapabilities.some(capability => capability.kind === 'hotkey'));
+  const target = {
+    name: 'Value', role: 'Document', within: 'hwnd:1001:10001',
+  };
+  const select = await workspace.act({ steps: [{ kind: 'hotkey', keys: ['ctrl', 'a'], target }] });
+  assert.equal(select.status, 'completed');
+  assert.equal(fixture.dispatches.length, 1);
+  const save = await workspace.act({ steps: [{ kind: 'hotkey', keys: ['ctrl', 's'], target }] });
+  assert.equal(save.code, 'approval_required');
+  assert.equal(fixture.dispatches.length, 1);
+  assert.equal((await workspace.resolveApproval(save.requestId, 'approve')).status, 'completed');
+  assert.equal(fixture.dispatches.length, 2);
+});
+
+test('the public control list cap leaves named action grounding available', async t => {
+  const fixture = makeHostFixture();
+  const workspace = await createWindowsProductHost({ authorizationFile: 'ignored-for-seams', test: {
+    ...fixture.seams,
+    async transportFactory(context) {
+      const opened = await fixture.seams.transportFactory(context);
+      const observe = opened.transport.observeWindow;
+      opened.transport.observeWindow = async (window, options) => {
+        const frame = await observe(window, options);
+        const item = frame.elements.find(element => element.label === 'Go');
+        return { ...frame, elements: Array.from({ length: 140 }, (_, index) => ({
+          ...item, index: String(index), label: `Choice ${index}`, token: `${item.token}-${index}`,
+        })) };
+      };
+      return opened;
+    },
+  } });
+  t.after(() => workspace.close());
+  await workspace.act({ activate: 'editor' });
+  const observed = await workspace.observe({ view: 'controls', where: { within: 'hwnd:1001:10001' } });
+  assert.equal(observed.controls.length, 128);
+  assert.equal(observed.complete, false);
+  assert.equal(observed.controls.some(control => control.name === 'Choice 139'), false);
+  const acted = await workspace.act({ steps: [{ kind: 'click', target: { role: 'Button', name: 'Choice 139', within: 'hwnd:1001:10001' } }] });
+  assert.equal(acted.status, 'completed');
+  assert.equal(fixture.dispatches.at(-1).target.control.control.name, 'Choice 139');
+});
+
+for (const refreshGrants of [false, true]) {
+  test(`revoking during a later approval preserves earlier step receipts (refresh ${refreshGrants})`, async t => {
+    const fixture = makeHostFixture();
+    const workspace = await createWindowsProductHost({ authorizationFile: 'ignored-for-seams', test: {
+      ...fixture.seams,
+      policy: ({ step }) => ({ decision: step.kind === 'type' ? 'allow' : 'approve', code: 'fixture_policy' }),
+    } });
+    t.after(() => workspace.close());
+    await workspace.act({ activate: 'editor' });
+    const pending = await workspace.act({ steps: [
+      { kind: 'type', target: { name: 'Value', within: 'hwnd:1001:10001' }, text: 'test draft' },
+      { kind: 'click', target: { name: 'Go', within: 'hwnd:1001:10001' } },
+    ] });
+    assert.equal(pending.code, 'approval_required');
+    assert.deepEqual(pending.steps.map(step => step.status), ['dispatched', 'not_dispatched']);
+    fixture.setGrants({ version: 1, apps: [], allowForegroundInput: false, allowDesktopCapture: false });
+    if (refreshGrants) await workspace.observe({ workspace: true });
+    const denied = await workspace.resolveApproval(pending.requestId, 'approve');
+    assert.equal(denied.code, 'application_automation_blocked');
+    assert.deepEqual(denied.steps.map(step => step.status), ['dispatched', 'not_dispatched']);
+    assert.equal(fixture.dispatches.length, 1);
+  });
+}
+
 test('dynamic grant discovery and same-app window refresh require no host restart', async () => {
   const fixture = makeHostFixture();
   fixture.windows.splice(fixture.windows.findIndex(window => window.id === 'editor-dialog'), 1);
@@ -265,9 +386,10 @@ test('revocation and target identity are rechecked before approval dispatch', as
   await workspace.close();
 });
 
-test('optional Windows OCR uses a fresh guarded desktop capture and preserves approval freshness', async () => {
+test('optional Windows OCR uses only the granted local window capture and preserves approval freshness', async () => {
   const fixture = makeHostFixture();
-  fixture.setGrants({ version: 1, apps: [{ id: 'editor', name: 'Editor' }], allowDesktopCapture: true, allowForegroundInput: false });
+  fixture.setGrants({ version: 1, apps: [{ id: 'editor', name: 'Editor' }], allowDesktopCapture: false,
+    allowLocalWindowEvidence: true, allowForegroundInput: false });
   const runnerCalls = [];
   const runner = {
     async recognize(request) {
@@ -290,6 +412,7 @@ test('optional Windows OCR uses a fresh guarded desktop capture and preserves ap
     test: { ...seams, ocrRunner: runner },
   });
   assert.equal((await workspace.act({ activate: 'editor' })).status, 'completed');
+  await assert.rejects(() => workspace.observe({ view: 'image' }), /image_delivery_not_authorized/u);
   const observation = await workspace.observe({ view: 'controls' });
   const pending = await workspace.act({
     observationId: observation.observationId,
@@ -314,6 +437,7 @@ test('optional Windows OCR uses a fresh guarded desktop capture and preserves ap
   assert.equal(known.status, 'completed', JSON.stringify(known));
   assert.equal(fixture.windowImageCaptures.length, 2);
   assert.equal(runnerCalls.length, 2);
+  assert.equal(fixture.imageCaptures.length, 0);
   await workspace.close();
 });
 
@@ -336,7 +460,7 @@ test('configured extra applications remain discoverable without Windows grants',
   await workspace.close();
 });
 
-test('OCR remains unavailable without the explicit desktop-capture grant', async () => {
+test('OCR remains unavailable without an image or local evidence grant', async () => {
   const fixture = makeHostFixture();
   fixture.setGrants({ version: 1, apps: [{ id: 'editor', name: 'Editor' }], allowDesktopCapture: false, allowForegroundInput: false });
   const runnerCalls = [];

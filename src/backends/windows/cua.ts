@@ -614,6 +614,6 @@ function validKey(key: string): boolean {
 function validHotkey(keys: readonly string[]): boolean {
   if (!Array.isArray(keys) || keys.length < 2 || keys.length > 3 || new Set(keys).size !== keys.length) return false;
   const normalized = keys.map(key => key.toLocaleLowerCase());
-  return (normalized.length === 2 && normalized[0] === "ctrl" && normalized[1] === "s")
+  return (normalized.length === 2 && normalized[0] === "ctrl" && (normalized[1] === "a" || normalized[1] === "s"))
     || (normalized.length === 3 && normalized[0] === "ctrl" && normalized[1] === "shift" && normalized[2] === "s");
 }

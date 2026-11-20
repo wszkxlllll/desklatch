@@ -101,7 +101,7 @@ function nameMatches(control: Control, wanted: string): boolean {
 }
 
 function scopeMatches(control: Control, within: string | undefined): boolean {
-  return within === undefined || (control.within !== undefined && normalize(control.within) === normalize(within));
+  return within === undefined || [control.within, control.windowScope].some(scope => scope !== undefined && normalize(scope) === normalize(within));
 }
 
 function actionMatches(control: Control, kind: ActionKind | undefined): boolean {

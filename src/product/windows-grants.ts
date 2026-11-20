@@ -14,6 +14,8 @@ export interface WindowsProductGrants {
   readonly apps: readonly WindowsProductAppGrant[];
   readonly allowForegroundInput: boolean;
   readonly allowDesktopCapture: boolean;
+  /** Permit OCR from the exact authorized window without delivering pixels to the model. */
+  readonly allowLocalWindowEvidence?: boolean;
 }
 
 export const emptyWindowsProductGrants: WindowsProductGrants = Object.freeze({
@@ -43,7 +45,8 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 export function parseWindowsProductGrants(value: unknown): WindowsProductGrants {
   const data = asRecord(value);
   if (data?.version !== 1 || !Array.isArray(data.apps) ||
-      typeof data.allowForegroundInput !== "boolean" || typeof data.allowDesktopCapture !== "boolean") {
+      typeof data.allowForegroundInput !== "boolean" || typeof data.allowDesktopCapture !== "boolean" ||
+      (data.allowLocalWindowEvidence !== undefined && typeof data.allowLocalWindowEvidence !== "boolean")) {
     throw new Error("windows_authorization_invalid");
   }
   const apps = new Map<string, WindowsProductAppGrant>();
@@ -61,6 +64,7 @@ export function parseWindowsProductGrants(value: unknown): WindowsProductGrants 
     apps: Object.freeze([...apps.values()]),
     allowForegroundInput: data.allowForegroundInput,
     allowDesktopCapture: data.allowDesktopCapture,
+    ...(data.allowLocalWindowEvidence === undefined ? {} : { allowLocalWindowEvidence: data.allowLocalWindowEvidence }),
   });
 }
 

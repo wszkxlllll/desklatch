@@ -17,10 +17,15 @@ export interface ObservationRegistryOptions {
   allowModelDocumentText: boolean;
   grantedAction: (kind: ActionKind) => boolean;
   refsGranted: boolean;
+  maxPublicControls?: number;
 }
 
 const CREDENTIAL_WORDS = /password|passwd|passcode|passphrase|secret|token|credential|authorization|cookie|api[ _-]?key|access[ _-]?key|private[ _-]?key|\bpin\b|\botp\b|cvv|cvc|card[ _-]?number|security[ _-]?code|ssn|密码|密钥|令牌|验证码|安全码|卡号|身份证/iu;
 const SAFE_TEXT = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g;
+
+function publicPriority(control: Control): number {
+  return control.states.includes("focused") ? 2 : control.actions.length > 0 ? 1 : 0;
+}
 
 export function sanitizeText(value: string, limit = 512): string {
   return value.replace(SAFE_TEXT, "").slice(0, limit);
@@ -91,16 +96,17 @@ export class ObservationRegistry {
   }
 
   public publicObservation(stored: StoredObservation, view: View): DeskObservation {
-    const controls: ControlObservation[] = [];
-    let index = 1;
-    for (const control of stored.frame.controls) {
-      controls.push(this.publicControl(control, this.makeRef(stored.observationId, index)));
-      index += 1;
+    const limit = this.options.maxPublicControls ?? stored.frame.controls.length;
+    const entries = [...stored.refs];
+    if (entries.length > limit) {
+      entries.sort(([, left], [, right]) => publicPriority(right) - publicPriority(left));
+      for (const [ref] of entries.slice(limit)) stored.refs.delete(ref);
     }
+    const controls = entries.slice(0, limit).map(([ref, control]) => this.publicControl(control, ref));
     const result: DeskObservation = {
       observationId: stored.observationId,
       view,
-      complete: stored.frame.complete,
+      complete: stored.frame.complete && controls.length === stored.frame.controls.length,
       controls,
     };
     if ((view === "image" || view === "both") && this.options.allowModelImages && stored.frame.image) result.image = stored.frame.image;
@@ -122,6 +128,7 @@ export class ObservationRegistry {
       }
     }
     if (control.name !== undefined) result.name = sanitizeText(control.name, 512);
+    if (control.windowScope !== undefined) result.windowScope = sanitizeText(control.windowScope, 128);
     if (control.rect) result.rect = { x: control.rect.x, y: control.rect.y, width: control.rect.width, height: control.rect.height };
     if (control.effect !== undefined) result.effect = control.effect;
     return result;
@@ -136,6 +143,7 @@ export class ObservationRegistry {
       actions: control.actions.filter(this.options.grantedAction),
     };
     if (control.name !== undefined) result.name = sanitizeText(control.name, 512);
+    if (control.windowScope !== undefined) result.windowScope = sanitizeText(control.windowScope, 128);
     if (control.rect) result.rect = { x: control.rect.x, y: control.rect.y, width: control.rect.width, height: control.rect.height };
     if (control.labels && control.labels.length > 0) result.labels = control.labels.map((label) => sanitizeText(label, 256));
     if (control.effect !== undefined) result.effect = control.effect;

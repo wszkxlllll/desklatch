@@ -1,4 +1,5 @@
 $ErrorActionPreference = "Stop"
+$SelectorMatchLimit = 8
 
 # This helper is a fixed, packaged worker. It accepts one bounded UTF-8 JSON
 # request and emits one bounded UTF-8 JSON reply. It never receives captions,
@@ -87,6 +88,36 @@ function RequestHwnd([object] $request) {
   }
   if ($value -le 0) { throw "invalid_window_identity" }
   return [IntPtr]$value
+}
+
+function NormalizeMatchText([string] $value) {
+  if ($null -eq $value) { return "" }
+  try { $normalized = $value.Normalize([Text.NormalizationForm]::FormKC) } catch { $normalized = $value }
+  return (($normalized.ToLowerInvariant() -replace "\s+", " ").Trim())
+}
+
+function SelectorFor([object] $request) {
+  if ($null -eq $request.where) { return $null }
+  $where = $request.where
+  $role = [string]$where.role
+  $name = [string]$where.name
+  # within is owned by the host's window router; state/aliases are not part of
+  # this worker's exact selector protocol. Never reinterpret them locally.
+  if ([string]::IsNullOrWhiteSpace($role) -or [string]::IsNullOrWhiteSpace($name) -or $null -ne $where.within -or $null -ne $where.state) {
+    throw "native_uia_selector_noncanonical"
+  }
+  if ($role.Length -gt 256 -or $name.Length -gt 4096) { throw "native_uia_selector_invalid" }
+  return [ordered]@{ role = $role; name = $name }
+}
+
+function SelectorMatches([object] $element, [object] $selector) {
+  if ($null -eq $selector) { return $true }
+  $role = NormalizeMatchText ([string]$element.role)
+  $wantedRole = NormalizeMatchText ([string]$selector.role)
+  if ($role -in @("edit", "input", "textfield")) { $role = "textbox" }
+  if ($wantedRole -in @("edit", "input", "textfield")) { $wantedRole = "textbox" }
+  $name = NormalizeMatchText ([string]$element.label)
+  return $role -ceq $wantedRole -and $name -ceq (NormalizeMatchText ([string]$selector.name))
 }
 
 function ElementIdentity([System.Windows.Automation.AutomationElement] $element) {
@@ -246,6 +277,9 @@ function ElementRecord(
     role = $role
     actions = $actions
   }
+  # A provider failure must never be mistaken for a complete selector walk.
+  # Unknown role or missing RuntimeId is conservative evidence of that failure.
+  if ($role -eq "Unknown" -or [string]::IsNullOrEmpty((ElementIdentity $element))) { $record.provider_error = $true }
   if (-not [string]::IsNullOrEmpty($parent)) { $record.parent_index = $parent }
   try {
     if ([bool]$element.Current.IsEnabled) { $record.enabled = $true } else { $record.enabled = $false }
@@ -293,14 +327,18 @@ function WalkElements(
   $queue.Enqueue([pscustomobject]@{ element = $root; depth = 0; parent = "" })
   $elements = New-Object System.Collections.Generic.List[object]
   $complete = $true
+  $examined = 1
   while ($queue.Count -gt 0) {
     if ($elements.Count -ge $maxElements) { $complete = $false; break }
     $entry = $queue.Dequeue()
     $item = ElementRecord $entry.element $elements.Count $entry.depth $entry.parent $processId $hwnd $rootIdentity
+    if ($item.provider_error -eq $true) { $complete = $false }
     [void]$elements.Add($item)
     $child = $null
     try { $child = $walker.GetFirstChild($entry.element) } catch { $complete = $false; $child = $null }
     while ($null -ne $child) {
+      if ($examined -ge $maxElements) { $complete = $false; break }
+      $examined++
       $owned = $false
       try { $owned = OwnedByTarget $child $hwnd } catch { $complete = $false }
       if ($owned) {
@@ -308,6 +346,7 @@ function WalkElements(
           # Probe the first omitted owned descendant so bounded depth is never
           # reported as a complete UIA document.
           $complete = $false
+          break
         } elseif ($queue.Count + $elements.Count -ge $maxElements) {
           $complete = $false
           break
@@ -329,6 +368,7 @@ function WalkElements(
         $item.element_token = TokenFor $processId $hwnd $rootIdentity ([string]$decoded.element) ([string]$decoded.role) $contextToken
       }
     }
+    if ($null -ne $item.PSObject.Properties["provider_error"]) { $item.PSObject.Properties.Remove("provider_error") }
   }
   return [pscustomobject]@{ elements = $elementArray; complete = $complete; approval_context_token = $contextToken }
 }
@@ -340,18 +380,40 @@ function Observe([object] $request) {
   $maxDepth = 32
   if ($null -ne $request.max_elements) { $maxElements = [Math]::Min(512, [Math]::Max(1, [int]$request.max_elements)) }
   if ($null -ne $request.max_depth) { $maxDepth = [Math]::Min(32, [Math]::Max(1, [int]$request.max_depth)) }
+  $selector = SelectorFor $request
   $root = RootFor $processId $hwnd
   $rootIdentity = ElementIdentity $root
   if ([string]::IsNullOrEmpty($rootIdentity)) { throw "native_uia_identity_unavailable" }
   $walk = WalkElements $root $processId $hwnd $maxElements $maxDepth $rootIdentity
+  $returnedElements = @($walk.elements)
+  $selectorMatchCount = $null
+  $selectorTooMany = $false
+  if ($null -ne $selector) {
+    $matches = @($walk.elements | Where-Object { SelectorMatches $_ $selector })
+    $selectorMatchCount = $matches.Count
+    if ($matches.Count -gt $SelectorMatchLimit) {
+      $selectorTooMany = $true
+      $returnedElements = @($matches | Select-Object -First $SelectorMatchLimit)
+    } else {
+      $returnedElements = $matches
+    }
+  }
+  $complete = [bool]$walk.complete
+  # The runtime checks uniqueness against the complete candidate list.
+  # Truncation, depth limits and provider errors leave completeness false.
+  if ($selectorTooMany) { $complete = $false }
   $reply = [ordered]@{
     ok = $true
     pid = $processId
     window_id = $hwnd.ToInt64().ToString([Globalization.CultureInfo]::InvariantCulture)
     snapshot_id = [Guid]::NewGuid().ToString("N")
     root_identity = $rootIdentity
-    elements = $walk.elements
-    elements_complete = $walk.complete
+    elements = $returnedElements
+    elements_complete = $complete
+  }
+  if ($null -ne $selector) {
+    $reply.selector_match_count = $selectorMatchCount
+    $reply.selector_bounded = $true
   }
   try {
     $title = [string]$root.Current.Name
@@ -436,6 +498,7 @@ function FindByIdentity(
   $queue = New-Object System.Collections.Generic.Queue[object]
   $queue.Enqueue([pscustomobject]@{ element = $root; depth = 0 })
   $count = 0
+  $examined = 1
   while ($queue.Count -gt 0 -and $count -lt $maxElements) {
     $entry = $queue.Dequeue()
     $count++
@@ -445,7 +508,8 @@ function FindByIdentity(
     $child = $null
     try { $child = $walker.GetFirstChild($entry.element) } catch { $child = $null }
     while ($null -ne $child) {
-      if ($queue.Count + $count -ge $maxElements) { break }
+      if ($examined -ge $maxElements) { break }
+      $examined++
       if (OwnedByTarget $child $hwnd) {
         $queue.Enqueue([pscustomobject]@{ element = $child; depth = $entry.depth + 1 })
       }
