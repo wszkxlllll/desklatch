@@ -1,6 +1,8 @@
 import type { ActResult, ApprovalDecision, ApprovalResolution, DeskSession } from "./core/session-types.js";
 import type { Capability } from "./contracts.js";
 import { actToolSchema } from "./request.js";
+import { addReuseActSchema, reuseQuerySchema } from "./reuse-tools.js";
+import type { DiscoverableStepReuse } from "./reuse-tools.js";
 import { createDeskTools, observeInputSchema, type ToolEndpoint } from "./tools.js";
 
 export interface WorkspaceApplicationInfo {
@@ -38,6 +40,8 @@ export interface WorkspaceApplication {
   readonly verifyFront?: WorkspaceFrontVerifier;
   /** Optional browser adapter; its own URL allowlist remains authoritative. */
   readonly navigate?: WorkspaceNavigator;
+  /** Optional host-owned pair for discovering and replaying verified steps. */
+  readonly stepReuse?: DiscoverableStepReuse;
 }
 
 export interface WorkspaceOpenedApplication {
@@ -45,6 +49,8 @@ export interface WorkspaceOpenedApplication {
   readonly activate?: WorkspaceActivator;
   readonly verifyFront?: WorkspaceFrontVerifier;
   readonly navigate?: WorkspaceNavigator;
+  /** Optional host-owned pair for discovering and replaying verified steps. */
+  readonly stepReuse?: DiscoverableStepReuse;
 }
 
 export interface OnDemandWorkspaceApplication {
@@ -55,6 +61,8 @@ export interface OnDemandWorkspaceApplication {
   readonly allowModelDocumentText?: boolean;
   readonly allowModelImages?: boolean;
   readonly allowNavigation?: boolean;
+  /** Advertise step-reuse fields before the application is opened. */
+  readonly allowStepReuse?: boolean;
   readonly open: (signal?: AbortSignal) => WorkspaceApplication | WorkspaceOpenedApplication | Promise<WorkspaceApplication | WorkspaceOpenedApplication>;
 }
 
@@ -70,6 +78,8 @@ export interface WorkspaceOptions {
   readonly applications?: readonly WorkspaceApplicationEntry[];
   readonly initialActive?: string | WorkspaceApplicationEntry | null;
   readonly discover?: WorkspaceDiscovery;
+  /** Host-owned user preference for whether an enrolled app/window may be automated. */
+  readonly canAutomate?: (application: WorkspaceApplicationInfo) => boolean;
 }
 
 export interface WorkspaceObservation {
@@ -101,6 +111,8 @@ interface ObservationBinding {
   readonly activation: number;
 }
 
+const MAX_REUSE_REFS = 1024;
+
 interface ApprovalBinding {
   readonly applicationId: string;
   readonly activation: number;
@@ -125,6 +137,10 @@ function hasOwn(value: AnyRecord, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(value, key);
 }
 
+function cloneSchema(value: AnyRecord): AnyRecord {
+  return JSON.parse(JSON.stringify(value)) as AnyRecord;
+}
+
 function validId(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0 && value.length <= 256;
 }
@@ -143,6 +159,18 @@ function isOnDemandApplication(value: WorkspaceApplicationEntry): value is OnDem
   return isRecord(value) && !hasOwn(value, "session") && Array.isArray(value.capabilities) && typeof value.open === "function";
 }
 
+function isValidStepReuse(value: unknown, session: DeskSession): value is DiscoverableStepReuse {
+  if (!isRecord(value) || value.session !== session || typeof value.close !== "function" || !Array.isArray(value.tools)) return false;
+  if (value.tools.length !== 2) return false;
+  const names = value.tools.map((tool) => isRecord(tool) && typeof tool.name === "string" ? tool.name : undefined);
+  if (!(names.includes("observe") && names.includes("act"))) return false;
+  return value.tools.every((tool) => isRecord(tool)
+    && typeof tool.name === "string"
+    && typeof tool.description === "string"
+    && isRecord(tool.inputSchema)
+    && typeof tool.invoke === "function");
+}
+
 function normalizeApplication(application: WorkspaceApplication): WorkspaceApplication {
   if (!isRecord(application) || !validId(application.id)
     || typeof application.name !== "string" || !application.name.trim()) {
@@ -151,6 +179,9 @@ function normalizeApplication(application: WorkspaceApplication): WorkspaceAppli
   if (!application.session || typeof application.session.observe !== "function"
     || typeof application.session.act !== "function" || typeof application.session.close !== "function") {
     throw new TypeError("invalid_workspace_session");
+  }
+  if (application.stepReuse !== undefined && !isValidStepReuse(application.stepReuse, application.session)) {
+    throw new TypeError("invalid_workspace_step_reuse");
   }
   return application;
 }
@@ -172,6 +203,7 @@ function normalizeOnDemandApplication(application: OnDemandWorkspaceApplication)
     ...(application.allowModelDocumentText === undefined ? {} : { allowModelDocumentText: application.allowModelDocumentText === true }),
     ...(application.allowModelImages === undefined ? {} : { allowModelImages: application.allowModelImages === true }),
     ...(application.allowNavigation === undefined ? {} : { allowNavigation: application.allowNavigation === true }),
+    ...(application.allowStepReuse === undefined ? {} : { allowStepReuse: application.allowStepReuse === true }),
     open: application.open,
   });
   normalizedOnDemand.set(application, normalized);
@@ -183,6 +215,7 @@ function sameOnDemandDeclaration(left: OnDemandWorkspaceApplication, right: OnDe
     && left.allowModelDocumentText === right.allowModelDocumentText
     && left.allowModelImages === right.allowModelImages
     && left.allowNavigation === right.allowNavigation
+    && left.allowStepReuse === right.allowStepReuse
     && JSON.stringify(left.capabilities) === JSON.stringify(right.capabilities);
 }
 
@@ -275,8 +308,10 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
   const applications = new Map<string, WorkspaceApplication>();
   const sessionTools = new Map<string, readonly ToolEndpoint[]>();
   const observations = new Map<string, ObservationBinding>();
+  const reuseRefs = new Map<string, ObservationBinding>();
   const approvals = new Map<string, ApprovalBinding>();
   const approvalResults = new Map<string, ApprovalResolution>();
+  const closedStepReuses = new WeakSet<object>();
   let activeId: string | null = null;
   let activation = 0;
   let closed = false;
@@ -368,6 +403,24 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
   activeId = seedId(options.initialActive);
   if (activeId !== null) activation = 1;
 
+  function canAutomateEntry(entry: WorkspaceApplicationEntry | undefined): boolean {
+    if (!entry || !options.canAutomate) return entry !== undefined;
+    try {
+      return options.canAutomate(infoFor(entry)) === true;
+    } catch {
+      return false;
+    }
+  }
+
+  function publicActiveId(): string | null {
+    if (!activeId || !canAutomateEntry(entries.get(activeId))) return null;
+    return activeId;
+  }
+
+  function visibleEntries(): readonly WorkspaceApplicationEntry[] {
+    return [...entries.values()].filter((entry) => canAutomateEntry(entry));
+  }
+
   async function discover(signal?: AbortSignal): Promise<void> {
     if (!options.discover) return;
     if (discoveryInFlight) return discoveryInFlight;
@@ -385,6 +438,7 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
 
   function invalidateObservations(): void {
     observations.clear();
+    reuseRefs.clear();
   }
 
   function operationStop(record: OperationRecord, input?: unknown, active: string | null = activeId): WorkspaceActResult | undefined {
@@ -394,6 +448,17 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
 
   function current(): WorkspaceApplication | undefined {
     return activeId === null ? undefined : applications.get(activeId);
+  }
+
+  async function closeStepReuse(value: DiscoverableStepReuse | undefined): Promise<void> {
+    if (!value || typeof value !== "object" || closedStepReuses.has(value)) return;
+    closedStepReuses.add(value);
+    await value.close().catch(() => undefined);
+  }
+
+  async function closeApplication(value: WorkspaceApplication): Promise<void> {
+    if (value.stepReuse) await closeStepReuse(value.stepReuse);
+    else await value.session.close().catch(() => undefined);
   }
 
   async function materialize(entry: OnDemandWorkspaceApplication, signal: AbortSignal, record: OperationRecord): Promise<WorkspaceApplication> {
@@ -409,17 +474,21 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
         ...(typeof opened.activate === "function" ? { activate: opened.activate.bind(opened) } : {}),
         ...(typeof opened.verifyFront === "function" ? { verifyFront: opened.verifyFront.bind(opened) } : {}),
         ...(entry.allowNavigation === true && typeof opened.navigate === "function" ? { navigate: opened.navigate.bind(opened) } : {}),
+        ...(entry.allowStepReuse === true && hasOwn(opened, "stepReuse") ? { stepReuse: opened.stepReuse } : {}),
       } : undefined;
     let application: WorkspaceApplication;
     try {
       if (!candidate || candidate.id !== entry.id) throw new TypeError("invalid_on_demand_open_result");
       application = normalizeApplication(candidate);
     } catch (error) {
+      if (candidate?.stepReuse && isRecord(candidate.stepReuse) && typeof candidate.stepReuse.close === "function") {
+        await (candidate.stepReuse.close as () => Promise<void>)().catch(() => undefined);
+      }
       if (candidate?.session) await candidate.session.close().catch(() => undefined);
       throw error;
     }
     if (operationStop(record)) {
-      await application.session.close().catch(() => undefined);
+      await closeApplication(application);
       return application;
     }
     applications.set(entry.id, application);
@@ -437,6 +506,17 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
       }
     }
     for (const id of ids) observations.set(id, { applicationId, activation });
+    if (Array.isArray(value.reuseCandidates)) {
+      for (const candidate of value.reuseCandidates) {
+        if (!isRecord(candidate) || typeof candidate.ref !== "string" || candidate.ref.trim().length === 0) continue;
+        reuseRefs.set(candidate.ref, { applicationId, activation });
+      }
+      while (reuseRefs.size > MAX_REUSE_REFS) {
+        const oldest = reuseRefs.keys().next().value;
+        if (typeof oldest !== "string") break;
+        reuseRefs.delete(oldest);
+      }
+    }
   }
 
   function isStaleObservation(input: unknown, appId: string): boolean {
@@ -445,15 +525,25 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     return !binding || binding.applicationId !== appId || binding.activation !== activation;
   }
 
+  function isStaleReuse(input: unknown, appId: string): boolean {
+    if (!isRecord(input) || !isRecord(input.reuse) || typeof input.reuse.ref !== "string") return false;
+    const binding = reuseRefs.get(input.reuse.ref);
+    return !binding || binding.applicationId !== appId || binding.activation !== activation;
+  }
+
   function deskTools(application: WorkspaceApplication): readonly ToolEndpoint[] {
     const cached = sessionTools.get(application.id);
     if (cached) return cached;
-    const tools = Object.freeze(createDeskTools(application.session));
+    const stepReuse = application.stepReuse;
+    if (stepReuse !== undefined && !isValidStepReuse(stepReuse, application.session)) {
+      throw new TypeError("invalid_workspace_step_reuse");
+    }
+    const tools = Object.freeze(stepReuse ? [...stepReuse.tools] : createDeskTools(application.session));
     sessionTools.set(application.id, tools);
     return tools;
   }
 
-  function findTool(application: WorkspaceApplication, name: "observe" | "act"): ToolEndpoint | undefined {
+  function findTool(application: WorkspaceApplication, name: string): ToolEndpoint | undefined {
     return deskTools(application).find((tool) => tool.name === name);
   }
 
@@ -461,6 +551,10 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     if (closed) return stopped("closed", undefined, null);
     const application = current();
     if (!application) return stopped("no_active_application");
+    if (!canAutomateEntry(entries.get(application.id))) return stopped("application_automation_blocked", undefined, null);
+    if (isRecord(input) && hasOwn(input, "reuseQuery") && !application.stepReuse) {
+      return stopped("reuse_unsupported", input, application.id);
+    }
     const tool = findTool(application, "observe");
     if (!tool) return stopped("observe_unsupported", undefined, application.id);
     const result = await tool.invoke(input, signal);
@@ -472,12 +566,21 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
 
   async function dispatchAct(input: unknown, signal: AbortSignal, record: OperationRecord): Promise<unknown> {
     if (closed) return stopped("closed", input, null);
-    if (isRecord(input) && typeof input.observationId === "string" && isStaleObservation(input, activeId ?? "")) {
+    if (!options.canAutomate && isRecord(input) && typeof input.observationId === "string"
+      && isStaleObservation(input, activeId ?? "")) {
       return stopped("stale_observation", input, activeId);
     }
     const application = current();
     if (!application) return stopped("no_active_application", input);
-    if (isStaleObservation(input, application.id)) return stopped("stale_observation", input, application.id);
+    if (!canAutomateEntry(entries.get(application.id))) return stopped("application_automation_blocked", input, null);
+    if (isRecord(input) && hasOwn(input, "reuseQuery")) return rejected("invalid_workspace_act", input);
+    if (isRecord(input) && hasOwn(input, "reuse")) {
+      if (!application.stepReuse) return stopped("reuse_unsupported", input, application.id);
+      if (isStaleReuse(input, application.id)) return stopped("stale_reuse", input, application.id);
+    }
+    if (isRecord(input) && typeof input.observationId === "string" && isStaleObservation(input, application.id)) {
+      return stopped("stale_observation", input, application.id);
+    }
     const tool = findTool(application, "act");
     if (!tool) return stopped("act_unsupported", input, application.id);
     const result = await tool.invoke(input, signal);
@@ -513,14 +616,15 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
       try {
         await discover(signal);
       } catch {
-        return stopped("discovery_failed", undefined, activeId);
+        return stopped("discovery_failed", undefined, publicActiveId());
       }
       const duringDiscovery = operationStop(record);
       if (duringDiscovery) return duringDiscovery;
     }
-    if (closed) return stopped("closed", undefined, activeId);
+    if (closed) return stopped("closed", undefined, null);
     const entry = entries.get(id);
-    if (!entry) return stopped("application_not_found", undefined, activeId);
+    if (!entry) return stopped("application_not_found", undefined, publicActiveId());
+    if (!canAutomateEntry(entry)) return stopped("application_automation_blocked", undefined, publicActiveId());
     const priorBeforeOpen = current();
     let application = applications.get(id);
     if (!application && isOnDemandApplication(entry)) {
@@ -534,7 +638,7 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
           return { ...interrupted, active: null };
         }
         await retainPreviousOrClear(priorBeforeOpen, signal);
-        return stopped(hostCode(error, "activation_failed"), undefined, activeId);
+        return stopped(hostCode(error, "activation_failed"), undefined, publicActiveId());
       }
       const interrupted = operationStop(record);
       if (interrupted) {
@@ -543,18 +647,27 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
         return { ...interrupted, active: null };
       }
     }
-    if (!application) return stopped("activation_unsupported", undefined, activeId);
+    if (!application) return stopped("activation_unsupported", undefined, publicActiveId());
+    if (!canAutomateEntry(entry)) {
+      if (isOnDemandApplication(entry) && applications.get(id) === application) {
+        applications.delete(id);
+        sessionTools.delete(id);
+        await closeApplication(application);
+      }
+      await retainPreviousOrClear(priorBeforeOpen, signal);
+      return stopped("application_automation_blocked", undefined, publicActiveId());
+    }
     if (isOnDemandApplication(entry) && !application.verifyFront) {
       applications.delete(id);
       sessionTools.delete(id);
-      await application.session.close().catch(() => undefined);
+      await closeApplication(application);
       await retainPreviousOrClear(priorBeforeOpen, signal);
       const interrupted = operationStop(record);
       if (interrupted) {
         activeId = null;
         return { ...interrupted, active: null };
       }
-      return stopped("activation_unverified", undefined, activeId);
+      return stopped("activation_unverified", undefined, publicActiveId());
     }
     if (activeId === id) {
       if (!application.verifyFront) return completed("already_active", id);
@@ -562,7 +675,10 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
         const verified = await application.verifyFront({ application: infoFor(application), signal });
         const interrupted = operationStop(record);
         if (interrupted) return interrupted;
-        if (verified === true) return completed("already_active", id);
+        if (verified === true) {
+          if (!canAutomateEntry(entry)) return stopped("application_automation_blocked", undefined, null);
+          return completed("already_active", id);
+        }
       } catch {
         // Treat an unsuccessful probe as loss of physical focus below.
       }
@@ -571,7 +687,7 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
       activation += 1;
       return stopped("activation_not_verified", undefined, null);
     }
-    if (signal?.aborted) return stopped("cancelled", undefined, activeId);
+    if (signal?.aborted) return stopped("cancelled", undefined, publicActiveId());
     const prior = current();
     const context: WorkspaceActivationContext = Object.freeze({
       application: infoFor(application),
@@ -586,12 +702,12 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
         invalidateObservations();
         return { ...interrupted, active: null };
       }
-      return stopped(code, undefined, activeId);
+      return stopped(code, undefined, publicActiveId());
     };
     invalidateObservations();
     activation += 1;
     if ((!application.activate && !isOnDemandApplication(entry)) || !application.verifyFront) {
-      return stopped("activation_unsupported", undefined, activeId);
+      return stopped("activation_unsupported", undefined, publicActiveId());
     }
     try {
       const activated = application.activate ? await application.activate(context) : undefined;
@@ -601,6 +717,7 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
         invalidateObservations();
         return { ...interrupted, active: null };
       }
+      if (!canAutomateEntry(entry)) return failedActivation("application_automation_blocked");
       if (activated === false) {
         return failedActivation("activation_failed");
       }
@@ -609,7 +726,7 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
       }
       if (signal.aborted) {
         await retainPreviousOrClear(prior, signal);
-        return stopped("cancelled", undefined, activeId);
+        return stopped("cancelled", undefined, publicActiveId());
       }
       const verified = await application.verifyFront(context);
       const duringVerify = operationStop(record);
@@ -621,6 +738,7 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
       if (verified !== true) {
         return failedActivation("activation_not_verified");
       }
+      if (!canAutomateEntry(entry)) return failedActivation("application_automation_blocked");
       const afterVerify = operationStop(record);
       if (afterVerify) {
         activeId = null;
@@ -644,6 +762,7 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     if (closed) return stopped("closed", undefined, null);
     const application = current();
     if (!application) return stopped("no_active_application");
+    if (!canAutomateEntry(entries.get(application.id))) return stopped("application_automation_blocked", undefined, null);
     if (!isAbsoluteHttpUrl(contextUrl)) return rejected("invalid_navigation_url");
     if (!application.navigate) return stopped("navigation_unsupported", undefined, application.id);
     if (signal?.aborted) return stopped("cancelled", undefined, application.id);
@@ -656,11 +775,12 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     try {
       const result = await application.navigate(context);
       const interrupted = operationStop(record, undefined, application.id);
+      if (!canAutomateEntry(entries.get(application.id))) return stopped("application_automation_blocked", undefined, null);
       return interrupted ?? callbackResult(result, application.id);
     } catch (error) {
       const interrupted = operationStop(record, undefined, null);
       if (interrupted) return interrupted;
-      return stopped(hostCode(error, "navigation_failed"), undefined, application.id);
+      return stopped(hostCode(error, "navigation_failed"), undefined, publicActiveId());
     }
   }
 
@@ -672,7 +792,9 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
 
   async function invokeObserve(input: unknown, signal?: AbortSignal): Promise<unknown> {
     if (isRecord(input) && input.workspace === true) {
-      if (Object.keys(input).some((key) => key !== "workspace")) throw new Error("invalid_workspace_observe");
+      const wantsReuse = hasOwn(input, "reuseQuery");
+      if (Object.keys(input).some((key) => key !== "workspace" && key !== "reuseQuery" && !(wantsReuse && key === "where"))
+        || (wantsReuse && !advertisesStepReuse())) throw new Error("invalid_workspace_observe");
       return enqueue(async (operationSignal, _generation, record) => {
         if (closed) return stopped("closed", undefined, null);
         try {
@@ -680,19 +802,26 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
         } catch {
           const interrupted = operationStop(record);
           if (interrupted) return interrupted;
-          return stopped("discovery_failed", undefined, activeId);
+          return stopped("discovery_failed", undefined, publicActiveId());
         }
         const interrupted = operationStop(record);
         if (interrupted) return interrupted;
-        return {
-          active: activeId,
-          applications: Object.freeze([...entries.values()].map(infoFor)),
+        const inventory = {
+          active: publicActiveId(),
+          applications: Object.freeze(visibleEntries().map(infoFor)),
         } satisfies WorkspaceObservation;
-      }, (record) => stopped(operationCode(record), undefined, activeId), signal);
+        if (wantsReuse && inventory.active !== null && current()?.stepReuse) {
+          const observation = await dispatchObserve(ordinaryObserveInput(input), operationSignal, record);
+          return isRecord(observation) && typeof observation.observationId === "string"
+            ? { ...observation, ...inventory }
+            : observation;
+        }
+        return inventory;
+      }, (record) => stopped(operationCode(record), undefined, publicActiveId()), signal);
     }
     return enqueue(
       (operationSignal, _generation, record) => dispatchObserve(ordinaryObserveInput(input), operationSignal, record),
-      (record) => stopped(operationCode(record), undefined, activeId),
+      (record) => stopped(operationCode(record), undefined, publicActiveId()),
       signal,
     );
   }
@@ -702,7 +831,7 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
       if (Object.keys(input).length !== 1 || typeof input.activate !== "string") return rejected("invalid_workspace_act", input);
       return enqueue(
         (operationSignal, generation, record) => activate(input.activate as string, operationSignal, generation, record),
-        (record) => stopped(operationCode(record), undefined, activeId),
+      (record) => stopped(operationCode(record), undefined, publicActiveId()),
         signal,
       );
     }
@@ -710,13 +839,13 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
       if (Object.keys(input).length !== 1 || typeof input.navigate !== "string") return rejected("invalid_workspace_act", input);
       return enqueue(
         (operationSignal, generation, record) => navigate(input.navigate as string, operationSignal, generation, record),
-        (record) => stopped(operationCode(record), undefined, activeId),
+      (record) => stopped(operationCode(record), undefined, publicActiveId()),
         signal,
       );
     }
     return enqueue(
       (operationSignal, _generation, record) => dispatchAct(input, operationSignal, record),
-      (record) => stopped(operationCode(record), input, activeId),
+      (record) => stopped(operationCode(record), input, publicActiveId()),
       signal,
     );
   }
@@ -749,16 +878,24 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     return options.discover !== undefined || [...entries.values()].some((entry) => isOnDemandApplication(entry) ? entry.allowNavigation === true : Boolean(entry.navigate));
   }
 
+  function advertisesStepReuse(): boolean {
+    return [...entries.values()].some((entry) => isOnDemandApplication(entry) ? entry.allowStepReuse === true : entry.stepReuse !== undefined);
+  }
+
   function observeSchema(): AnyRecord {
     const bases = [...entries.values()]
       .map((entry) => isOnDemandApplication(entry) ? staticObserveSchema(entry) : findTool(entry, "observe")?.inputSchema)
       .filter((value): value is AnyRecord => isRecord(value));
+    const reuseEnabled = advertisesStepReuse();
     const base = bases[0];
     if (!isRecord(base)) {
       return {
         type: "object",
         additionalProperties: false,
-        properties: { workspace: { type: "boolean" } },
+        properties: {
+          workspace: { type: "boolean" },
+          ...(reuseEnabled ? { reuseQuery: cloneSchema(reuseQuerySchema) } : {}),
+        },
         oneOf: [
           { required: ["workspace"], properties: { workspace: { const: true } } },
           { properties: { workspace: { const: false } } },
@@ -775,21 +912,26 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
       .map((schema) => isRecord(schema.properties) && isRecord(schema.properties.read) ? schema.properties.read : undefined)
       .find((value): value is AnyRecord => isRecord(value));
     if (readSchema && !isRecord(properties.read)) properties.read = readSchema;
+    if (reuseEnabled) properties.reuseQuery = cloneSchema(reuseQuerySchema);
     return {
       ...base,
       additionalProperties: false,
       properties: { ...properties, workspace: { type: "boolean" } },
       oneOf: [
-        { required: ["workspace"], properties: { workspace: { const: true } }, not: { anyOf: [{ required: ["view"] }, { required: ["where"] }, { required: ["read"] }] } },
+        { required: ["workspace"], properties: { workspace: { const: true } }, not: { anyOf: [
+          { required: ["view"] }, { required: ["read"] }, { required: ["where"], not: { required: ["reuseQuery"] } },
+        ] } },
         { properties: { workspace: { const: false } } },
       ],
     };
   }
 
   function actSchema(): AnyRecord {
-    const base = actToolSchema(enrolledCapabilities(), enrolledLimits());
+    let base = actToolSchema(enrolledCapabilities(), enrolledLimits());
     const activation = advertisesActivation();
     const navigation = advertisesNavigation();
+    const reuseEnabled = advertisesStepReuse();
+    if (reuseEnabled && isRecord(base)) base = addReuseActSchema(base);
     if (!isRecord(base)) {
       const properties: AnyRecord = { steps: { type: "array" } };
       const branches: AnyRecord[] = [{ required: ["steps"] }];
@@ -801,33 +943,37 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
         properties.navigate = { type: "string", format: "uri" };
         branches.unshift({ required: ["navigate"] });
       }
-      return {
+      let schema: AnyRecord = {
         type: "object",
         additionalProperties: false,
         properties,
         oneOf: branches,
       };
+      return schema;
     }
     const { required: _required, if: baseIf, then: baseThen, ...withoutRequired } = base;
     const properties = isRecord(base.properties) ? base.properties : {};
     const regularRequired = Array.isArray(base.required) && base.required.length > 0 ? base.required : ["steps"];
     const guardedIf = isRecord(baseIf)
-      ? { ...baseIf, required: Array.isArray(baseIf.required) ? [...baseIf.required, "steps"] : ["steps"] }
+      ? { ...baseIf, required: Array.isArray(baseIf.required) ? [...new Set([...baseIf.required, "steps"])] : ["steps"] }
       : undefined;
     const propertiesWithWorkspace: AnyRecord = { ...properties };
     if (activation) propertiesWithWorkspace.activate = { type: "string", minLength: 1 };
     if (navigation) propertiesWithWorkspace.navigate = { type: "string", format: "uri" };
     const workspaceBranches: AnyRecord[] = [];
-    if (activation) workspaceBranches.push({ required: ["activate"], not: { anyOf: [{ required: ["navigate"] }, { required: ["steps"] }, { required: ["observationId"] }] } });
-    if (navigation) workspaceBranches.push({ required: ["navigate"], not: { anyOf: [{ required: ["activate"] }, { required: ["steps"] }, { required: ["observationId"] }] } });
-    workspaceBranches.push({ required: regularRequired, not: { anyOf: [{ required: ["activate"] }, { required: ["navigate"] }] } });
-    return {
+    const reuseNot = reuseEnabled ? [{ required: ["reuse"] }] : [];
+    if (activation) workspaceBranches.push({ required: ["activate"], not: { anyOf: [{ required: ["navigate"] }, { required: ["steps"] }, { required: ["observationId"] }, ...reuseNot] } });
+    if (navigation) workspaceBranches.push({ required: ["navigate"], not: { anyOf: [{ required: ["activate"] }, { required: ["steps"] }, { required: ["observationId"] }, ...reuseNot] } });
+    workspaceBranches.push({ required: regularRequired, not: { anyOf: [{ required: ["activate"] }, { required: ["navigate"] }, ...reuseNot] } });
+    if (reuseEnabled) workspaceBranches.push({ required: ["reuse"], not: { anyOf: [{ required: ["activate"] }, { required: ["navigate"] }, { required: ["steps"] }, { required: ["observationId"] }] } });
+    const schema: AnyRecord = {
       ...withoutRequired,
       additionalProperties: false,
       properties: propertiesWithWorkspace,
       ...(guardedIf && baseThen ? { if: guardedIf, then: baseThen } : {}),
       oneOf: workspaceBranches,
     };
+    return schema;
   }
 
   function staticObserveSchema(application: OnDemandWorkspaceApplication): AnyRecord {
@@ -841,8 +987,10 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
         const documents = [...entries.values()].some((entry) => isOnDemandApplication(entry)
           ? entry.allowModelDocumentText === true
           : entry.session.allowModelDocumentText === true);
+        const reuse = advertisesStepReuse();
         return "Use {workspace:true} to discover available owned applications and the actual active application; otherwise observe the active application's controls."
-          + (documents ? ' When the active browser grants rendered text, start with {"read":"document"}, find a literal keyword with {"read":{"query":"..."}}, or pass the returned document.nextCursor as {"read":{"cursor":"..."}}.' : "");
+          + (documents ? ' When the active browser grants rendered text, start with {"read":"document"}, find a literal keyword with {"read":{"query":"..."}}, or pass the returned document.nextCursor as {"read":{"cursor":"..."}}.' : "")
+          + (reuse ? " When reusable verified steps are available, ordinary observe automatically lists scoped reuseCandidates; use reuseQuery only to rank them by intention." : "");
       },
       get inputSchema() { return observeSchema(); },
       invoke: invokeObserve,
@@ -880,14 +1028,23 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
       const application = binding ? applications.get(binding.applicationId) : current();
       const session = binding?.session ?? application?.session;
       if (!session) return { requestId, status: "stopped" as const, code: "approval_not_found", steps: [] };
+      const settle = application?.stepReuse?.resolveApproval ?? session.resolveApproval.bind(session);
+      const entry = binding ? entries.get(binding.applicationId) : application ? entries.get(application.id) : undefined;
+      if (!canAutomateEntry(entry)) {
+        const blocked: ApprovalResolution = { requestId, status: "stopped", code: "application_automation_blocked", steps: [] };
+        approvalResults.set(requestId, blocked);
+        // Release the session's host approval without allowing it to dispatch.
+        void settle(requestId, "deny").catch(() => undefined);
+        return blocked;
+      }
       if (binding && (binding.applicationId !== activeId || binding.activation !== activation)) {
         const stale: ApprovalResolution = { requestId, status: "stopped", code: "stale_activation", steps: [] };
         approvalResults.set(requestId, stale);
         // Release the session's host approval without allowing it to dispatch.
-        void session.resolveApproval(requestId, "deny").catch(() => undefined);
+        void settle(requestId, "deny").catch(() => undefined);
         return stale;
       }
-      const result = await session.resolveApproval(requestId, decision);
+      const result = await settle(requestId, decision);
       const interrupted = operationStop(record);
       if (interrupted) {
         const stoppedApproval = interruptedApproval(result, requestId, operationCode(record));
@@ -909,7 +1066,7 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
         approvalResults.set(result.requestId, result);
       }
       return result;
-    }, (record) => ({ ...stopped(operationCode(record), undefined, activeId), requestId })),
+    }, (record) => ({ ...stopped(operationCode(record), undefined, publicActiveId()), requestId })),
     correct: (reason = "corrected") => {
       abortOperations("corrected");
       invalidateObservations();
@@ -943,11 +1100,15 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
       invalidateObservations();
       for (const application of applications.values()) application.session.cancel("closed");
       const closeSessions = async (): Promise<void> => {
-        const sessions = new Set<DeskSession>();
+        const sessions = new Map<DeskSession, DiscoverableStepReuse | undefined>();
         for (const application of applications.values()) {
-          if (sessions.has(application.session)) continue;
-          sessions.add(application.session);
-          await application.session.close();
+          const prior = sessions.get(application.session);
+          if (prior === undefined && application.stepReuse) sessions.set(application.session, application.stepReuse);
+          else if (!sessions.has(application.session)) sessions.set(application.session, undefined);
+        }
+        for (const [session, stepReuse] of sessions) {
+          if (stepReuse) await closeStepReuse(stepReuse);
+          else await session.close().catch(() => undefined);
         }
       };
       closePromise = sequence.then(closeSessions, closeSessions);

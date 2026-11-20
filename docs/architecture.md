@@ -23,6 +23,22 @@ DSH 有两条接入路径。直接加载 Cordis 插件时，宿主通过 `openSe
 
 LangGraph 和 OpenAI Agents SDK 会在绑定工具时读取参数格式。宿主应先登记本次任务允许使用的应用，再绑定 `workspace.tools`。执行时会按当前应用的实际能力检查每一步。如果运行中才加入具有新动作的应用，宿主需重新绑定工具才能向模型提供新增参数。MCP 宿主可以重新请求工具清单。
 
+### 应用和窗口排除设置
+
+宿主向用户列出 `workspace.applications`。每一项可以代表整个应用的入口，也可以代表一个已绑定的窗口。宿主保留窗口到所属应用的映射，把用户选中的应用或窗口交给 `canAutomate` 判断。模型列应用时只会拿到可自动操作的条目，启动、切换和后续工具调用也按同一规则检查。
+
+```ts
+const workspace = createWorkspace({
+  applications,
+  canAutomate: ({ id }) => !blockedWindows.has(id) && !blockedApps.has(appByWindow.get(id) ?? id),
+});
+
+// Replace the host's blocked sets when the user saves preferences.
+workspace.correct("automation_preferences_changed");
+```
+
+DSH 插件可以将该工作区作为 `createDeskDshPlugin(() => workspace)` 的返回值接入。其他框架绑定同一 `workspace.tools`。设置和值的存储由应用或插件管理。用户更新设置时，宿主先保存新的排除列表，再调用 `workspace.correct`，中断仍在执行的任务并使旧引用失效。对桌面坐标操作，后端仍需按授权窗口检查实际落点。
+
 E2B 浏览器可用 DOM 定位。云端原生应用则从 AT-SPI 读取控件，按窗口标识和进程绑定。只能取得窗口时，观察会明确标记控件清单不完整。宿主可为一个指定窗口授权文字输入和 `Ctrl+S`，派发前核对系统键盘焦点和可见的阻塞弹窗。私有云桌面的中文输入还需要 `allowTemporaryClipboard`。运行时只在系统剪贴板空闲时临时取得所有权，向经过窗口或 X 客户端身份核实的接收方提供文字，完成后释放。应用是否保存成功，可由宿主回读已授权的目标文件确认。
 
 ## 正常执行和中断
@@ -57,8 +73,8 @@ E2B 浏览器可用 DOM 定位。云端原生应用则从 AT-SPI 读取控件，
 
 ## 可选的步骤复用
 
-宿主可从 `desklatch/reuse` 创建记录器，让原有工具把 `act` 委托给记录器。它调用当前会话执行动作，并将回执与这次实际请求相绑定。首版支持按控件条件定位的 `type` 和 `setValue`。例如，写入一个查询词后，只有同一输入框的公开值与查询词相等，且整批操作均已核验，宿主才能保存这段步骤。记录里保存参数名，实际查询词在本次运行时提供。
+宿主可从 `desklatch/reuse` 调用 `createDiscoverableStepReuse({ session, getContext, store })`。单会话可以直接注册它返回的两个工具，工作区可以把它作为对应应用的 `stepReuse`。按需应用在声明里用 `allowStepReuse: true` 提前公布参数格式。`getContext` 从实际受控会话提供稳定的用户、应用和页面范围，模型只能选择观察返回的候选，页面和应用范围由宿主决定。缓存默认在内存中，宿主可以用同一个存储接口跨会话或重启保留记录。
 
-遇到相似任务时，宿主选中记录并提供本次参数。记录器把新的请求交回公共 `act`。执行器在当前界面重新定位，每一步都经过本次权限、风险判断和结果检查。旧坐标、控件引用以及之前的批准只在原执行中有效。运行回执说明本次实际执行到了哪一步，命中记录本身不能说明任务成功。
+首版自动记录按控件条件定位的 `type` 和 `setValue`。目标字段需有同目标的公开值核验，整批通过才保存。记录保留控件条件和参数位置，执行时使用当前任务提供的值。Agent 在普通 `observe` 中获取少量候选，也可用 `reuseQuery` 补充简短意图。需要应用清单时，可在同一次 `observe` 同时传入 `workspace: true` 和 `reuseQuery`，查询已激活应用中的候选。候选先匹配当前范围，再按任务文字和本轮实际控件排序。控件列表截断时，相关候选可以保留给当前 `act` 做重新定位。
 
-例如，宿主用 `createVerifiedStepReuse({ session, store })` 创建记录器，再将 `createDeskTools({ ...session, act: reuse.act })` 交给现有框架。选择哪条记录、适用哪个应用和工作区域、参数从哪里来，均由宿主负责。独立安装的验收程序在没有任何框架、浏览器或模型 SDK 的环境里执行、记录并复用了一个字段写入。[独立安装验收](../scripts/verify-package.mjs)
+Agent 使用 `act({reuse:{ref,values}})` 提交候选和本次参数。记录器把请求交回当前会话的公共 `act`，逐步重新定位、查权限和核对结果。区域变化或引用失效时，本次复用停止。回执保留实际执行进度，Agent 可据此继续处理。受控应用也可用 `createVerifiedStepReuse` 的显式接口绑定固定工作流。[独立安装验收](../scripts/verify-package.mjs)

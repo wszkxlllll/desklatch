@@ -5,6 +5,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
 import { createWorkspace } from "../dist/workspace.js";
+import { createDiscoverableStepReuse, MemoryVerifiedStepReuseStore } from "../dist/reuse.js";
 import { createLangChainTools } from "../dist/integrations/langchain.js";
 import { createOpenAIAgentsTools } from "../dist/integrations/openai-agents.js";
 import { createDeskMcpServer } from "../dist/integrations/mcp.js";
@@ -89,6 +90,67 @@ test("LangChain keeps document query and continuation parameters when the editor
     await observe.invoke({ read: { cursor: "document-page-two" } });
     await assert.rejects(() => observe.invoke({ read: { query: "new query", cursor: "wrong cursor" } }));
     assert.deepEqual(reads, [{ query: "opening hours" }, { cursor: "document-page-two" }]);
+  } finally {
+    await workspace.close();
+  }
+});
+
+test("LangChain chooses an advertised verified replay through the two workspace tools", async () => {
+  const target = { role: "textbox", name: "Search documentation" };
+  const notes = { role: "textbox", name: "Scratch notes" };
+  const writes = [];
+  let controlsTruncated = false;
+  let pageScope = "docs-search";
+  const store = new MemoryVerifiedStepReuseStore();
+  const session = {
+    capabilities: [{ kind: "setValue", targets: ["selector"] }],
+    allowModelImages: false,
+    limits: { maxSteps: 4, maxTextLength: 1_000, maxScrollAmount: 10 },
+    async observe() {
+      const observedTargets = controlsTruncated ? [target] : [target, notes];
+      const controls = observedTargets.map((item) => ({ ref: item.name, ...item, states: ["visible", "enabled", "editable"], actions: ["setValue"] }));
+      return { observationId: "doc-search-screen", view: "controls", complete: !controlsTruncated, controls };
+    },
+    async act(input) {
+      writes.push(...input.steps.map((step) => step.value));
+      return { status: "completed", steps: input.steps.map((step, index) => ({ index: index + 1, kind: step.kind, status: "verified" })) };
+    },
+    correct() {},
+    cancel() {},
+    async close() {},
+  };
+  const stepReuse = createDiscoverableStepReuse({ session, store, getContext: () => ({ workspace: "test", page: pageScope }) });
+  const workspace = createWorkspace({
+    initialActive: "browser", applications: [{ id: "browser", name: "Browser", session, stepReuse }],
+  });
+  try {
+    const tools = createLangChainTools(workspace.tools);
+    assert.deepEqual(tools.map((tool) => tool.name), ["observe", "act"]);
+    const [observe, act] = tools;
+    const first = await act.invoke({ steps: [{ kind: "setValue", target, value: "pathlib", expect: { target, valueEquals: "pathlib" } }] });
+    assert.equal(first.status, "completed");
+    await act.invoke({ steps: [{ kind: "setValue", target: notes, value: "draft", expect: { target: notes, valueEquals: "draft" } }] });
+    const available = await observe.invoke({ workspace: true, reuseQuery: "search documentation", where: { state: "visible" } });
+    assert.equal(available.active, "browser");
+    assert.deepEqual(available.applications.map((app) => app.id), ["browser"]);
+    const [candidate] = available.reuseCandidates;
+    assert.equal(candidate.actions[0].target.name, target.name);
+    const next = await act.invoke({ reuse: { ref: candidate.ref, values: { [candidate.actions[0].parameter]: "datetime" } } });
+    assert.equal(next.status, "completed");
+    assert.deepEqual(writes, ["pathlib", "draft", "datetime"]);
+    controlsTruncated = true;
+    const truncated = await observe.invoke({ reuseQuery: "scratch notes" });
+    const [unconfirmed] = truncated.reuseCandidates;
+    assert.equal(unconfirmed.actions[0].target.name, notes.name);
+    assert.equal(unconfirmed.available, false);
+    const loadRecord = store.get.bind(store);
+    store.get = (key) => {
+      pageScope = "different-page";
+      return loadRecord(key);
+    };
+    const changed = await act.invoke({ reuse: { ref: unconfirmed.ref, values: { [unconfirmed.actions[0].parameter]: "new notes" } } });
+    assert.equal(changed.code, "context_mismatch");
+    assert.deepEqual(writes, ["pathlib", "draft", "datetime"]);
   } finally {
     await workspace.close();
   }

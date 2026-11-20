@@ -526,6 +526,8 @@ export interface VerifiedStepReuse {
   get(key: string): Promise<VerifiedStepRecord | undefined>;
   list(): Promise<readonly VerifiedStepRecord[]>;
   forget(key: string): Promise<boolean>;
+  /** Execute an already-read, validated record without reloading the store. */
+  runRecord?(record: VerifiedStepRecord, options?: ReuseRunOptions): Promise<ReuseRunResult>;
 }
 
 export interface VerifiedStepReuseOptions {
@@ -630,6 +632,37 @@ export function createVerifiedStepReuse(options: VerifiedStepReuseOptions): Veri
     }
   }
 
+  async function executeRecord(normalizedKey: string, record: VerifiedStepRecord, runOptions: ReuseRunOptions): Promise<ReuseRunResult> {
+    if (!isRecord(runOptions)) return { status: "miss", reused: false, key: normalizedKey, code: "parameter_invalid" };
+    const normalizedOptions = runOptions as ReuseRunOptions;
+    if (normalizedOptions.context !== undefined && !isJson(normalizedOptions.context)) {
+      return { status: "miss", reused: false, key: normalizedKey, code: "context_mismatch" };
+    }
+    if (normalizedOptions.coverage !== undefined && !isJson(normalizedOptions.coverage)) {
+      return { status: "miss", reused: false, key: normalizedKey, code: "coverage_mismatch" };
+    }
+    const contextCode = contextMatches(record, normalizedOptions);
+    if (contextCode) return { status: "miss", reused: false, key: normalizedKey, code: contextCode };
+    const values = normalizedOptions.values ?? {};
+    if (!isRecord(values)) return { status: "miss", reused: false, key: normalizedKey, code: "parameter_invalid" };
+    const materialized = substitute(record.request, values as Readonly<Record<string, string | number | boolean>>, record.parameterNames);
+    if (!materialized) {
+      const missing = record.parameterNames.some((name) => !Object.hasOwn(values, name));
+      return { status: "miss", reused: false, key: normalizedKey, code: missing ? "parameter_missing" : "parameter_invalid" };
+    }
+    let request: ActRequest;
+    try {
+      request = validateRequest(materialized, options.session.capabilities, options.session.limits);
+    } catch {
+      return { status: "miss", reused: false, key: normalizedKey, code: "request_invalid" };
+    }
+    const result = await options.session.act(request, normalizedOptions.signal);
+    const succeeded = result.status === "completed"
+      && result.steps.length === request.steps.length
+      && result.steps.every((receipt, index) => receipt.index === index + 1 && receipt.status === "verified");
+    return { status: result.status, reused: true, succeeded, key: normalizedKey, record, result };
+  }
+
   const api: VerifiedStepReuse = {
     async act(raw, signal) {
       const request = jsonSnapshot(raw);
@@ -700,10 +733,6 @@ export function createVerifiedStepReuse(options: VerifiedStepReuseOptions): Veri
 
     async run(key, runOptions = {}) {
       const normalizedKey = normalizeKey(key);
-      if (!isRecord(runOptions)) return { status: "miss", reused: false, key: normalizedKey, code: "parameter_invalid" };
-      const normalizedOptions = runOptions as ReuseRunOptions;
-      if (normalizedOptions.context !== undefined && !isJson(normalizedOptions.context)) return { status: "miss", reused: false, key: normalizedKey, code: "context_mismatch" };
-      if (normalizedOptions.coverage !== undefined && !isJson(normalizedOptions.coverage)) return { status: "miss", reused: false, key: normalizedKey, code: "coverage_mismatch" };
       let record: VerifiedStepRecord | undefined;
       try {
         record = await readOne(normalizedKey);
@@ -711,26 +740,17 @@ export function createVerifiedStepReuse(options: VerifiedStepReuseOptions): Veri
         return { status: "miss", reused: false, key: normalizedKey, code: "store_error" };
       }
       if (!record) return { status: "miss", reused: false, key: normalizedKey, code: "reuse_not_found" };
-      const contextCode = contextMatches(record, normalizedOptions);
-      if (contextCode) return { status: "miss", reused: false, key: normalizedKey, code: contextCode };
-      const values = normalizedOptions.values ?? {};
-      if (!isRecord(values)) return { status: "miss", reused: false, key: normalizedKey, code: "parameter_invalid" };
-      const materialized = substitute(record.request, values as Readonly<Record<string, string | number | boolean>>, record.parameterNames);
-      if (!materialized) {
-        const missing = record.parameterNames.some((name) => !Object.hasOwn(values, name));
-        return { status: "miss", reused: false, key: normalizedKey, code: missing ? "parameter_missing" : "parameter_invalid" };
+      return executeRecord(normalizedKey, record, runOptions);
+    },
+
+    async runRecord(record, runOptions = {}) {
+      const candidate: unknown = record;
+      if (!validateRecord(candidate)) {
+        const key = isRecord(candidate) && typeof candidate.key === "string" ? candidate.key : "<invalid>";
+        return { status: "miss", reused: false, key, code: "reuse_not_found" };
       }
-      let request: ActRequest;
-      try {
-        request = validateRequest(materialized, options.session.capabilities, options.session.limits);
-      } catch {
-        return { status: "miss", reused: false, key: normalizedKey, code: "request_invalid" };
-      }
-      const result = await options.session.act(request, normalizedOptions.signal);
-      const succeeded = result.status === "completed"
-        && result.steps.length === request.steps.length
-        && result.steps.every((receipt, index) => receipt.index === index + 1 && receipt.status === "verified");
-      return { status: result.status, reused: true, succeeded, key: normalizedKey, record, result };
+      const normalizedKey = normalizeKey(candidate.key);
+      return executeRecord(normalizedKey, serializeRecord(candidate), runOptions);
     },
 
     async reuse(key, runOptions = {}) {
@@ -768,3 +788,15 @@ export function createVerifiedStepReuse(options: VerifiedStepReuseOptions): Veri
   };
   return api;
 }
+
+export {
+  addReuseActSchema,
+  createDiscoverableStepReuse,
+  reuseQuerySchema,
+} from "./reuse-tools.js";
+export type {
+  DiscoverableStepReuse,
+  DiscoverableStepReuseOptions,
+  ReuseCandidate,
+  ReuseCandidateAction,
+} from "./reuse-tools.js";

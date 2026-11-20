@@ -25,6 +25,8 @@ const node = new ToolNode(createLangChainTools(endpoints));
 
 多个应用共用一个模型会话时，宿主用 `createWorkspace({ applications })` 注册获准的应用，将 `workspace.tools` 交给同一个框架。条目可以绑定已打开的会话，也可以提供宿主的 `open` 函数。模型选中该应用时，宿主才接入已有窗口或启动应用。[工作区接口](docs/architecture.md#多个应用共用的工作区)
 
+宿主可以通过 `canAutomate` 接入用户的应用或窗口排除设置。DSH、LangGraph 和 MCP 共用同一工作区规则。[应用和窗口排除设置](docs/architecture.md#应用和窗口排除设置)
+
 | 工具 | 模型怎么用 |
 | --- | --- |
 | `observe` | 用 `{workspace:true}` 查看可选择的应用，也可以读取当前界面的控件、网页正文或获准的截图。网页正文支持关键词查找和续读。 |
@@ -59,7 +61,7 @@ const node = new ToolNode(createLangChainTools(endpoints));
 
 网页正文需要宿主在浏览器后端启用 `allowDocumentText`，并给会话启用 `allowModelDocumentText`。`observe({read:"document"})` 读正文首批文字，`observe({read:{query:"停止入场"}})` 查找正文中含该词的位置。任一结果带有 `document.nextCursor` 时，将它传给 `observe({read:{cursor: ...}})` 可继续读。同一页的关键词查找覆盖本次授权范围内的已渲染正文，包括首批未返回的部分。结果附带来源，每次仍按现有文本预算返回。
 
-需要复用字段写入时，宿主可另行加载 `desklatch/reuse`。记录器只接受通过自身调用、已核验的回执，复用时仍经过当前会话的公开 `act`。[步骤复用设计](docs/architecture.md#可选的步骤复用)
+需要复用字段写入时，宿主可另行加载 `desklatch/reuse`。启用自动发现后，符合条件的已核验操作会生成记录。`observe` 给出当前界面的相关候选，Agent 选中以后用同一个 `act` 执行。[步骤复用设计](docs/architecture.md#可选的步骤复用)
 
 ## 构建和验证
 

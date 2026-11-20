@@ -77,6 +77,29 @@ function app(id, session, extra = {}) {
   return { id, name: id.toUpperCase(), description: `${id} app`, session, ...extra };
 }
 
+function stepReuseFor(session, calls = {}) {
+  const observe = {
+    name: "observe",
+    description: "observe with reuse",
+    inputSchema: { type: "object", additionalProperties: false, properties: { reuseQuery: { type: "string" } } },
+    invoke: async (input, signal) => {
+      calls.observe?.push(input);
+      const result = await session.observe(input, signal);
+      return { ...result, reuseCandidates: [{ ref: "reuse-ref", actions: [], available: true }] };
+    },
+  };
+  const act = {
+    name: "act",
+    description: "act with reuse",
+    inputSchema: { type: "object", additionalProperties: false, properties: { reuse: { type: "object" } } },
+    invoke: async (input, signal) => {
+      calls.act?.push(input);
+      return session.act(input, signal);
+    },
+  };
+  return { session, tools: Object.freeze([observe, act]), close: async () => { await session.close(); } };
+}
+
 test("workspace discovery works before activation and exposes exactly observe/act", async () => {
   const first = fakeSession("one");
   const second = fakeSession("two");
@@ -91,6 +114,57 @@ test("workspace discovery works before activation and exposes exactly observe/ac
     ],
   });
   assert.equal(first.calls.observe.length, 0);
+  await workspace.close();
+});
+
+test("step reuse stays inside the two workspace tools and invalidates refs after switching apps", async () => {
+  const first = fakeSession("reuse-one");
+  const second = fakeSession("reuse-two");
+  const reuseCalls = { observe: [], act: [] };
+  const workspace = createWorkspace({
+    applications: [
+      app("reuse-one", first.session, { stepReuse: stepReuseFor(first.session, reuseCalls), activate: () => {}, verifyFront: () => true }),
+      app("reuse-two", second.session, { activate: () => {}, verifyFront: () => true }),
+    ],
+    initialActive: "reuse-one",
+  });
+  assert.deepEqual(workspace.tools.map((tool) => tool.name), ["observe", "act"]);
+  assert.equal(workspace.tools[0].inputSchema.properties.reuseQuery.type, "string");
+  assert.equal(workspace.tools[1].inputSchema.properties.reuse.type, "object");
+  const observed = await workspace.observe({ reuseQuery: "edit title" });
+  assert.equal(observed.reuseCandidates[0].ref, "reuse-ref");
+  assert.equal(reuseCalls.observe.length, 1);
+  await workspace.act({ activate: "reuse-two" });
+  await workspace.act({ activate: "reuse-one" });
+  const stale = await workspace.act({ reuse: { ref: "reuse-ref", values: {} } });
+  assert.equal(stale.code, "stale_reuse");
+  assert.equal(reuseCalls.act.length, 0);
+  await workspace.close();
+});
+
+test("canAutomate hides blocked apps, prevents lazy open, and blocks active work", async () => {
+  let allowed = false;
+  const eager = fakeSession("blocked");
+  const lazySession = fakeSession("lazy-blocked");
+  let opens = 0;
+  const lazy = createOnDemandWorkspaceApplication({
+    id: "lazy-blocked",
+    name: "Lazy blocked",
+    capabilities: lazySession.session.capabilities,
+    open: async () => { opens += 1; return { session: lazySession.session, verifyFront: () => true }; },
+  });
+  const workspace = createWorkspace({
+    applications: [app("blocked", eager.session), lazy],
+    initialActive: "blocked",
+    canAutomate: ({ id }) => allowed || id === "other-never-registered",
+  });
+  assert.deepEqual((await workspace.observe({ workspace: true })).applications, []);
+  assert.deepEqual(workspace.applications.map(({ id }) => id), ["blocked", "lazy-blocked"]);
+  assert.equal((await workspace.observe({})).code, "application_automation_blocked");
+  assert.equal((await workspace.act({ activate: "lazy-blocked" })).code, "application_automation_blocked");
+  assert.equal(opens, 0);
+  allowed = true;
+  assert.equal((await workspace.act({ activate: "lazy-blocked" })).code, "activated");
   await workspace.close();
 });
 

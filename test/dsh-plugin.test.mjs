@@ -9,7 +9,7 @@ import { ToolsService } from "@deepseek-ai/dsh-tools";
 
 import { createDeskSession } from "desklatch";
 import { createDeskDshPlugin } from "desklatch/dsh";
-import { createWorkspace } from "desklatch/workspace";
+import { createOnDemandWorkspaceApplication, createWorkspace } from "desklatch/workspace";
 
 async function createDshContext() {
   const ctx = new Context();
@@ -152,6 +152,59 @@ test("native DSH plugin accepts a workspace host and invokes its navigate route"
     await runtime.prompt.dispose();
   }
   assert.equal(fixture.closes, 1);
+});
+
+test("native DSH tools respect the host's application and window exclusions", async () => {
+  const groups = new Map([["work-notes", "editor"], ["private-notes", "editor"], ["mail-window", "mail"]]);
+  const blockedApps = new Set(["mail"]);
+  const blockedWindows = new Set(["private-notes"]);
+  const launches = [];
+  const fixtures = new Map();
+  const workspace = createWorkspace({
+    applications: [...groups.keys()].map((id) => {
+      const fixture = fixtureSession();
+      fixtures.set(id, fixture);
+      return createOnDemandWorkspaceApplication({
+        id, name: id, capabilities: fixture.session.capabilities,
+        async open() {
+          launches.push(id);
+          return { session: fixture.session, verifyFront: () => true };
+        },
+      });
+    }),
+    canAutomate: ({ id }) => !blockedWindows.has(id) && !blockedApps.has(groups.get(id)),
+  });
+  const runtime = await createDshContext();
+  const fiber = runtime.ctx.plugin(createDeskDshPlugin(async () => workspace));
+  await fiber.await();
+  let callId = 0;
+  const invoke = async (name, args) => {
+    const result = await executeModelToolFixture(runtime.ctx, {
+      callId: `dsh-scope-${++callId}`, name: `desklatch_${name}`, arguments: args,
+      signal: new AbortController().signal,
+    });
+    return JSON.parse(result.content[0].text);
+  };
+  try {
+    assert.deepEqual((await invoke("observe", { workspace: true })).applications.map((item) => item.id), ["work-notes"]);
+    assert.equal(workspace.applications.length, 3, "The host can still see every entry in its settings");
+    assert.equal((await invoke("act", { activate: "mail-window" })).code, "application_automation_blocked");
+    assert.equal((await invoke("act", { activate: "private-notes" })).code, "application_automation_blocked");
+    assert.deepEqual(launches, []);
+    assert.equal((await invoke("act", { activate: "work-notes" })).code, "activated");
+    assert.deepEqual(launches, ["work-notes"]);
+    const action = { steps: [{ kind: "click", target: { name: "Apply" } }] };
+    assert.equal((await invoke("act", action)).status, "completed");
+    blockedApps.add("editor");
+    workspace.correct();
+    assert.equal((await invoke("act", action)).code, "application_automation_blocked");
+    assert.equal(fixtures.get("work-notes").calls.filter((call) => call.kind === "act").length, 1);
+  } finally {
+    await fiber.dispose();
+    await runtime.executor.dispose();
+    await runtime.tools.dispose();
+    await runtime.prompt.dispose();
+  }
 });
 
 test("failed activation leaves no tools and late activation closes exactly once", async () => {
