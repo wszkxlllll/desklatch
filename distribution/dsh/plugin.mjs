@@ -15,8 +15,8 @@ export default {
     const approval = createDeskDshApprovalBridge(ctx);
     const openSession = process.platform === "win32"
       ? async () => {
-        const { createWindowsProductHost, readWindowsAuthorizationPath } = await import("desklatch/windows-product");
-        return createWindowsProductHost({
+        const { openInstalledWindowsHost, readWindowsAuthorizationPath } = await import("desklatch/windows-product");
+        return openInstalledWindowsHost({
           authorizationFile: await readWindowsAuthorizationPath(),
           onApprovalRequested: approval.onApprovalRequested,
         });

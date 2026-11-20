@@ -10,6 +10,7 @@ import { stdin, stdout } from "node:process";
 import { parseArgs } from "node:util";
 import { fileURLToPath } from "node:url";
 import { findChromiumExecutable } from "../backends/browser/local.js";
+import { writeWindowsProductRuntimeConfig } from "../product/runtime-config.js";
 import { installOcrSetup } from "../setup/install-ocr.js";
 import { checkOptionalSetup } from "../setup/optional.js";
 import { prepareWindowsAuthorizationFile, registerWindowsAuthorizationPath, windowsProductGrantsFile } from "../product/windows-grants.js";
@@ -44,13 +45,19 @@ function chooseExtra(answer: string): ExtraChoice {
   throw new Error("Choose install, existing, or skip for the optional feature.");
 }
 
-function moduleInstalled(name: string): boolean {
+function moduleInstalled(name: string, rootDirectory = process.cwd()): boolean {
   try {
-    createRequire(import.meta.url).resolve(name);
+    createRequire(join(rootDirectory, "package.json")).resolve(name);
     return true;
   } catch {
     return false;
   }
+}
+
+function consumerRoot(authorizationFile: string | undefined): string {
+  return authorizationFile === undefined
+    ? process.cwd()
+    : dirname(dirname(dirname(authorizationFile)));
 }
 
 async function writeMcpConfig(output: string, authorizationFile?: string) {
@@ -219,6 +226,7 @@ async function main() {
   }
 
   const authorizationFile = windows ? windowsProductGrantsFile(process.cwd()) : undefined;
+  const installRoot = consumerRoot(authorizationFile);
   if (parsed.values["register-windows-location"]) {
     if (route !== "dsh" || !authorizationFile) throw new Error("Desktop location registration requires the Windows DSH route.");
     if (process.env.DESKLATCH_WINDOWS_GRANTS_FILE) return;
@@ -234,7 +242,11 @@ async function main() {
     packages.push(["koffi", "koffi@3.3.8", true]);
     if (route === "mcp") packages.push(["@trycua/cua-driver", "@trycua/cua-driver@0.54.0", true]);
   }
-  if (installE2b) packages.push(["@e2b/desktop", "@e2b/desktop@2.5.0", true]);
+  // The Windows product's “use existing configuration” route still needs the
+  // SDK in this chosen install root; do not accept a copy resolved from the
+  // DeskLatch CLI's own package tree.
+  const installExistingE2b = parsed.values.windows === true && e2b && !installE2b;
+  if (e2b) packages.push(["@e2b/desktop", "@e2b/desktop@2.5.0", installE2b || installExistingE2b]);
   const selectedInstalls = packages.filter(([, , shouldInstall]) => shouldInstall).map(([, spec]) => spec);
   if (selectedInstalls.length) {
     const npm = process.env.npm_execpath;
@@ -245,7 +257,7 @@ async function main() {
       cwd: process.cwd(), stdio: "inherit", windowsHide: true, env: installEnvironment,
     });
   }
-  const remaining = packages.filter(([name, , shouldInstall]) => !shouldInstall && !moduleInstalled(name)).map(([, spec]) => spec);
+  const remaining = packages.filter(([name, , shouldInstall]) => !shouldInstall && !moduleInstalled(name, installRoot)).map(([, spec]) => spec);
   if (remaining.length) {
     console.log(`Install the selected packages here with npm install ${remaining.join(" ")}`);
     process.exitCode = 1;
@@ -257,7 +269,7 @@ async function main() {
   }
   if (route === "mcp") {
     await writeMcpConfig(resolve(parsed.values.output ?? "desklatch.mcp.json"), authorizationFile);
-    if (!windows && moduleInstalled("playwright-core")) {
+    if (!windows && moduleInstalled("playwright-core", installRoot)) {
       const { chromium } = await import("playwright-core");
       if (!findChromiumExecutable() && !existsSync(chromium.executablePath())) {
         console.log("Install Chrome or Edge, or run npm exec -- playwright-core install chromium.");
@@ -278,9 +290,9 @@ async function main() {
     ocr = await installOcrSetup({ rootDirectory: process.cwd(), pythonExecutable });
     console.log(`OCR configuration was saved at ${resolve(".desklatch/ocr/ocr.json")}.`);
   }
-  if (e2b && envFile) process.loadEnvFile(resolve(envFile));
+  let optional: Awaited<ReturnType<typeof checkOptionalSetup>> | undefined;
   if (e2b || ocr) {
-    const optional = await checkOptionalSetup({ rootDirectory: process.cwd(), e2b, ocr });
+    optional = await checkOptionalSetup({ rootDirectory: installRoot, e2b, e2bEnvFile: envFile, ocr });
     for (const report of Object.values(optional.reports)) {
       console.log(`${report.module.toUpperCase()} (${report.code}) ${report.message}`);
       console.log(report.guidance);
@@ -288,6 +300,20 @@ async function main() {
     const failed = Object.values(optional.reports).some((report) => !report.available
       && !(installE2b && report.code === "E2B_API_KEY_MISSING"));
     if (failed) process.exitCode = 1;
+  }
+  if (authorizationFile) {
+    const ocrReport = optional?.reports.ocr;
+    const e2bReport = optional?.reports.e2b;
+    const persistable = ocrReport?.available !== false
+      && e2bReport?.code !== "E2B_PACKAGE_MISSING"
+      && e2bReport?.code !== "E2B_PACKAGE_RESOLUTION_FAILED";
+    if (persistable) {
+      await writeWindowsProductRuntimeConfig(authorizationFile, {
+        version: 1,
+        ...(ocr === undefined ? {} : { ocr }),
+        ...(e2b ? { e2b: envFile === undefined ? {} : { envFile: resolve(envFile) } } : {}),
+      });
+    }
   }
 }
 

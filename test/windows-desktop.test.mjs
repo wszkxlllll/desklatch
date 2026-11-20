@@ -282,12 +282,56 @@ test('CUA transport sends controls-only UIA reads and explicit background delive
   await transport.close();
 });
 
+test('CUA exact-window OCR capture verifies HWND/PID and infers the logical screenshot origin', async () => {
+  const calls = [];
+  const target = { pid: 41001, hwnd: 0x100000000001n };
+  const pngHeader = Buffer.alloc(24);
+  pngHeader.writeUInt32BE(0x89504e47, 0);
+  pngHeader.writeUInt32BE(0x0d0a1a0a, 4);
+  pngHeader.writeUInt32BE(427, 16);
+  pngHeader.writeUInt32BE(261, 20);
+  const driver = {
+    async metadata() { return { driverVersion: '0.54.0' }; },
+    async startSession() { return { active: true }; },
+    async endSession() { return { active: false }; },
+    async callTool(name, json) {
+      calls.push({ name, args: JSON.parse(json) });
+      if (name !== 'get_window_state') return { isError: false };
+      return {
+        isError: false,
+        images: [{ mimeType: 'image/png', dataBase64: pngHeader.toString('base64') }],
+        structuredContent: {
+          pid: target.pid,
+          window_id: target.hwnd.toString(),
+          screenshot_frame_valid: true,
+          elements: [{ frame: { x: 228, y: 236, width: 220, height: 78 }, screenshot_frame: { x: 108, y: 116, width: 220, height: 78 } }],
+        },
+      };
+    },
+  };
+  const transport = await CuaWindowsTransport.open(driver, 'ocr-capture-session');
+  const image = await transport.observeWindowImage(target, {});
+  assert.deepEqual(image, {
+    mimeType: 'image/png',
+    dataBase64: pngHeader.toString('base64'),
+    width: 427,
+    height: 261,
+    origin: { x: 120, y: 120 },
+  });
+  const capture = calls.find(call => call.name === 'get_window_state');
+  assert.equal(capture.args.include_screenshot, true);
+  assert.equal(capture.args.include_accessibility_tree, true);
+  assert.equal(String(capture.args.window_id), target.hwnd.toString());
+  await transport.close();
+});
+
 test('CUA transport projects an explicitly foreground desktop point into window-local pixels', async () => {
   const calls = [];
   const target = { pid: 41001, hwnd: 0x100000000001n };
   const bounds = { x: 100, y: 200, width: 500, height: 300 };
   let capture = { pid: target.pid, window_id: String(target.hwnd), window_bounds: bounds,
-    screenshot_frame_valid: true, capture_id: 'local-capture' };
+    screenshot_frame_valid: true, capture_id: 'local-capture', screenshot_width: 400, screenshot_height: 240,
+    elements: [{ frame: { x: 90, y: 160, width: 40, height: 32 }, screenshot_frame: { x: 20, y: 30, width: 40, height: 32 } }] };
   const driver = {
     async metadata() { return { driverVersion: '0.54.0' }; },
     async startSession() { return { active: true }; },
@@ -309,7 +353,7 @@ test('CUA transport projects an explicitly foreground desktop point into window-
   const result = await transport.dispatch(action, recipient, {});
   assert.equal(result.status, 'dispatched');
   const click = calls.find(call => call.name === 'click');
-  assert.deepEqual({ x: click.args.x, y: click.args.y }, { x: 50, y: 50 });
+  assert.deepEqual({ x: click.args.x, y: click.args.y }, { x: 80, y: 120 });
   assert.equal(click.args.delivery_mode, 'foreground');
   assert.equal(click.args.capture_id, 'local-capture');
   assert.equal(click.args.element_token, undefined);

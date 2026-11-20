@@ -12,7 +12,7 @@ tarball there first, then start the interactive chooser for both optional
 features. Each feature offers `install`, `existing`, and `skip` (the default).
 
 ```sh
-npm install --omit=optional /path/to/desklatch-0.1.0-dev.1.tgz
+npm install --omit=optional /path/to/desklatch-0.1.0-dev.2.tgz
 npm exec -- desklatch-setup
 ```
 
@@ -31,10 +31,10 @@ npm exec -- desklatch-setup dsh --bundle path/to/desklatch-dsh.tgz
 npm exec -- desklatch-setup dsh --bundle path/to/desklatch-dsh.tgz --install-e2b --install-ocr
 ```
 
-On Windows, the starter plugin and the generated MCP configuration open the
-local Windows host. The setup wizard installs and checks the selected extra
-dependencies. A host can use those configurations to add OCR evidence or
-create an E2B session.
+On Windows, both the DSH plugin and the generated MCP server load optional
+features from `.desklatch/windows/runtime.json` in the installation folder.
+Running the installer again saves the selected options. The installer keeps
+the E2B key in the selected `.env` or the per-installation secret file.
 [Connection setup](integrations.md)
 
 ## Local OCR
@@ -125,7 +125,20 @@ The probe loads the real local worker and model files. In a host integration,
 pass the parsed JSON to `createRapidOcrCpuRunner` and use its recognition
 function for the host's risk evidence policy. [OCR evidence integration](../src/evidence/README.md)
 
+In the Windows product, enable the screen-capture permission for OCR. Ordinary
+controls use local checks first. On an ambiguous action, OCR can read the
+bounded target region and request approval when it identifies a consequential
+command. An approved action still needs fresh visual evidence before dispatch.
+
 ## E2B
+
+With a key configured, ask the Agent to list its DeskLatch workspace and switch
+to the E2B browser or Writer. Both entries share a private temporary sandbox.
+Browsing initially allows `https://docs.python.org`. To choose other permitted
+origins, set `DESKLATCH_E2B_BROWSER_ORIGINS` in the E2B `.env` to a comma-separated
+list of origins, such as `https://docs.python.org,https://www.rfc-editor.org`,
+then restart the client. Closing the workspace requests sandbox shutdown. The
+sandbox also has a bounded lease.
 
 Create an E2B account and copy an API key from the Dashboard as described in
 the [official E2B quickstart](https://docs.e2b.dev/quickstart/). Install the
@@ -176,10 +189,10 @@ npm exec -- desklatch-setup mcp --e2b --env-file .env
 Do not commit the file, paste the real key into shell history, or include it
 in `ocr.json`, MCP JSON, DSH bundle metadata, logs, or bug reports.
 
-### Existing host-owned sandbox
+### Bring your own sandbox in an SDK integration
 
-DeskLatch does not own E2B lifecycle. The host creates and releases the
-sandbox, then passes that already-owned `Sandbox` to the E2B backend:
+When embedding the E2B backend directly, create and release the sandbox in
+your host. Pass the existing `Sandbox` to the backend.
 
 ```js
 import { Sandbox } from "@e2b/desktop";

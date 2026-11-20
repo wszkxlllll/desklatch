@@ -83,12 +83,13 @@ export function createWindowsForegroundActivator(
     throw backendError("foreground_activation_unavailable");
   }
   return async (target, options) => {
+    const before = await inspector.read(target, undefined, options.signal);
+    if (foregroundMatches(before, target)) return { status: "dispatched" };
     const activation = await transport.bringToFront!(target, options);
-    if (activation.status !== "dispatched") return activation;
+    if (activation.status === "refused") return activation;
     const evidence = await inspector.read(target, undefined, options.signal);
-    return foregroundMatches(evidence, target)
-      ? { status: "dispatched" }
-      : { status: "refused", code: "foreground_not_confirmed" };
+    if (foregroundMatches(evidence, target)) return { status: "dispatched" };
+    return activation.status === "dispatched" ? { status: "refused", code: "foreground_not_confirmed" } : activation;
   };
 }
 
@@ -208,7 +209,10 @@ class WindowsDesktopSession implements WindowsDesktopBackend {
       // must not mint a new scope merely because a snapshot was refreshed.
       const frameScope = this.#scopePrefix;
       const snapshots: Array<{ target: WindowsWindowTarget; snapshot?: WindowsWindowSnapshot; evidence?: WindowsPhysicalEvidence; focus?: WindowsFocusEvidence }> = [];
-      if (view !== "image") {
+      // Preserve private hit-test geometry on image-only observations when
+      // the host permits points. The model still receives only the screenshot.
+      const includeGeometry = view !== "image" || this.foregroundPointAllowed();
+      if (includeGeometry) {
         for (const target of this.#authorization.targets) {
           options.signal?.throwIfAborted();
           const evidence = await this.readPhysical(target, undefined, options.signal);
@@ -231,7 +235,7 @@ class WindowsDesktopSession implements WindowsDesktopBackend {
           }
         }
       }
-      const built = view === "image" ? emptyFrame() : buildControlsFrame(snapshots, options.where, this.#transport.source === "native-uia-v1");
+      const built = includeGeometry ? buildControlsFrame(snapshots, options.where, this.#transport.source === "native-uia-v1") : emptyFrame();
       const controlsInFrame = await this.removeOwnedDialogCopies(built.internal, options.signal);
       let image = undefined;
       let complete = built.complete;
@@ -241,7 +245,7 @@ class WindowsDesktopSession implements WindowsDesktopBackend {
       }
       const frame: Frame = Object.freeze({
         scope: frameScope,
-        controls: Object.freeze(controlsInFrame.map(item => item.control)),
+        controls: Object.freeze(view === "image" ? [] : controlsInFrame.map(item => item.control)),
         complete,
         ...(image ? { image } : {}),
       });
@@ -639,7 +643,7 @@ function buildControlsFrame(
 
 function makeCanvasControls(
   scope: string,
-  snapshots: ReadonlyArray<{ target: WindowsWindowTarget; snapshot?: WindowsWindowSnapshot }>,
+  snapshots: ReadonlyArray<{ target: WindowsWindowTarget; snapshot?: WindowsWindowSnapshot; evidence?: WindowsPhysicalEvidence }>,
   bounds: ReadonlyMap<string, Rect>,
   enabled: boolean,
 ): ReadonlyMap<string, InternalControl> {
@@ -647,7 +651,7 @@ function makeCanvasControls(
   const controls = new Map<string, InternalControl>();
   for (const item of snapshots) {
     const windowKeyValue = windowKey(item.target);
-    const rect = bounds.get(windowKeyValue);
+    const rect = item.evidence?.bounds ?? bounds.get(windowKeyValue);
     if (!rect) continue;
     const id = `canvas:${shortHash(`${scope}\u0000${windowKeyValue}`)}`;
     const source: WindowsWindowElement = {

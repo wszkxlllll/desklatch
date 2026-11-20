@@ -94,7 +94,7 @@ export interface WindowsWindowElement {
   readonly token?: string;
   /** Host-private binding to the material data shown in an enrolled dialog. */
   readonly approvalContext?: Control["approvalContext"];
-  /** Desktop/global physical coordinates when supplied as `frame`. */
+  /** Desktop coordinates in the UIA coordinate space when supplied as `frame`. */
   readonly rect?: Rect;
   /** True when `rect` came from the older window-local screenshot_frame field. */
   readonly rectIsWindowLocal?: boolean;
@@ -145,6 +145,8 @@ export interface WindowsPhysicalInspector {
   read(target: WindowsWindowTarget, point?: Point, signal?: AbortSignal): Promise<WindowsPhysicalEvidence | undefined>;
   /** Optional native UIA focus probe. Keyboard actions require this proof. */
   readFocused?(target: WindowsWindowTarget, signal?: AbortSignal): Promise<WindowsFocusEvidence | undefined>;
+  /** Return the primary display in the same coordinate space as read(). */
+  captureDesktopImage?(signal?: AbortSignal): Promise<WindowsDesktopImage | undefined>;
   close?(): Promise<void>;
 }
 
@@ -153,7 +155,7 @@ export interface WindowsDispatchTarget {
   readonly control?: WindowsResolvedControl;
   /** Desktop-space point. The transport maps it to the native window space. */
   readonly point?: Point;
-  /** Physical desktop bounds used for the foreground coordinate projection. */
+  /** Window bounds from the observation, checked against the fresh capture. */
   readonly windowBounds?: Rect;
   readonly foreground: boolean;
 }
@@ -187,6 +189,8 @@ export interface WindowsTransport {
   readonly source?: WindowsBackgroundSource;
   open?(signal?: AbortSignal): Promise<void>;
   observeWindow(target: WindowsWindowTarget, options: { readonly signal?: AbortSignal }): Promise<WindowsWindowSnapshot>;
+  /** Fresh read-only pixels for one exact authorized HWND/PID. */
+  observeWindowImage?(target: WindowsWindowTarget, options: { readonly signal?: AbortSignal }): Promise<WindowsDesktopImage | undefined>;
   observeDesktopImage?(options: { readonly signal?: AbortSignal }): Promise<WindowsDesktopImage | undefined>;
   dispatch(step: Step, target: WindowsDispatchTarget, options: { readonly signal?: AbortSignal }): Promise<WindowsTransportDelivery>;
   /** Optional explicit foreground escalation. Never called for background UIA actions. */

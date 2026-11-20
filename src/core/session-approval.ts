@@ -26,9 +26,24 @@ export function approvalActionParams(step: Step): Readonly<Record<string, string
 }
 
 export function approvalSummary(step: Step, target: Control, destination?: Control): string {
-  const targetName = target.name ? ` ${safeText(target.name, 128)}` : "";
+  const targetName = target.name ? ` ${safeText(target.name, 128)}`
+    : step.kind === "click" && "point" in step.target ? ` at (${step.target.point.x}, ${step.target.point.y})` : "";
   const destinationName = destination?.name ? ` to ${safeText(destination.name, 128)}` : "";
   return `${step.kind}${targetName}${destinationName}`;
+}
+
+const visualApprovalReasons: Readonly<Record<string, string>> = Object.freeze({
+  ocr_external_requires_approval: "本地 OCR 识别到发送、提交或共享操作。",
+  ocr_financial_requires_approval: "本地 OCR 识别到付款或交易操作。",
+  ocr_destructive_requires_approval: "本地 OCR 识别到删除、替换或覆盖操作。",
+  ocr_security_requires_approval: "本地 OCR 识别到权限或安全设置操作。",
+});
+
+export function approvalContextSummary(target: Control, riskCode: string): string | undefined {
+  const native = target.approvalContext?.summary;
+  const visual = Object.hasOwn(visualApprovalReasons, riskCode) ? visualApprovalReasons[riskCode] : undefined;
+  const context = [native, visual].filter(Boolean).join("\n");
+  return context ? safeText(context, 512) : undefined;
 }
 
 export function normalizeApprovalDecision(answer: ApprovalAnswer | boolean | void): ApprovalAnswer | undefined {

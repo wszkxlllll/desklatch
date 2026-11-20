@@ -95,6 +95,8 @@ export interface DesktopBackend {
   readonly capabilities: readonly Capability[];
   /** Host opt-in for exposing rendered browser text to the model surface. */
   readonly allowDocumentText?: boolean;
+  /** The backend can resolve points against the specific observed frame. */
+  readonly hitTestSnapshot?: boolean;
   observe(options: ObserveOptions): Promise<Frame>;
   hitTest?(frame: Frame, point: Point, signal?: AbortSignal): Promise<Control | undefined>;
   dispatch(request: Dispatch): Promise<Delivery>;

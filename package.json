@@ -1,6 +1,6 @@
 {
   "name": "desklatch",
-  "version": "0.1.0-dev.1",
+  "version": "0.1.0-dev.2",
   "private": true,
   "description": "A host-controlled computer-use runtime for AI agents",
   "type": "module",

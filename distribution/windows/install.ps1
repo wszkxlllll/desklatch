@@ -416,6 +416,8 @@ function Start-Gui {
       if ($state.Process.ExitCode -eq 0) {
         $authorizeButton.Enabled = Test-Path -LiteralPath (Join-Path $state.InstalledRoot "DeskLatch-Authorize.cmd") -PathType Leaf
         $nextStep = if ($state.Route -eq "dsh") { "打开授权页选择应用，再重新打开 DeepSeek Harness。关键动作会在 DSH 会话中请求确认。" } else { "打开授权页选择应用，再复制 MCP 配置到你的客户端。关键动作会弹出 Windows 审批窗口。" }
+        if ($stdout -match 'OCR \(ready\)') { $nextStep += " 使用本地 OCR 时，请在授权页开启截图权限。" }
+        if ($stdout -match 'E2B \(ready\)') { $nextStep += " 云端应用已启用，首次切换时才创建云电脑。" }
         if ($stdout -match 'E2B_API_KEY_MISSING') { $nextStep += " E2B 已安装，之后可重开向导填写密钥。" }
         $copyButton.Visible = $state.Route -eq "mcp"
         [Windows.Forms.MessageBox]::Show($form, $nextStep, "DeskLatch 安装完成", [Windows.Forms.MessageBoxButtons]::OK, [Windows.Forms.MessageBoxIcon]::Information) | Out-Null

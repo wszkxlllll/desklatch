@@ -226,7 +226,7 @@ export class TargetResolver {
   }
 
   private async hitTestOrigin(frame: Frame, point: Point, signal: AbortSignal): Promise<Control | undefined> {
-    const snapshotHitTest = (this.deps.backend as DesktopBackend & { readonly hitTestSnapshot?: boolean }).hitTestSnapshot === true;
+    const snapshotHitTest = this.deps.backend.hitTestSnapshot === true;
     if (snapshotHitTest && this.deps.backend.hitTest) return this.deps.backend.hitTest(frame, point, signal);
     if (!frame.complete) return undefined;
     const matches = frame.controls.filter((control) => pointInRect(point, control));

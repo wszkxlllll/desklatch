@@ -1,7 +1,11 @@
 import { createDeskSession, type DeskSession } from "../session.js";
 import { createWorkspace, createOnDemandWorkspaceApplication, type OnDemandWorkspaceApplication, type Workspace, type WorkspaceOpenedApplication } from "../workspace.js";
-import type { Capability, DesktopBackend, Dispatch, Delivery, Frame, ObserveOptions, RiskPolicy } from "../contracts.js";
+import { createRiskPolicy } from "../policy.js";
+import type { Capability, DesktopBackend, Dispatch, Delivery, Frame, ObserveOptions, Rect, RiskInput, RiskPolicy } from "../contracts.js";
 import type { ActResult, ApprovalHandler, ApprovalResolution, DeskObserveOptions, DeskObservation, DeskSessionActOptions } from "../core/session-types.js";
+import { createWindowsOcrProvider, windowsOcrRegion } from "./windows-ocr.js";
+import type { RapidOcrCpuRunnerOptions } from "../evidence/rapidocr.js";
+import type { RapidOcrV5MobileRunner } from "../evidence/ocr.js";
 import { readWindowsProductGrants as readPersistedWindowsProductGrants } from "./windows-grants.js";
 import type { WindowsProductGrants } from "./windows-grants.js";
 import { listWindowsAppWindows as listNativeWindowsAppWindows, verifyWindowsAppWindow as verifyNativeWindowsAppWindow } from "./windows-inventory.js";
@@ -40,11 +44,17 @@ export interface WindowsProductHostTestSeams {
     readonly inspector?: WindowsPhysicalInspector;
   }>;
   readonly policy?: RiskPolicy;
+  /** Deterministic local runner seam; production uses `options.ocr`. */
+  readonly ocrRunner?: RapidOcrV5MobileRunner;
 }
 
 export interface WindowsProductHostOptions {
   readonly authorizationFile: string;
   readonly onApprovalRequested?: ApprovalHandler;
+  /** Explicit opt-in for local PP-OCRv5 mobile evidence. */
+  readonly ocr?: RapidOcrCpuRunnerOptions;
+  /** Host-owned adapter descriptors (for example, cloud-backed entries). */
+  readonly extraApplications?: readonly OnDemandWorkspaceApplication[];
   /** Narrow deterministic seams; production uses the packaged grant/inventory modules. */
   readonly test?: WindowsProductHostTestSeams;
 }
@@ -77,6 +87,9 @@ export async function createWindowsProductHost(options: WindowsProductHostOption
     throw new TypeError("invalid_windows_authorization_file");
   }
   const initial = await readGrants(options, options.authorizationFile);
+  const extras = Object.freeze([...(options.extraApplications ?? [])]);
+  const windowsIds = new Set(initial.apps.map(app => app.id));
+  if (extras.some(application => windowsIds.has(application.id))) throw productError("duplicate_workspace_application");
   const entryById = new Map<string, OnDemandWorkspaceApplication>();
   const entryFor = (app: { readonly id: string; readonly name: string }, grants: WindowsProductGrants): OnDemandWorkspaceApplication => {
     const existing = entryById.get(app.id);
@@ -94,11 +107,12 @@ export async function createWindowsProductHost(options: WindowsProductHostOption
   for (const app of initial.apps) entryFor(app, initial);
   let currentGrants = initial;
   return createWorkspace({
-    applications: [...entryById.values()],
-    canAutomate: application => currentGrants.apps.some(app => app.id === application.id),
+    applications: [...entryById.values(), ...extras],
+    canAutomate: application => extras.some(extra => extra.id === application.id)
+      || currentGrants.apps.some(app => app.id === application.id),
     discover: async () => {
       currentGrants = await readGrants(options, options.authorizationFile);
-      return currentGrants.apps.map(app => entryFor(app, currentGrants));
+      return [...currentGrants.apps.map(app => entryFor(app, currentGrants)), ...extras];
     },
   });
 }
@@ -192,6 +206,8 @@ async function openProductRuntime(
   let driver: WindowsCuaDriver | undefined;
   let transport: WindowsTransport;
   let inspector: WindowsPhysicalInspector | undefined;
+  let captureDriver: WindowsCuaDriver | undefined;
+  let captureTransport: WindowsTransport | undefined;
   if (options.test?.transportFactory) {
     const created = await options.test.transportFactory({ app, windows, grants });
     transport = created.transport;
@@ -201,6 +217,17 @@ async function openProductRuntime(
     const opened = await CuaWindowsTransport.open(driver, `desklatch-product-${safeId(app.id)}`, signal);
     transport = opened;
     inspector = await loadWindowsPhysicalInspector();
+    if (options.ocr !== undefined && grants.allowDesktopCapture) {
+      try {
+        captureDriver = await createCuaDriver();
+        captureTransport = await CuaWindowsTransport.open(captureDriver, `desklatch-product-${safeId(app.id)}-ocr`, signal);
+      } catch {
+        await captureTransport?.close?.().catch(() => undefined);
+        await (captureDriver as (WindowsCuaDriver & { shutdown?: () => Promise<void> }) | undefined)?.shutdown?.().catch(() => undefined);
+        captureTransport = undefined;
+        captureDriver = undefined;
+      }
+    }
   }
   if (!inspector) {
     await transport.close?.().catch(() => undefined);
@@ -215,7 +242,12 @@ async function openProductRuntime(
     background: { source: WINDOWS_BACKGROUND_SOURCE },
     version: grants.version.toString(),
   };
-  const guardedTransport = createGrantGuardedTransport(transport, options, app.id, windows, grants);
+  const guardedTransport = createGrantGuardedTransport(transport, options, app.id, windows, grants, inspector.captureDesktopImage?.bind(inspector));
+  const guardedCaptureTransport = captureTransport !== undefined && captureTransport !== transport
+    ? createGrantGuardedTransport(captureTransport, options, app.id, windows, grants)
+    : options.test?.transportFactory
+      ? guardedTransport
+      : {};
   const foregroundActivator: WindowsForegroundActivator | undefined = grants.allowForegroundInput
     ? createWindowsForegroundActivator(guardedTransport, inspector)
     : undefined;
@@ -228,14 +260,27 @@ async function openProductRuntime(
       ...(foregroundActivator ? { activateForeground: foregroundActivator } : {}),
     });
     const guardedBackend = createGrantGuardedBackend(backend, options, app.id, grants);
+    const policy = options.test?.policy ?? (options.ocr === undefined ? undefined : createRiskPolicy({
+      ocr: createWindowsOcrProvider({
+        rapidOcr: options.ocr,
+        transport: guardedCaptureTransport,
+        regionForInput: windowsOcrRegion,
+        targetForInput: input => selectOcrTarget(options, windows, inspector!, input),
+        ...(options.test?.ocrRunner === undefined ? {} : { runner: options.test.ocrRunner }),
+      }),
+      ocrRegion: windowsOcrRegion,
+      timeoutMs: (options.ocr.timeoutMs ?? 8_000) + 2_000,
+    }));
     session = createDeskSession(guardedBackend, {
       allowModelImages: grants.allowDesktopCapture,
       onApprovalRequested: options.onApprovalRequested,
-      ...(options.test?.policy ? { policy: options.test.policy } : {}),
+      ...(policy ? { policy } : {}),
     });
   } catch (error) {
     await transport.close?.().catch(() => undefined);
+    if (captureTransport !== undefined && captureTransport !== transport) await captureTransport.close?.().catch(() => undefined);
     await (driver as (WindowsCuaDriver & { shutdown?: () => Promise<void> }) | undefined)?.shutdown?.().catch(() => undefined);
+    await (captureDriver as (WindowsCuaDriver & { shutdown?: () => Promise<void> }) | undefined)?.shutdown?.().catch(() => undefined);
     throw error;
   }
   let closed = false;
@@ -243,9 +288,13 @@ async function openProductRuntime(
     if (closed) return;
     closed = true;
     await session.close().catch(() => undefined);
+    if (captureTransport !== undefined && captureTransport !== transport) await captureTransport.close?.().catch(() => undefined);
     const ownedDriver = driver as (WindowsCuaDriver & { shutdown?: () => Promise<void>; uniffiDestroy?: () => void }) | undefined;
     await ownedDriver?.shutdown?.().catch(() => undefined);
     ownedDriver?.uniffiDestroy?.();
+    const ownedCaptureDriver = captureDriver as (WindowsCuaDriver & { shutdown?: () => Promise<void>; uniffiDestroy?: () => void }) | undefined;
+    await ownedCaptureDriver?.shutdown?.().catch(() => undefined);
+    ownedCaptureDriver?.uniffiDestroy?.();
   };
   return { session, grants, windows, inspector, foregroundActivator, close };
 }
@@ -256,11 +305,13 @@ function createGrantGuardedTransport(
   appId: string,
   windows: readonly WindowsAppWindow[],
   expectedGrants: WindowsProductGrants,
+  captureDesktopImage?: WindowsPhysicalInspector["captureDesktopImage"],
 ): WindowsTransport {
-  const authorizationLive = async (requireForeground = false): Promise<string | undefined> => {
+  const authorizationLive = async (requireForeground = false, requireCapture = false): Promise<string | undefined> => {
     try {
       const grants = await readGrants(options, options.authorizationFile);
       if (!grants.apps.some(app => app.id === appId)) return "application_automation_blocked";
+      if (requireCapture && !expectedGrants.allowDesktopCapture) return "desktop_image_not_authorized";
       if (grants.allowDesktopCapture !== expectedGrants.allowDesktopCapture
         || grants.allowForegroundInput !== expectedGrants.allowForegroundInput) return "window_scope_changed";
       if (requireForeground && !grants.allowForegroundInput) return "foreground_input_not_authorized";
@@ -283,10 +334,16 @@ function createGrantGuardedTransport(
       if (!(await verifyTarget(target))) throw productError("window_scope_changed");
       return transport.observeWindow(target, callOptions);
     },
-    observeDesktopImage: transport.observeDesktopImage ? async callOptions => {
-      const code = await authorizationLive();
+    observeWindowImage: transport.observeWindowImage ? async (target, callOptions) => {
+      const code = await authorizationLive(false, true);
       if (code) throw productError(code);
-      return transport.observeDesktopImage!(callOptions);
+      if (!(await verifyTarget(target))) throw productError("window_scope_changed");
+      return transport.observeWindowImage!(target, callOptions);
+    } : undefined,
+    observeDesktopImage: captureDesktopImage || transport.observeDesktopImage ? async callOptions => {
+      const code = await authorizationLive(false, true);
+      if (code) throw productError(code);
+      return captureDesktopImage ? captureDesktopImage(callOptions.signal) : transport.observeDesktopImage!(callOptions);
     } : undefined,
     dispatch: async (step, target, callOptions) => {
       const code = await authorizationLive(target.foreground);
@@ -325,6 +382,7 @@ function createGrantGuardedBackend(
   };
   return {
     capabilities: backend.capabilities,
+    hitTestSnapshot: backend.hitTestSnapshot,
     observe: async (request: ObserveOptions): Promise<Frame> => {
       const authorization = await authorizationLive();
       if (!authorization.ok) throw productError(authorization.code);
@@ -429,6 +487,42 @@ async function verifiedAppWindows(options: WindowsProductHostOptions, appId: str
     if (await verify(window)) verified.push(window);
   }
   return verified;
+}
+
+async function selectOcrTarget(
+  options: WindowsProductHostOptions,
+  windows: readonly WindowsAppWindow[],
+  inspector: WindowsPhysicalInspector,
+  input: RiskInput,
+): Promise<WindowsWindowTarget | undefined> {
+  const region = windowsOcrRegion(input);
+  if (region === undefined) return undefined;
+  const verify = options.test?.verifyWindowsAppWindow ?? verifyNativeWindowsAppWindow;
+  const candidates: WindowsWindowTarget[] = [];
+  for (const window of windows) {
+    try {
+      if (!(await verify(window))) continue;
+      const target = toWindowTarget(window);
+      const evidence = await inspector.read(target, centerRect(region), input.signal);
+      if (!evidence?.visible || evidence.minimized || evidence.bounds === undefined) continue;
+      if (!containsRect(evidence.bounds, region)) continue;
+      if (evidence.occludingHwnd !== undefined && evidence.occludingHwnd !== target.hwnd) continue;
+      candidates.push(target);
+    } catch {
+      // A disappearing or occluded window is not an OCR candidate.
+    }
+  }
+  return candidates.length === 1 ? candidates[0] : undefined;
+}
+
+function containsRect(outer: Rect, inner: Rect): boolean {
+  return inner.x >= outer.x && inner.y >= outer.y
+    && inner.x + inner.width <= outer.x + outer.width
+    && inner.y + inner.height <= outer.y + outer.height;
+}
+
+function centerRect(rect: Rect): { readonly x: number; readonly y: number } {
+  return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
 }
 
 async function createCuaDriver(): Promise<WindowsCuaDriver> {

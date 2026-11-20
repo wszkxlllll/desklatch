@@ -46,7 +46,7 @@ const handle = await ctx.agents.create({
 支持本地 stdio MCP 的客户端可使用 Windows 向导生成的配置。也可以在 Node.js 22.19 或更高版本下，下载核心包并在新目录运行以下命令。
 
 ```sh
-npm install --omit=optional /path/to/desklatch-0.1.0-dev.1.tgz
+npm install --omit=optional /path/to/desklatch-0.1.0-dev.2.tgz
 npm exec -- desklatch-setup mcp --install
 ```
 
@@ -56,7 +56,7 @@ npm exec -- desklatch-setup mcp --install
 
 ## TypeScript SDK
 
-在宿主项目安装 [Release 的核心包](https://github.com/wszkxlllll/desklatch/releases/tag/v0.1.0-dev.1)，再安装实际使用的框架和驱动。下面的 `page` 是宿主已打开且授权的 Playwright Page，`allowedOrigin` 是允许操作的来源。
+在宿主项目安装 [Release 的核心包](https://github.com/wszkxlllll/desklatch/releases/tag/v0.1.0-dev.2)，再安装实际使用的框架和驱动。下面的 `page` 是宿主已打开且授权的 Playwright Page，`allowedOrigin` 是允许操作的来源。
 
 ```ts
 import { createDeskSession, createDeskTools } from "desklatch";
@@ -105,6 +105,6 @@ OpenAI Agents SDK 可以用 `createOpenAIAgentsTools(endpoints)` 把工具交给
 
 ## 选装与验收
 
-Windows 向导里可单独选择 OCR 和 E2B。它们的本地依赖和配置供实际宿主使用。OCR 可用于本地证据规则，E2B 由宿主创建和释放桌面会话。 [可选组件配置](setup-optional.md)
+Windows 向导里可单独选择 OCR 和 E2B。原生插件与 MCP 读取相同的安装配置，沿用 `observe` 和 `act`。OCR 可在获得截图授权后补充本地证据。会话切换到 E2B 应用时才创建云电脑。 [可选组件配置](setup-optional.md)
 
 运行 `npm run pack:install -- ./distribution/out` 生成核心包、DSH 包和 Windows 向导。普通 `npm test` 可离线运行。真实模型或 E2B 测试的密钥、运行条件和结束清理见验收记录。[可复跑测试](verification.md#复跑)

@@ -98,6 +98,49 @@ export class CuaWindowsTransport implements WindowsTransport {
     };
   }
 
+  /**
+   * Capture pixels for one exact enrolled window without touching the action
+   * snapshot. CUA reports UIA frame coordinates in a logical desktop space,
+   * while the returned PNG is window-local. Matching `frame` and
+   * `screenshot_frame` pairs establish the logical origin; without that proof
+   * the image is refused rather than OCRing a DPI-shifted crop.
+   */
+  async observeWindowImage(target: WindowsWindowTarget, options: { readonly signal?: AbortSignal }): Promise<WindowsDesktopImage | undefined> {
+    this.assertOpen();
+    options.signal?.throwIfAborted();
+    const result = await this.call("get_window_state", {
+      pid: target.pid,
+      window_id: rawBigInt(target.hwnd),
+      session: this.#session,
+      include_accessibility_tree: true,
+      include_screenshot: true,
+      tree_format: "elements",
+      full_output: true,
+      max_elements: 512,
+      max_depth: 32,
+    }, options.signal);
+    const raw = structuredRecord(result);
+    if (!raw) throw backendError(result.errorCode ?? "window_image_invalid");
+    if (result.isError) throw backendError(result.errorCode ?? stringField(raw, "code") ?? "window_image_failed");
+    if (positiveInteger(raw.pid) !== target.pid || parseBigInt(raw.window_id ?? raw.windowId) !== target.hwnd) {
+      throw backendError("window_image_identity_mismatch");
+    }
+    if (raw.screenshot_frame_valid === false) throw backendError("window_image_frame_invalid");
+    const image = result.images?.[0];
+    if (!image || typeof image.mimeType !== "string" || typeof image.dataBase64 !== "string" || image.dataBase64.length === 0) return undefined;
+    const dimensions = imageDimensions(image.mimeType, image.dataBase64, raw);
+    if (dimensions === undefined) throw backendError("window_image_dimensions_unknown");
+    const origin = inferScreenshotOrigin(raw, dimensions.width, dimensions.height);
+    if (origin === undefined) throw backendError("window_image_origin_unproven");
+    return Object.freeze({
+      mimeType: image.mimeType,
+      dataBase64: image.dataBase64,
+      width: dimensions.width,
+      height: dimensions.height,
+      origin,
+    });
+  }
+
   async observeDesktopImage(options: { readonly signal?: AbortSignal }): Promise<WindowsDesktopImage | undefined> {
     this.assertOpen();
     options.signal?.throwIfAborted();
@@ -120,14 +163,18 @@ export class CuaWindowsTransport implements WindowsTransport {
       target: windowAddress(target.window),
       delivery_mode: target.foreground ? "foreground" : "background",
     };
-    const localPoint = target.point === undefined ? undefined : localPointForTarget(target.point, target.windowBounds, target.control?.localRect);
-    if (target.foreground && localPoint && (step.kind === "click" || step.kind === "scroll")) {
+    let localPoint = target.point === undefined ? undefined : localPointForTarget(target.point, target.windowBounds, target.control?.localRect);
+    if (target.foreground && target.point && (step.kind === "click" || step.kind === "scroll")) {
       if (!target.windowBounds) return { status: "refused", code: "foreground_bounds_unavailable" };
-      const captureId = await this.foregroundCaptureId(target.window, target.windowBounds, options.signal);
+      const capture = await this.foregroundCapture(target.window, target.windowBounds, options.signal);
       options.signal?.throwIfAborted();
-      if (captureId === null) return { status: "refused", code: "foreground_capture_stale" };
-      if (captureId === undefined) return { status: "refused", code: "foreground_capture_unavailable" };
-      args.capture_id = captureId;
+      if (capture === null) return { status: "refused", code: "foreground_capture_stale" };
+      if (capture === undefined) return { status: "refused", code: "foreground_capture_unavailable" };
+      localPoint = { x: Math.round(target.point.x - capture.origin.x), y: Math.round(target.point.y - capture.origin.y) };
+      if (localPoint.x < 0 || localPoint.y < 0 || localPoint.x >= capture.width || localPoint.y >= capture.height) {
+        return { status: "refused", code: "point_outside_window_capture" };
+      }
+      args.capture_id = capture.id;
     }
     switch (step.kind) {
       case "click": {
@@ -193,7 +240,7 @@ export class CuaWindowsTransport implements WindowsTransport {
       pid: target.pid,
       window_id: rawBigInt(target.hwnd),
       session: this.#session,
-      }, options.signal), true);
+      }, options.signal), true, "activation");
     } catch (error) {
       return classifyActionError(error);
     }
@@ -244,7 +291,7 @@ export class CuaWindowsTransport implements WindowsTransport {
     }
   }
 
-  private actionResult(result: WindowsToolResult, foreground: boolean, allowKeyboardMode = false): WindowsTransportDelivery {
+  private actionResult(result: WindowsToolResult, foreground: boolean, purpose?: "keyboard" | "activation"): WindowsTransportDelivery {
     const action = actionRecord(result);
     const code = result.errorCode ?? stringField(action, "code", "error_code") ?? stringField(action?.error, "code");
     if (result.isError) {
@@ -259,11 +306,12 @@ export class CuaWindowsTransport implements WindowsTransport {
     if (effect === "partial") return { status: "partial", ...(code ? { code } : {}) };
     if (effect === "refused") return { status: "refused", code: code ?? "driver_refused" };
     if (effect === "suspected_noop") return { status: "unknown", code: code ?? "driver_suspected_noop" };
-    if (mode !== undefined && mode !== (foreground ? "foreground" : "background")
-      && !(allowKeyboardMode && (mode === "not_applicable" || mode === "background"))) {
+    const acceptsMode = (purpose !== undefined && mode === "not_applicable") || (purpose === "keyboard" && mode === "background");
+    if (mode !== undefined && mode !== (foreground ? "foreground" : "background") && !acceptsMode) {
       return { status: "unknown", code: code ?? "delivery_mode_mismatch" };
     }
     if (!foreground && route === "global_input") return { status: "unknown", code: code ?? "background_used_global_input" };
+    if (purpose === "activation" && route === "global_input") return { status: "unknown", code: "activation_used_global_input" };
     if (effect === "confirmed" || effect === "unverifiable") {
       return { status: "dispatched", ...(code ? { code } : {}) };
     }
@@ -272,7 +320,7 @@ export class CuaWindowsTransport implements WindowsTransport {
 
   private async runAction(name: string, args: Record<string, unknown>, foreground: boolean, signal?: AbortSignal, allowKeyboardMode = false): Promise<WindowsTransportDelivery> {
     try {
-      return this.actionResult(await this.call(name, args, signal), foreground, allowKeyboardMode);
+      return this.actionResult(await this.call(name, args, signal), foreground, allowKeyboardMode ? "keyboard" : undefined);
     } catch (error) {
       return classifyActionError(error);
     }
@@ -284,13 +332,15 @@ export class CuaWindowsTransport implements WindowsTransport {
    * not part of DeskLatch's model-visible frame. A changed window identity
    * or geometry invalidates the proposed coordinates.
    */
-  private async foregroundCaptureId(target: WindowsWindowTarget, expectedBounds?: Rect, signal?: AbortSignal): Promise<string | null | undefined> {
+  private async foregroundCapture(target: WindowsWindowTarget, expectedBounds: Rect, signal?: AbortSignal):
+    Promise<{ readonly id: string; readonly origin: Point; readonly width: number; readonly height: number } | null | undefined> {
     const result = await this.call("get_window_state", {
       pid: target.pid,
       window_id: rawBigInt(target.hwnd),
       session: this.#session,
       full_output: true,
-      include_accessibility_tree: false,
+      include_accessibility_tree: true,
+      tree_format: "elements",
       include_screenshot: true,
       max_elements: 256,
       max_depth: 16,
@@ -299,12 +349,14 @@ export class CuaWindowsTransport implements WindowsTransport {
     const raw = structuredRecord(result);
     if (!raw || positiveInteger(raw.pid) !== target.pid || parseBigInt(raw.window_id ?? raw.windowId) !== target.hwnd) return null;
     if (raw.screenshot_frame_valid === false) return null;
-    if (expectedBounds !== undefined) {
-      const capturedBounds = parseRect(raw.window_bounds ?? raw.windowBounds ?? raw.bounds);
-      if (capturedBounds === undefined || !sameRect(capturedBounds, expectedBounds)) return null;
-    }
-    const captureId = stringField(raw, "capture_id", "captureId");
-    return captureId && captureId.length <= 256 ? captureId : undefined;
+    const capturedBounds = parseRect(raw.window_bounds ?? raw.windowBounds ?? raw.bounds);
+    if (capturedBounds === undefined || !sameRect(capturedBounds, expectedBounds)) return null;
+    const image = result.images[0];
+    const dimensions = imageDimensions(image.mimeType, image.dataBase64, raw);
+    const id = stringField(raw, "capture_id", "captureId");
+    if (!id || id.length > 256 || !dimensions) return undefined;
+    const origin = inferScreenshotOrigin(raw, dimensions.width, dimensions.height);
+    return origin === undefined ? undefined : { id, origin, ...dimensions };
   }
 
   private assertOpen(): void {
@@ -352,6 +404,64 @@ function parseRect(value: unknown): Rect | undefined {
   const height = finiteNumber(item.height ?? item.h);
   if (x === undefined || y === undefined || width === undefined || height === undefined || width <= 0 || height <= 0) return undefined;
   return { x, y, width, height };
+}
+
+function inferScreenshotOrigin(raw: Record<string, unknown>, imageWidth: number, imageHeight: number): Point | undefined {
+  const elements = Array.isArray(raw.elements) ? raw.elements : [];
+  const origins: Point[] = [];
+  for (const value of elements) {
+    const item = record(value);
+    if (!item) continue;
+    const frame = parseRect(item.frame ?? item.bounding_rect ?? item.boundingRect);
+    const screenshot = parseRect(item.screenshot_frame ?? item.screenshotFrame);
+    if (!frame || !screenshot || frame.width !== screenshot.width || frame.height !== screenshot.height) continue;
+    if (screenshot.x < 0 || screenshot.y < 0
+      || screenshot.x + screenshot.width > imageWidth
+      || screenshot.y + screenshot.height > imageHeight) continue;
+    const origin = { x: frame.x - screenshot.x, y: frame.y - screenshot.y };
+    if (!origins.some(candidate => candidate.x === origin.x && candidate.y === origin.y)) origins.push(origin);
+  }
+  return origins.length === 1 ? origins[0] : undefined;
+}
+
+function imageDimensions(mimeType: string, dataBase64: string, raw: Record<string, unknown>): { readonly width: number; readonly height: number } | undefined {
+  const prefix = Buffer.from(dataBase64.replace(/^data:[^;,]+;base64,/iu, "").slice(0, 512), "base64");
+  if (mimeType.toLocaleLowerCase() === "image/png" && prefix.length >= 24
+    && prefix.readUInt32BE(0) === 0x89504e47 && prefix.readUInt32BE(4) === 0x0d0a1a0a) {
+    const width = prefix.readUInt32BE(16);
+    const height = prefix.readUInt32BE(20);
+    if (width > 0 && height > 0) return { width, height };
+  }
+  if (mimeType.toLocaleLowerCase() === "image/jpeg") {
+    const jpeg = jpegDimensions(prefix);
+    if (jpeg) return jpeg;
+  }
+  const width = positiveInteger(raw.width ?? raw.screenshot_width ?? raw.screenshotWidth);
+  const height = positiveInteger(raw.height ?? raw.screenshot_height ?? raw.screenshotHeight);
+  return width !== undefined && height !== undefined ? { width, height } : undefined;
+}
+
+function jpegDimensions(bytes: Uint8Array): { readonly width: number; readonly height: number } | undefined {
+  if (bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8) return undefined;
+  let offset = 2;
+  while (offset + 9 < bytes.length) {
+    if (bytes[offset] !== 0xff) { offset += 1; continue; }
+    while (offset < bytes.length && bytes[offset] === 0xff) offset += 1;
+    const marker = bytes[offset++];
+    if (marker === undefined || marker === 0xd9 || marker === 0xda) break;
+    if (offset + 2 > bytes.length) break;
+    const length = (bytes[offset] << 8) | bytes[offset + 1];
+    if (length < 2 || offset + length > bytes.length) break;
+    const sof = (marker >= 0xc0 && marker <= 0xc3) || (marker >= 0xc5 && marker <= 0xc7)
+      || (marker >= 0xc9 && marker <= 0xcb) || (marker >= 0xcd && marker <= 0xcf);
+    if (sof && length >= 7) {
+      const height = (bytes[offset + 3] << 8) | bytes[offset + 4];
+      const width = (bytes[offset + 5] << 8) | bytes[offset + 6];
+      if (width > 0 && height > 0) return { width, height };
+    }
+    offset += length;
+  }
+  return undefined;
 }
 
 function sameRect(left: Rect, right: Rect): boolean {

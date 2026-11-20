@@ -31,6 +31,8 @@ function makeHostFixture() {
   ];
   const contexts = [];
   const dispatches = [];
+  const imageCaptures = [];
+  const windowImageCaptures = [];
   const seams = {
     async readWindowsProductGrants() { return grants; },
     async listWindowsAppWindows() { return windows; },
@@ -48,6 +50,14 @@ function makeHostFixture() {
             dispatches.push({ appId: context.app.id, step, target });
             return { status: 'dispatched' };
           },
+          async observeDesktopImage() {
+            imageCaptures.push({ appId: context.app.id });
+            return { mimeType: 'image/png', dataBase64: 'AA==', width: 1000, height: 1000 };
+          },
+          async observeWindowImage(target) {
+            windowImageCaptures.push({ appId: context.app.id, target });
+            return { mimeType: 'image/png', dataBase64: 'AA==', width: 1000, height: 1000 };
+          },
           async bringToFront() {
             return { status: 'dispatched' };
           },
@@ -64,7 +74,7 @@ function makeHostFixture() {
     },
     policy: () => ({ decision: 'allow', code: 'product_test' }),
   };
-  return { seams, windows, contexts, dispatches, setGrants(value) { grants = value; } };
+  return { seams, windows, contexts, dispatches, imageCaptures, windowImageCaptures, setGrants(value) { grants = value; } };
 }
 
 test('product host exposes only granted apps and includes owned child windows under the app grant', async () => {
@@ -193,5 +203,105 @@ test('revocation and target identity are rechecked before approval dispatch', as
   assert.equal(stale.status, 'stopped');
   assert.ok(['window_scope_changed', 'observation_incomplete'].includes(stale.code));
   assert.equal(fixture.dispatches.length, 0);
+  await workspace.close();
+});
+
+test('optional Windows OCR uses a fresh guarded desktop capture and preserves approval freshness', async () => {
+  const fixture = makeHostFixture();
+  fixture.setGrants({ version: 1, apps: [{ id: 'editor', name: 'Editor' }], allowDesktopCapture: true, allowForegroundInput: false });
+  const runnerCalls = [];
+  const runner = {
+    async recognize(request) {
+      runnerCalls.push(request);
+      assert.deepEqual(request.region, { x: 40, y: 60, width: 100, height: 30 });
+      assert.equal(request.image.width, 1000);
+      assert.equal(request.image.height, 1000);
+      return [{ text: 'Send', confidence: 0.99 }];
+    },
+  };
+  const { policy: _fixturePolicy, ...seams } = fixture.seams;
+  const workspace = await createWindowsProductHost({
+    authorizationFile: 'ignored-for-seams',
+    ocr: {
+      pythonExecutable: 'python',
+      detectorModelPath: 'C:\\ocr\\detector.onnx',
+      recognizerModelPath: 'C:\\ocr\\recognizer.onnx',
+      dictionaryPath: 'C:\\ocr\\dict.txt',
+    },
+    test: { ...seams, ocrRunner: runner },
+  });
+  assert.equal((await workspace.act({ activate: 'editor' })).status, 'completed');
+  const observation = await workspace.observe({ view: 'controls' });
+  const pending = await workspace.act({
+    observationId: observation.observationId,
+    steps: [{ kind: 'click', target: { role: 'Button', name: 'Go', within: 'Editor Main' } }],
+  });
+  assert.equal(pending.status, 'stopped');
+  assert.equal(pending.code, 'approval_required');
+  assert.equal(fixture.windowImageCaptures.length, 1);
+  assert.equal(fixture.windowImageCaptures[0].target.hwnd, 10001n);
+  assert.equal(runnerCalls.length, 1);
+
+  const resumed = await workspace.resolveApproval(pending.requestId, 'approve');
+  assert.equal(resumed.status, 'completed', JSON.stringify(resumed));
+  assert.equal(fixture.windowImageCaptures.length, 2);
+  assert.equal(runnerCalls.length, 2);
+  assert.equal(fixture.dispatches.at(-1).appId, 'editor');
+  const knownObservation = await workspace.observe({ view: 'controls' });
+  const known = await workspace.act({
+    observationId: knownObservation.observationId,
+    steps: [{ kind: 'type', target: { role: 'Edit', name: 'Value', within: 'Editor Main' }, text: 'draft' }],
+  });
+  assert.equal(known.status, 'completed', JSON.stringify(known));
+  assert.equal(fixture.windowImageCaptures.length, 2);
+  assert.equal(runnerCalls.length, 2);
+  await workspace.close();
+});
+
+test('configured extra applications remain discoverable without Windows grants', async () => {
+  const fixture = makeHostFixture();
+  fixture.setGrants({ version: 1, apps: [], allowDesktopCapture: false, allowForegroundInput: false });
+  const extra = {
+    id: 'cloud-adapter',
+    name: 'Cloud Adapter',
+    capabilities: [],
+    async open() { throw new Error('not opened in discovery test'); },
+  };
+  const workspace = await createWindowsProductHost({
+    authorizationFile: 'ignored-for-seams',
+    extraApplications: [extra],
+    test: fixture.seams,
+  });
+  const inventory = await workspace.observe({ workspace: true });
+  assert.deepEqual(inventory.applications.map(app => app.id), ['cloud-adapter']);
+  await workspace.close();
+});
+
+test('OCR remains unavailable without the explicit desktop-capture grant', async () => {
+  const fixture = makeHostFixture();
+  fixture.setGrants({ version: 1, apps: [{ id: 'editor', name: 'Editor' }], allowDesktopCapture: false, allowForegroundInput: false });
+  const runnerCalls = [];
+  const runner = { async recognize(request) { runnerCalls.push(request); return [{ text: 'Send', confidence: 0.99 }]; } };
+  const { policy: _fixturePolicy, ...seams } = fixture.seams;
+  const workspace = await createWindowsProductHost({
+    authorizationFile: 'ignored-for-seams',
+    ocr: {
+      pythonExecutable: 'python',
+      detectorModelPath: 'C:\\ocr\\detector.onnx',
+      recognizerModelPath: 'C:\\ocr\\recognizer.onnx',
+      dictionaryPath: 'C:\\ocr\\dict.txt',
+    },
+    test: { ...seams, ocrRunner: runner },
+  });
+  assert.equal((await workspace.act({ activate: 'editor' })).status, 'completed');
+  const observation = await workspace.observe({ view: 'controls' });
+  const refused = await workspace.act({
+    observationId: observation.observationId,
+    steps: [{ kind: 'click', target: { role: 'Button', name: 'Go', within: 'Editor Main' } }],
+  });
+  assert.equal(refused.status, 'stopped');
+  assert.equal(refused.code, 'risk_evidence_required');
+  assert.equal(fixture.windowImageCaptures.length, 0);
+  assert.equal(runnerCalls.length, 0);
   await workspace.close();
 });

@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ApprovalDecision, ApprovalRequest } from "../core/session-types.js";
 import type { DeskToolHost } from "../integrations/shared.js";
-import { createWindowsProductHost } from "./windows-host.js";
+import { openInstalledWindowsHost } from "./windows-product.js";
 
 type ConfirmWindowsAction = (request: ApprovalRequest, signal?: AbortSignal) => Promise<ApprovalDecision>;
 
@@ -19,7 +19,7 @@ export async function createWindowsMcpHost(
   confirm: ConfirmWindowsAction = confirmWindowsAction,
 ): Promise<DeskToolHost> {
   const pending = new Map<string, ApprovalRequest>();
-  const workspace = await createWindowsProductHost({
+  const workspace = await openInstalledWindowsHost({
     authorizationFile,
     onApprovalRequested(request) {
       for (const [id, earlier] of pending) if (earlier.expiresAt <= Date.now()) pending.delete(id);

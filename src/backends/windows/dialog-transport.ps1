@@ -16,6 +16,53 @@ function ErrorReply([string] $code) {
   return [ordered]@{ ok = $false; code = $code }
 }
 
+function CaptureDesktop([object] $request) {
+  Add-Type -AssemblyName System.Drawing
+  $width = [int]$request.width
+  $height = [int]$request.height
+  if ($width -lt 1 -or $height -lt 1 -or [long]$width * $height -gt 40000000) {
+    return ErrorReply "desktop_capture_invalid_size"
+  }
+  # The parent works in the logical coordinate space returned by user32.
+  # Sample the actual display pixels here, then scale the entire primary
+  # display to that same logical grid before exposing the screenshot.
+  $prior = [NativeWindowScope]::SetThreadDpiAwarenessContext([IntPtr](-4))
+  if ($prior -eq [IntPtr]::Zero) { return ErrorReply "desktop_capture_dpi_unavailable" }
+  $pixels = $null
+  $reader = $null
+  $scaled = $null
+  $writer = $null
+  $stream = $null
+  try {
+    $pixelWidth = [NativeWindowScope]::GetSystemMetrics(0)
+    $pixelHeight = [NativeWindowScope]::GetSystemMetrics(1)
+    if ($pixelWidth -lt 1 -or $pixelHeight -lt 1 -or [long]$pixelWidth * $pixelHeight -gt 40000000) {
+      return ErrorReply "desktop_capture_invalid_size"
+    }
+    $pixels = [Drawing.Bitmap]::new($pixelWidth, $pixelHeight)
+    $reader = [Drawing.Graphics]::FromImage($pixels)
+    $reader.CopyFromScreen(0, 0, 0, 0, [Drawing.Size]::new($pixelWidth, $pixelHeight))
+    $stream = [IO.MemoryStream]::new()
+    if ($pixelWidth -eq $width -and $pixelHeight -eq $height) {
+      $pixels.Save($stream, [Drawing.Imaging.ImageFormat]::Jpeg)
+    } else {
+      $scaled = [Drawing.Bitmap]::new($width, $height)
+      $writer = [Drawing.Graphics]::FromImage($scaled)
+      $writer.InterpolationMode = [Drawing.Drawing2D.InterpolationMode]::HighQualityBilinear
+      $writer.DrawImage($pixels, 0, 0, $width, $height)
+      $scaled.Save($stream, [Drawing.Imaging.ImageFormat]::Jpeg)
+    }
+    return [ordered]@{ ok = $true; width = $width; height = $height; data = [Convert]::ToBase64String($stream.ToArray()) }
+  } finally {
+    if ($stream) { $stream.Dispose() }
+    if ($writer) { $writer.Dispose() }
+    if ($scaled) { $scaled.Dispose() }
+    if ($reader) { $reader.Dispose() }
+    if ($pixels) { $pixels.Dispose() }
+    [void][NativeWindowScope]::SetThreadDpiAwarenessContext($prior)
+  }
+}
+
 function RequestString([object] $request, [string] $name) {
   $value = $request.$name
   if ($null -eq $value) { throw "native_uia_invalid_request" }
@@ -563,6 +610,10 @@ public static class NativeWindowScope {
   public static extern bool GetWindowRect(IntPtr hwnd, out NativeWindowRect rect);
   [DllImport("user32.dll")]
   public static extern IntPtr WindowFromPoint(NativeWindowPoint point);
+  [DllImport("user32.dll")]
+  public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
+  [DllImport("user32.dll")]
+  public static extern int GetSystemMetrics(int index);
 }
 "@
     $request = $raw | ConvertFrom-Json
@@ -572,6 +623,8 @@ public static class NativeWindowScope {
       $reply = Observe $request
     } elseif ([string]$request.op -eq "focus") {
       $reply = Focus $request
+    } elseif ([string]$request.op -eq "desktop_image") {
+      $reply = CaptureDesktop $request
     } elseif ([string]$request.op -eq "dispatch") {
       $reply = Dispatch $request
     } else {

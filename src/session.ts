@@ -50,7 +50,7 @@ import { validateRequest } from "./request.js";
 import { canonicalRole, matchControl } from "./grounding.js";
 import { defaultRiskPolicy, recheckRiskApproval } from "./policy.js";
 import { awaitAbortable, deepFreeze, freezeCapabilities, intersectCapabilities, mergeSignals, safeAdapterCode, safeValidationCode } from "./core/session-support.js";
-import { approvalActionParams, approvalSummary, normalizeApprovalDecision } from "./core/session-approval.js";
+import { approvalActionParams, approvalContextSummary, approvalSummary, normalizeApprovalDecision } from "./core/session-approval.js";
 import { isSensitiveControl, ObservationRegistry, sanitizeText, type StoredObservation } from "./core/observation-registry.js";
 import { sameBinding, TargetResolver, type Binding, type FocusRecord, type PreparedStep } from "./core/session-target-resolver.js";
 
@@ -315,14 +315,13 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
     riskInput: RiskInput,
   ): PendingApproval {
     const requestId = makeApprovalId();
+    const contextSummary = approvalContextSummary(prepared.target, riskDecision.code);
     const request: ApprovalRequest = {
       requestId,
       step: index,
       kind: prepared.step.kind,
       summary: approvalSummary(prepared.step, prepared.target, prepared.destination),
-      ...(prepared.target.approvalContext?.summary
-        ? { contextSummary: sanitizeText(prepared.target.approvalContext.summary, 512) }
-        : {}),
+      ...(contextSummary ? { contextSummary } : {}),
       params: approvalActionParams(prepared.step),
       expiresAt: Date.now() + Math.max(1, approvalTimeoutMs),
     };

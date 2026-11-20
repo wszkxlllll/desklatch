@@ -8,6 +8,9 @@ import {
   type RapidOcrStatus,
   type RapidOcrStatusCode,
 } from "../evidence/rapidocr.js";
+import { readE2BApiKey } from "../product/runtime-config.js";
+
+export { readE2BApiKey } from "../product/runtime-config.js";
 
 const E2B_PACKAGE = "@e2b/desktop" as const;
 
@@ -26,6 +29,8 @@ export interface OptionalSetupOptions {
   readonly rootDirectory?: string;
   /** Check the consumer's optional @e2b/desktop dependency and API key. */
   readonly e2b?: boolean;
+  /** Optional protected .env file; its key is read without mutating process.env. */
+  readonly e2bEnvFile?: string;
   /** Check an explicitly configured local OCR environment and model set. */
   readonly ocr?: OptionalOcrSetupOptions;
 }
@@ -93,7 +98,7 @@ export async function checkOptionalSetup(
 ): Promise<OptionalSetupResult> {
   const rootDirectory = normalizeRootDirectory(options.rootDirectory);
   const reports: OptionalSetupReports = {
-    ...(options.e2b === true ? { e2b: checkE2BSetup(rootDirectory) } : {}),
+    ...(options.e2b === true ? { e2b: checkE2BSetup(rootDirectory, options.e2bEnvFile) } : {}),
     ...(options.ocr === undefined ? {} : { ocr: await checkOcrSetup(options.ocr) }),
   };
   const selected = Object.values(reports);
@@ -112,10 +117,11 @@ function normalizeRootDirectory(value: string | undefined): string {
   return resolvePath(value);
 }
 
-function checkE2BSetup(rootDirectory: string): E2BOptionalSetupReport {
+function checkE2BSetup(rootDirectory: string, envFile?: string): E2BOptionalSetupReport {
   const packageResolution = resolveConsumerPackage(rootDirectory, E2B_PACKAGE);
   const packageAvailable = packageResolution === "resolved";
-  const apiKeyConfigured = configuredEnvironmentValue("E2B_API_KEY");
+  const apiKey = readE2BApiKey(envFile);
+  const apiKeyConfigured = apiKey !== undefined;
   if (packageResolution === "missing") {
     return {
       module: "e2b",
@@ -184,11 +190,6 @@ function resolveConsumerPackage(rootDirectory: string, packageName: string): "re
 
 function isModuleNotFound(error: unknown): boolean {
   return error !== null && typeof error === "object" && (error as NodeJS.ErrnoException).code === "MODULE_NOT_FOUND";
-}
-
-function configuredEnvironmentValue(name: string): boolean {
-  const value = process.env[name];
-  return typeof value === "string" && value.trim().length > 0;
 }
 
 async function checkOcrSetup(options: OptionalOcrSetupOptions): Promise<OcrOptionalSetupReport> {

@@ -19,3 +19,9 @@ The bundle carries the DeskLatch runtime and installs its pinned CUA driver
 and Windows inspector dependencies. Outside Windows, it opens the isolated
 browser demo. The demo can use an installed Chrome or Edge or a Chromium
 binary selected through `DESKLATCH_CHROMIUM`.
+
+The Windows installer persists optional OCR and E2B settings with the local
+authorization. OCR supplies local evidence for ambiguous actions under the
+screen-capture grant. With an E2B key configured, the two DeskLatch tools can
+switch to the cloud browser and Writer. The first cloud activation starts the
+guest. Approval continues through DSH's normal session cards.

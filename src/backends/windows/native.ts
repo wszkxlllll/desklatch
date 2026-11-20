@@ -1,6 +1,6 @@
 import type { Point, Rect } from "../../contracts.js";
 import { PowerShellNativeUiAutomationWorker, type NativeUiAutomationWorker } from "./dialog-transport.js";
-import type { WindowsFocusEvidence, WindowsPhysicalEvidence, WindowsPhysicalInspector, WindowsWindowTarget } from "./types.js";
+import type { WindowsDesktopImage, WindowsFocusEvidence, WindowsPhysicalEvidence, WindowsPhysicalInspector, WindowsWindowTarget } from "./types.js";
 
 type DynamicImport = (specifier: string) => Promise<Record<string, unknown>>;
 type NativeFunction = (...args: any[]) => any;
@@ -29,6 +29,7 @@ export async function loadWindowsPhysicalInspector(): Promise<WindowsPhysicalIns
     const getWindowRect = user32.func("int __stdcall GetWindowRect(uintptr_t hwnd, void *rect)");
     const getWindow = user32.func("uintptr_t __stdcall GetWindow(uintptr_t hwnd, uint32_t command)");
     const getAncestor = user32.func("uintptr_t __stdcall GetAncestor(uintptr_t hwnd, uint32_t flags)");
+    const getSystemMetrics = user32.func("int __stdcall GetSystemMetrics(int index)");
     return new User32Inspector({
       isWindow,
       isWindowVisible,
@@ -38,7 +39,8 @@ export async function loadWindowsPhysicalInspector(): Promise<WindowsPhysicalIns
       getWindowRect,
       getWindow,
       getAncestor,
-    }, new PowerShellNativeUiAutomationWorker());
+      getSystemMetrics,
+    }, new PowerShellNativeUiAutomationWorker(), new PowerShellNativeUiAutomationWorker({ maxOutputBytes: 8 * 1024 * 1024 }));
   } catch {
     // Native evidence is a hard pre-dispatch requirement. Returning undefined
     // lets the adapter honestly refuse input instead of guessing ownership.
@@ -55,15 +57,18 @@ interface User32Api {
   readonly getWindowRect: NativeFunction;
   readonly getWindow: NativeFunction;
   readonly getAncestor: NativeFunction;
+  readonly getSystemMetrics: NativeFunction;
 }
 
 class User32Inspector implements WindowsPhysicalInspector {
   readonly #api: User32Api;
   readonly #focusWorker?: NativeUiAutomationWorker;
+  readonly #captureWorker?: NativeUiAutomationWorker;
 
-  constructor(api: User32Api, focusWorker?: NativeUiAutomationWorker) {
+  constructor(api: User32Api, focusWorker?: NativeUiAutomationWorker, captureWorker?: NativeUiAutomationWorker) {
     this.#api = api;
     this.#focusWorker = focusWorker;
+    this.#captureWorker = captureWorker;
   }
 
   async read(target: WindowsWindowTarget, point?: Point, signal?: AbortSignal): Promise<WindowsPhysicalEvidence | undefined> {
@@ -146,8 +151,21 @@ class User32Inspector implements WindowsPhysicalInspector {
     }
   }
 
+  async captureDesktopImage(signal?: AbortSignal): Promise<WindowsDesktopImage | undefined> {
+    if (!this.#captureWorker) return undefined;
+    signal?.throwIfAborted();
+    const width = Number(this.#api.getSystemMetrics(0));
+    const height = Number(this.#api.getSystemMetrics(1));
+    const result = record(await this.#captureWorker.request({ op: "desktop_image", width, height }, { signal }));
+    if (result?.ok !== true || result.width !== width || result.height !== height
+        || typeof result.data !== "string" || result.data.length === 0
+        || width !== Number(this.#api.getSystemMetrics(0)) || height !== Number(this.#api.getSystemMetrics(1))) return undefined;
+    return { mimeType: "image/jpeg", dataBase64: result.data, width, height };
+  }
+
   async close(): Promise<void> {
     await this.#focusWorker?.close?.();
+    await this.#captureWorker?.close?.();
   }
 
   /**
