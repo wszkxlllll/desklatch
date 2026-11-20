@@ -31,7 +31,7 @@ export function normalizeEndpoints(endpoints: readonly ToolEndpoint[]): readonly
   const normalized: ToolEndpoint[] = [];
 
   for (const endpoint of endpoints) {
-    if (endpoint.name !== "observe" && endpoint.name !== "act") {
+    if (endpoint.name !== "observe" && endpoint.name !== "act" && endpoint.name !== "run_code") {
       throw new Error(`Unsupported DeskLatch tool endpoint: ${String(endpoint.name)}`);
     }
     if (seen.has(endpoint.name)) {
@@ -111,7 +111,7 @@ export function toDesktopContent(value: unknown, policy: ImagePolicy = "native")
   return [text, { type: "image" as const, data: normalized.image.dataBase64, mimeType: normalized.image.mimeType }];
 }
 
-const publicToolErrors = new Set(["closed", "invalid_view", "invalid_observe", "invalid_observe_filter",
+const publicToolErrors = new Set(["closed", "code_mode_busy", "invalid_view", "invalid_observe", "invalid_observe_filter",
   "image_delivery_not_authorized", "document_delivery_not_authorized", "invalid_document_read", "document_cursor_stale", "observe_failed", "cancelled"]);
 
 export function errorText(error: unknown): string {

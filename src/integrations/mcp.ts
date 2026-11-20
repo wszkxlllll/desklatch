@@ -33,7 +33,7 @@ function textResult(text: string, isError = false): CallToolResult {
 }
 
 /**
- * Build an official MCP v1 server around the two public DeskLatch endpoints.
+ * Build an official MCP v1 server around the provided DeskLatch endpoints.
  * A low-level `Server` is used so the endpoint-provided JSON Schema is
  * advertised unchanged; no Zod conversion can silently broaden or narrow the
  * host's authorization contract.

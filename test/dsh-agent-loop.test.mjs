@@ -108,6 +108,11 @@ test("official DSH AgentLoop dispatches DeskLatch tools from an Agent-scoped plu
 class ApprovalAdapter extends LlmAdapter {
   requests = [];
 
+  constructor(codeMode) {
+    super();
+    this.codeMode = codeMode;
+  }
+
   async resolveModel(provider, model) {
     return { provider, id: model, name: model, context: { contextWindow: 16_384 }, inputModalities: ["text"], systemPromptUpdate: "in-history", toolUpdate: "in-history" };
   }
@@ -119,7 +124,10 @@ class ApprovalAdapter extends LlmAdapter {
       const steps = this.requests.length === 1
         ? [{ kind: "type", target: { name: "Title" }, text }, { kind: "type", target: { name: "Title" }, text: "approved action 2" }]
         : [{ kind: "type", target: { name: "Title" }, text }];
-      yield { type: "tool-call-delta", index: 0, id: `approval-call-${this.requests.length}`, name: "desklatch_act", argumentsDelta: JSON.stringify({ steps }) };
+      const code = `for (const step of ${JSON.stringify(steps)}) await desk.act({ steps: [step] });`;
+      const name = this.codeMode ? "desklatch_run_code" : "desklatch_act";
+      const args = this.codeMode ? { code } : { steps };
+      yield { type: "tool-call-delta", index: 0, id: `approval-call-${this.requests.length}`, name, argumentsDelta: JSON.stringify(args) };
       yield { type: "finish", reason: { kind: "tool-calls" } };
       return;
     }
@@ -140,7 +148,7 @@ function waitFor(predicate) {
   });
 }
 
-test("native DSH approval bridge holds act until consent and resumes or denies once", async () => {
+async function verifyNativeApproval(codeMode) {
   const ctx = new Context();
   const fibers = [];
   const questions = [];
@@ -173,7 +181,7 @@ test("native DSH approval bridge holds act until consent and resumes or denies o
     fibers.push(await mount(ctx, AgentLoop));
     ctx.on("approval/request", (request) => new Promise((resolve) => questions.push({ request, resolve })));
 
-    const adapter = new ApprovalAdapter();
+    const adapter = new ApprovalAdapter(codeMode);
     disposeAdapter = ctx.llm.registerAdapter(["approval-offline"], adapter);
     handle = await ctx.agents.create({
       sessionId: "dsh-approval-test",
@@ -191,7 +199,7 @@ test("native DSH approval bridge holds act until consent and resumes or denies o
             return rawSession.resolveApproval(requestId, decision);
           },
         };
-        const fiber = agentCtx.plugin(createDeskDshPlugin(() => session, { approval: bridge }));
+        const fiber = agentCtx.plugin(createDeskDshPlugin(() => session, { approval: bridge, codeMode }));
         await fiber.await();
       },
     });
@@ -199,7 +207,8 @@ test("native DSH approval bridge holds act until consent and resumes or denies o
     handle.agent.followup(createUserMessage({ content: [{ type: "text", text: "Do the approved action." }], source: { kind: "user" } }));
     const firstIdle = handle.agent.whenIdle();
     await waitFor(() => questions.length === 1);
-    assert.equal(questions[0].request.toolName, "desklatch_act");
+    assert.equal(adapter.requests[0].tools.some(tool => tool.name === "desklatch_run_code"), codeMode);
+    assert.equal(questions[0].request.toolName, codeMode ? "desklatch_run_code" : "desklatch_act");
     assert.equal(calls.length, 0);
     questions.shift().resolve("allowed-once");
     await waitFor(() => questions.length === 1);
@@ -229,4 +238,7 @@ test("native DSH approval bridge holds act until consent and resumes or denies o
     for (const fiber of fibers.reverse()) await fiber.dispose();
     await ctx.fiber.dispose();
   }
-});
+}
+
+test("native DSH approval bridge holds act until consent and resumes or denies once", () => verifyNativeApproval(false));
+test("each Code Mode act uses the native DSH approval bridge", () => verifyNativeApproval(true));

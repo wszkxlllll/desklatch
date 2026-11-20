@@ -2,7 +2,7 @@ import type { Capability, DocumentRead, Selector, View } from "./contracts.js";
 import { actToolSchema } from "./request.js";
 
 export interface ToolEndpoint {
-  name: "observe" | "act";
+  name: "observe" | "act" | "run_code";
   description: string;
   inputSchema: Record<string, unknown>;
   invoke(input: unknown, signal?: AbortSignal): Promise<unknown>;

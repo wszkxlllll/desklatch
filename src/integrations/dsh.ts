@@ -11,6 +11,7 @@ import type { ApprovalService } from "@deepseek-ai/dsh-user-approval";
 import type { ApprovalDecision, ApprovalRequest } from "../core/session-types.js";
 import type { ToolEndpoint } from "../tools.js";
 import { errorText, resolveDeskToolHost, toDesktopContent, type DeskToolHost, type DeskToolSource } from "./shared.js";
+import type { CodeModeOptions } from "../code-mode/index.js";
 
 export type DeskDshSession = DeskToolSource;
 
@@ -234,9 +235,13 @@ export function createDeskDshApprovalBridge(ctx: Context): DeskDshApprovalBridge
 export interface DeskDshPluginOptions {
   /** Optional bridge created with createDeskDshApprovalBridge(ctx). */
   readonly approval?: DeskDshApprovalBridge;
+  /** Trusted host opt-in. Programmatic act calls use the same DSH approval bridge. */
+  readonly codeMode?: boolean | CodeModeOptions;
 }
 
-function makeDefinition(ctx: Context, endpoint: ToolEndpoint, approval: DeskDshApprovalBridge | undefined, host: () => DeskToolHost | undefined): ToolDefinition {
+type DshCodeInvocation = (input: unknown, execution: ToolExecution) => Promise<unknown>;
+
+function makeDefinition(ctx: Context, endpoint: ToolEndpoint, approval: DeskDshApprovalBridge | undefined, host: () => DeskToolHost | undefined, runCode?: DshCodeInvocation): ToolDefinition {
   const name = `desklatch_${endpoint.name}`;
   const projections = new WeakMap<ToolExecution, PreparedImageProjection>();
   return {
@@ -264,7 +269,9 @@ function makeDefinition(ctx: Context, endpoint: ToolEndpoint, approval: DeskDshA
     execute: async (args: unknown, execution: ToolExecution) => {
       try {
         const input = (typeof args === "object" && args !== null ? args : {}) as Record<string, unknown>;
-        const invoke = () => endpoint.invoke(input, execution.signal);
+        const invoke = () => endpoint.name === "run_code" && runCode
+          ? runCode(input, execution)
+          : endpoint.invoke(input, execution.signal);
         const value = approval !== undefined && endpoint.name === "act"
           ? await approval.run(execution, host() as DeskToolHost, invoke)
           : await invoke();
@@ -287,7 +294,7 @@ function makeDefinition(ctx: Context, endpoint: ToolEndpoint, approval: DeskDshA
 /**
  * Create a native Cordis plugin. Each mount obtains its own host-authorized
  * session and owns exactly the registrations and close hook created by it.
- * No model loop, MCP transport, child process, or approval model endpoint is added.
+ * No model loop, MCP transport, or approval model endpoint is added.
  * The optional approval bridge only connects an existing host callback to DSH's
  * native in-conversation approval seam.
  */
@@ -313,12 +320,28 @@ export function createDeskDshPlugin(openSession: DeskDshOpenSession, options: De
 
       const activation = Promise.resolve()
         .then(() => openSession(ctx, controller.signal))
-        .then((opened) => {
+        .then(async (opened) => {
           session = resolveDeskToolHost(opened);
+          if (disposed || controller.signal.aborted) return closeOnce();
+          let runCode: DshCodeInvocation | undefined;
+          if (options.codeMode) {
+            try {
+              const { createDeskCodeMode } = await import("../code-mode/index.js");
+              const enabled = createDeskCodeMode(session, options.codeMode === true ? undefined : options.codeMode);
+              session = enabled;
+              const approval = options.approval;
+              runCode = (input, execution) => enabled.runCode(input, execution.signal, approval
+                ? (invoke, signal) => approval.run({ ...execution, signal }, enabled, invoke)
+                : undefined);
+            } catch (error) {
+              await closeOnce();
+              throw error;
+            }
+          }
           if (disposed || controller.signal.aborted) return closeOnce();
           for (const endpoint of session.tools) {
             if (disposed || controller.signal.aborted) break;
-            disposers.push(ctx.tools.register(makeDefinition(ctx, endpoint, options.approval, () => session)));
+            disposers.push(ctx.tools.register(makeDefinition(ctx, endpoint, options.approval, () => session, runCode)));
           }
         });
 

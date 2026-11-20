@@ -72,6 +72,10 @@
       "types": "./dist/workspace.d.ts",
       "import": "./dist/workspace.js"
     },
+    "./code-mode": {
+      "types": "./dist/code-mode/index.d.ts",
+      "import": "./dist/code-mode/index.js"
+    },
     "./schema": "./schema/act-input.schema.json"
   },
   "files": [
@@ -91,7 +95,9 @@
     "verify:package": "npm run build && node scripts/verify-package.mjs"
   },
   "dependencies": {
-    "ajv": "8.20.0"
+    "@jitl/quickjs-wasmfile-release-sync": "0.32.0",
+    "ajv": "8.20.0",
+    "quickjs-emscripten-core": "0.32.0"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "~4.1.0",
@@ -105,9 +111,15 @@
     "playwright-core": "^1.65.1"
   },
   "peerDependenciesMeta": {
-    "@deepseek-ai/cordis": { "optional": true },
-    "@deepseek-ai/dsh-tools": { "optional": true },
-    "@deepseek-ai/dsh-user-approval": { "optional": true },
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-user-approval": {
+      "optional": true
+    },
     "@openai/agents": {
       "optional": true
     },

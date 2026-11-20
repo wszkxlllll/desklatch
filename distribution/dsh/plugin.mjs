@@ -22,6 +22,9 @@ export default {
         });
       }
       : () => createDemoDeskSession({ onApprovalRequested: approval.onApprovalRequested });
-    await ctx.plugin(createDeskDshPlugin(openSession, { approval })).await();
+    await ctx.plugin(createDeskDshPlugin(openSession, {
+      approval,
+      codeMode: process.env.DESKLATCH_CODE_MODE === "1",
+    })).await();
   },
 };

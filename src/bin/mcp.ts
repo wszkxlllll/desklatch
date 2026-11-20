@@ -5,19 +5,34 @@ import { createDeskMcpServer } from "../integrations/mcp.js";
 import { resolveDeskToolHost } from "../integrations/shared.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
+const args = process.argv.slice(2);
+const codeFlag = args[0] === "--code-mode";
+if (codeFlag) args.shift();
+const usage = "usage: desklatch-mcp [--code-mode] (--windows <authorization-file> | --demo | <trusted-host-module.mjs>)";
+
 /** The command-line argument is a trusted operator-owned module, outside the model's tool surface. */
 async function main() {
-  const [input, authorizationFile, extra] = process.argv.slice(2);
+  const [input, authorizationFile, extra] = args;
   const windows = input === "--windows";
   if (!input || extra !== undefined || (windows ? !authorizationFile || !isAbsolute(authorizationFile) : authorizationFile !== undefined)) {
-    throw Error("usage: desklatch-mcp --windows <authorization-file> | --demo | <trusted-host-module.mjs>");
+    throw Error(usage);
   }
   const opened = windows
     ? await (await import("../product/windows-mcp.js")).createWindowsMcpHost(authorizationFile!)
     : input === "--demo"
     ? await (await import("../demo.js")).createDemoDeskSession()
     : await openHost(input);
-  const toolHost = resolveDeskToolHost(opened);
+  const baseHost = resolveDeskToolHost(opened);
+  let toolHost = baseHost;
+  if (codeFlag || process.env.DESKLATCH_CODE_MODE === "1") {
+    try {
+      const { createDeskCodeMode } = await import("../code-mode/index.js");
+      toolHost = createDeskCodeMode(baseHost);
+    } catch (error) {
+      await baseHost.close();
+      throw error;
+    }
+  }
   let closed: Promise<void> | undefined;
   const close = () => (closed ??= Promise.resolve().then(() => toolHost.close()));
   try {
@@ -42,9 +57,9 @@ async function openHost(input: string) {
 
 main().catch(() => {
   // stdout is reserved for MCP. Host exceptions may contain credentials or paths.
-  if (process.argv[2] === "--windows") console.error("DeskLatch could not start the Windows desktop host. Check installation and application authorization.");
-  else if (process.argv.length !== 3) console.error("usage: desklatch-mcp --windows <authorization-file> | --demo | <trusted-host-module.mjs>");
-  else if (process.argv[2] === "--demo") console.error("DeskLatch demo could not start. Run desklatch-setup mcp to check Playwright and Chromium.");
+  if (args[0] === "--windows") console.error("DeskLatch could not start the Windows desktop host. Check installation and application authorization.");
+  else if (args.length !== 1) console.error(usage);
+  else if (args[0] === "--demo") console.error("DeskLatch demo could not start. Run desklatch-setup mcp to check Playwright and Chromium.");
   else console.error("DeskLatch MCP host could not start");
   process.exitCode = 1;
 });

@@ -228,6 +228,13 @@ assert.equal(typeof (await import("desklatch/demo")).createDemoDeskSession, "fun
 const bundle = await import("desklatch-dsh");
 assert.equal(bundle.default?.name, "desklatch-dsh");
 assert.equal(typeof bundle.default?.apply, "function");
+const { createDeskCodeMode } = await import("desklatch/code-mode");
+const codeHost = createDeskCodeMode({ tools: [], close() {} });
+try {
+  const result = await codeHost.runCode({ code: 'inspect("portable")' });
+  assert.equal(result.status, "completed", JSON.stringify(result));
+  assert.deepEqual(result.inspections, ["portable"]);
+} finally { await codeHost.close(); }
 assert.throws(() => import.meta.resolve("@deepseek-ai/dsh-mcp-client"), { code: "ERR_MODULE_NOT_FOUND" });
 assert.throws(() => import.meta.resolve("@e2b/desktop"), { code: "ERR_MODULE_NOT_FOUND" });
 if (process.platform === "win32" && process.arch === "x64") {
