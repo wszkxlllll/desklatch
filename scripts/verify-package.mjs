@@ -17,6 +17,7 @@ try {
   assert.equal(basename(packed.filename), packed.filename);
   const files = new Set(packed.files.map(file => file.path));
   for (const path of ["schema/act-input.schema.json", "dist/bin/mcp.js", "dist/reuse.js", "dist/reuse.d.ts", "dist/backends/e2b/chromium_pipe.py",
+    "dist/workspace.js", "dist/workspace.d.ts", "dist/backends/e2b/atspi_worker.py", "dist/backends/e2b/x11-recipient.py",
     "dist/backends/windows/dialog-transport.ps1",
     "dist/evidence/rapidocr_worker.py", "dist/integrations/dsh.js", "dist/integrations/langchain-images.js",
     "docs/architecture.md", "examples/frameworks/langgraph.mjs"]) assert.ok(files.has(path), path);
@@ -25,6 +26,7 @@ try {
   const probe = `import assert from 'node:assert/strict';
     import { createDeskSession, createDeskTools } from 'desklatch';
     import { createVerifiedStepReuse } from 'desklatch/reuse';
+    import { createWorkspace } from 'desklatch/workspace';
     for (const peer of ['playwright-core', '@langchain/core', '@modelcontextprotocol/sdk', '@openai/agents', '@trycua/cua-driver', '@deepseek-ai/dsh-mcp-client']) {
       assert.throws(() => import.meta.resolve(peer), {code:'ERR_MODULE_NOT_FOUND'});
     }
@@ -43,9 +45,15 @@ try {
     await cache.remember('draft-title',request,result,{...scope,parameters:[{name:'title',paths:['steps.0.text','steps.0.expect.valueEquals']}]});
     const replay = await cache.run('draft-title',{...scope,values:{title:'revised'}});
     assert.equal(replay.result.steps[0].status,'verified'); assert.equal(value,'revised');
-    await session.close();`;
+    let selected = false;
+    const workspace = createWorkspace({applications:[{id:'editor',name:'Editor',session,
+      activate:()=>{selected=true;},verifyFront:()=>selected}]});
+    assert.deepEqual(workspace.tools.map(t=>t.name), ['observe','act']);
+    assert.equal((await workspace.tools[1].invoke({activate:'editor'})).status,'completed');
+    assert.equal((await workspace.tools[0].invoke({where:{name:'Title'}})).controls[0].value,'revised');
+    await workspace.close();`;
   run(["--input-type=module", "--eval", probe], consumer);
-  console.log(`Installed ${packed.name}@${packed.version} from tarball. Independent host verified an action and parameterized replay with zero optional peers.`);
+  console.log(`Installed ${packed.name}@${packed.version} from tarball. Independent host verified field replay and the two workspace tools with zero optional peers.`);
 } finally {
   const createdPath = await realpath(consumer);
   if (dirname(createdPath) === tempParent && basename(createdPath).startsWith("desklatch-pack-")) {

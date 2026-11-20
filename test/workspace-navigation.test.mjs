@@ -93,7 +93,9 @@ test("workspace navigation guards top-level redirects and preserves host resourc
       (error) => error?.code === "redirect_blocked",
     );
     assert.equal(foreignRequests, 0);
-    assert.equal(new URL(page.url()).origin, trustedOrigin);
+    // Chromium can keep the prior document or commit its own network-error page.
+    const afterBlock = new URL(page.url());
+    assert.ok(afterBlock.origin === trustedOrigin || afterBlock.href === "chrome-error://chromewebdata/" || afterBlock.href === "about:blank", afterBlock.href);
 
     for (const url of [
       "data:text/html,blocked",

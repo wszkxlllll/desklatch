@@ -244,3 +244,18 @@ export async function createE2BBrowserBackend(guest: E2BGuest, options: E2BBrows
     };
   } catch (error) { await managed.close(); throw error; }
 }
+
+export {
+  createE2BDesktopBackend,
+  E2BAtSpiCommandWorker,
+  E2BX11RecipientProcess,
+} from "./desktop.js";
+export type {
+  E2BAtSpiWorker,
+  E2BX11Recipient,
+  E2BX11KeyboardRecipient,
+  E2BDesktopActivationEvent,
+  E2BDesktopBackendOptions,
+  E2BDesktopSurface,
+  E2BWindowGrant,
+} from "./desktop.js";
