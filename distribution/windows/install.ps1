@@ -210,10 +210,10 @@ function Invoke-SetupFlow {
   }
   $dshHome = if ($Options.DshHome) { Resolve-TargetPath $Options.DshHome } elseif ($env:DSH_HOME) { $env:DSH_HOME } else { $null }
   $environment = New-ScopedEnvironment $root $dshHome
-  $npmArguments = @("install", "--save-exact", "--omit=optional", "--no-audit", "--no-fund", $core.FullName)
+  $npmArguments = @("install", "--save-exact", "--ignore-scripts", "--no-audit", "--no-fund", $core.FullName)
   Invoke-External -File $nodePair.Node -Arguments (@($nodePair.Npm) + $npmArguments) -WorkingDirectory $root -Environment $environment -Label "npm package installation" | Out-Null
 
-  $setupArguments = @("exec", "--", "desklatch-setup", $Options.Route)
+  $setupArguments = @("exec", "--", "desklatch-setup", $Options.Route, "--windows")
   if ($Options.Route -eq "mcp") { $setupArguments += @("--install", "--output", (Join-Path $root "desklatch.mcp.json")) }
   else { $setupArguments += @("--bundle", $dsh.FullName) }
   if ($Options.E2bChoice -eq "Install") { $setupArguments += "--install-e2b" }
@@ -236,7 +236,10 @@ function Invoke-SetupFlow {
     Assert-DshClosed
     Write-InstallLog "DSH Desktop must be fully closed before the official profile command runs."
     $storeDirectory = Join-Path $root ".desklatch\cache\pnpm"
-    Invoke-External -File $dshCommand -Arguments @("plugin", "--profile", $Options.DshProfile, "add", "--store-dir", $storeDirectory, $dsh.FullName) -WorkingDirectory $root -Environment $environment -Label "official DSH bundle installation" | Out-Null
+    # The bundle uses checked platform binaries and does not need dependency build scripts.
+    Invoke-External -File $dshCommand -Arguments @("plugin", "--profile", $Options.DshProfile, "add", "--ignore-scripts", "--store-dir", $storeDirectory, $dsh.FullName) -WorkingDirectory $root -Environment $environment -Label "official DSH bundle installation" | Out-Null
+    $registerArguments = @("exec", "--", "desklatch-setup", "dsh", "--windows", "--register-windows-location", "--bundle", $dsh.FullName)
+    Invoke-External -File $nodePair.Node -Arguments (@($nodePair.Npm) + $registerArguments) -WorkingDirectory $root -Environment $environment -Label "Windows authorization registration" | Out-Null
     Write-InstallLog ("DSH bundle installed for profile " + $Options.DshProfile + ". Restart DSH to load the native tools.")
   } else {
     Write-InstallLog ("MCP configuration written to " + (Join-Path $root "desklatch.mcp.json") + ". Add this server entry to your MCP client; no DSH profile was changed.")
@@ -364,6 +367,14 @@ function Start-Gui {
   $startButton.Text = "开始安装"; $startButton.Location = New-Object Drawing.Point(540, 552); $startButton.Size = New-Object Drawing.Size(90, 30); $form.Controls.Add($startButton)
   $closeButton = New-Object Windows.Forms.Button
   $closeButton.Text = "关闭"; $closeButton.Location = New-Object Drawing.Point(640, 552); $closeButton.Size = New-Object Drawing.Size(90, 30); $closeButton.Add_Click({ $form.Close() }); $form.Controls.Add($closeButton)
+  $authorizeButton = New-Object Windows.Forms.Button
+  $authorizeButton.Text = "打开授权页"; $authorizeButton.Location = New-Object Drawing.Point(390, 552); $authorizeButton.Size = New-Object Drawing.Size(140, 30); $authorizeButton.Enabled = $false
+  $authorizeButton.Add_Click({
+    $authorizePath = Join-Path $state.InstalledRoot "DeskLatch-Authorize.cmd"
+    if (Test-Path -LiteralPath $authorizePath -PathType Leaf) { Start-Process -FilePath $authorizePath -WorkingDirectory $state.InstalledRoot -WindowStyle Hidden }
+    else { [Windows.Forms.MessageBox]::Show($form, "授权启动文件尚未生成。请先完成安装。", "DeskLatch 安装", [Windows.Forms.MessageBoxButtons]::OK, [Windows.Forms.MessageBoxIcon]::Information) | Out-Null }
+  })
+  $form.Controls.Add($authorizeButton)
   $copyButton = New-Object Windows.Forms.Button
   $copyButton.Text = "复制 MCP 配置"; $copyButton.Location = New-Object Drawing.Point(20, 552); $copyButton.Size = New-Object Drawing.Size(135, 30); $copyButton.Visible = $false
   $form.Controls.Add($copyButton)
@@ -381,7 +392,7 @@ function Start-Gui {
   $dshRadio.Add_CheckedChanged($updateState); $mcpRadio.Add_CheckedChanged($updateState); $e2bCombo.Add_SelectedIndexChanged($updateState); $ocrCombo.Add_SelectedIndexChanged($updateState); & $updateState
 
   $script:LogSink = { param([string]$Message) if ($script:LogBox -and -not $script:LogBox.IsDisposed) { $script:LogBox.AppendText($Message + [Environment]::NewLine) } }
-  $state = @{ Process = $null; OutputTask = $null; ErrorTask = $null; Route = $null; McpConfig = $null }
+  $state = @{ Process = $null; OutputTask = $null; ErrorTask = $null; Route = $null; McpConfig = $null; InstalledRoot = $null }
   $copyButton.Add_Click({
     try { [Windows.Forms.Clipboard]::SetText([IO.File]::ReadAllText($state.McpConfig, [Text.Encoding]::UTF8)); $copyButton.Text = "配置已复制" }
     catch { [Windows.Forms.MessageBox]::Show($form, "复制失败。可在安装目录打开 desklatch.mcp.json。", "DeskLatch 安装") | Out-Null }
@@ -403,7 +414,8 @@ function Start-Gui {
       $startButton.Enabled = $true
       $closeButton.Enabled = $true
       if ($state.Process.ExitCode -eq 0) {
-        $nextStep = if ($state.Route -eq "dsh") { "重新打开 DeepSeek Harness。新建会话后可用 DeskLatch，并在审批卡上选择批准或拒绝。" } else { "MCP 配置已生成。点击复制，把它添加到你使用的客户端。" }
+        $authorizeButton.Enabled = Test-Path -LiteralPath (Join-Path $state.InstalledRoot "DeskLatch-Authorize.cmd") -PathType Leaf
+        $nextStep = if ($state.Route -eq "dsh") { "打开授权页选择应用，再重新打开 DeepSeek Harness。关键动作会在 DSH 会话中请求确认。" } else { "打开授权页选择应用，再复制 MCP 配置到你的客户端。关键动作会弹出 Windows 审批窗口。" }
         if ($stdout -match 'E2B_API_KEY_MISSING') { $nextStep += " E2B 已安装，之后可重开向导填写密钥。" }
         $copyButton.Visible = $state.Route -eq "mcp"
         [Windows.Forms.MessageBox]::Show($form, $nextStep, "DeskLatch 安装完成", [Windows.Forms.MessageBoxButtons]::OK, [Windows.Forms.MessageBoxIcon]::Information) | Out-Null
@@ -434,10 +446,10 @@ function Start-Gui {
       try { $start.StandardOutputEncoding = New-Object Text.UTF8Encoding($false); $start.StandardErrorEncoding = New-Object Text.UTF8Encoding($false) } catch { }
       $state.Process = New-Object Diagnostics.Process; $state.Process.StartInfo = $start
       if (-not $state.Process.Start()) { throw "Could not start the installer worker." }
-      $state.Route = $options.Route; $state.McpConfig = Join-Path (Resolve-TargetPath $options.InstallRoot) "desklatch.mcp.json"
+      $state.Route = $options.Route; $state.InstalledRoot = $start.WorkingDirectory; $state.McpConfig = Join-Path $state.InstalledRoot "desklatch.mcp.json"
       $state.OutputTask = $state.Process.StandardOutput.ReadToEndAsync()
       $state.ErrorTask = $state.Process.StandardError.ReadToEndAsync()
-      $startButton.Enabled = $false; $closeButton.Enabled = $false; $copyButton.Visible = $false; $script:ProgressBar.Visible = $true; $timer.Start(); $script:LogBox.AppendText("开始安装，请稍候。`r`n")
+      $startButton.Enabled = $false; $closeButton.Enabled = $false; $authorizeButton.Enabled = $false; $copyButton.Visible = $false; $script:ProgressBar.Visible = $true; $timer.Start(); $script:LogBox.AppendText("开始安装，请稍候。`r`n")
     } catch { [Windows.Forms.MessageBox]::Show($form, $_.Exception.Message, "DeskLatch 安装", [Windows.Forms.MessageBoxButtons]::OK, [Windows.Forms.MessageBoxIcon]::Warning) | Out-Null }
   })
   [void]$form.ShowDialog()

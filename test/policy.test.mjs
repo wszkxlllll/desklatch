@@ -48,6 +48,33 @@ test("unknown actions do not silently allow and a clear text-only review may all
   assert.equal(noReviewer.decision, "needs_evidence");
 });
 
+test("native controls with untyped effects use local evidence before review", async () => {
+  const reviewed = [];
+  const policy = createRiskPolicy({ reviewer(request) { reviewed.push(request.target.name); return { classification: "unclear" }; } });
+  const click = (name, role = "Button", count = 1) => policy(input(
+    { kind: "click", target: { ref: "native" }, count },
+    control({ name, role, states: ["visible", "enabled"], effect: "unknown", actions: ["click"] }),
+  ));
+
+  for (const name of ["Search", "Open settings panel", "Find next", "Find...", "保存草稿", "查看付款记录", "不发送"]) {
+    assert.equal((await click(name)).decision, "allow", name);
+  }
+  assert.equal((await click("Details", "TabItem")).decision, "allow");
+  assert.equal((await click("File", "MenuItem")).decision, "allow");
+  assert.equal((await policy(input({ kind: "type", target: { ref: "editor" }, text: "Do not submit" }, control({ effect: "unknown" })))).decision, "allow");
+  assert.equal((await policy(input({ kind: "scroll", target: { ref: "list" }, direction: "down", amount: 1 },
+    control({ role: "List", effect: "unknown", actions: ["scroll"] })))).decision, "allow");
+
+  for (const name of ["Send message", "Checkout", "确认付款", "覆盖现有文件", "取消预约", "启用宏"]) {
+    assert.equal((await click(name)).decision, "approve", name);
+  }
+  assert.deepEqual(reviewed, []);
+  assert.equal((await click("Continue")).decision, "needs_evidence");
+  assert.equal((await click("Confirm")).decision, "needs_evidence");
+  assert.equal((await click("Search", "Button", 2)).decision, "needs_evidence");
+  assert.deepEqual(reviewed, ["Continue", "Confirm", "Search"]);
+});
+
 test("host hard denial cannot be overridden by a reviewer", async () => {
   let reviewed = false;
   let ocrCalls = 0;

@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { readFile, stat, writeFile } from "node:fs/promises";
+import { readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
-import { resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { stdin, stdout } from "node:process";
 import { parseArgs } from "node:util";
@@ -11,11 +12,14 @@ import { fileURLToPath } from "node:url";
 import { findChromiumExecutable } from "../backends/browser/local.js";
 import { installOcrSetup } from "../setup/install-ocr.js";
 import { checkOptionalSetup } from "../setup/optional.js";
+import { prepareWindowsAuthorizationFile, registerWindowsAuthorizationPath, windowsProductGrantsFile } from "../product/windows-grants.js";
 
 const usage = `DeskLatch setup
   desklatch-setup                         Choose a route and optional features
-  desklatch-setup mcp [--install] [--output desklatch.mcp.json]
+  desklatch-setup mcp [--install] [--output desklatch.mcp.json] [--demo]
   desklatch-setup dsh --bundle /path/to/desklatch-dsh.tgz
+  Windows installs desktop dependencies and creates DeskLatch-Authorize.cmd.
+  Use --demo for the isolated browser example when setting up MCP.
   Optional E2B: --e2b to check, --install-e2b to install, --env-file to read your existing key.
   Optional OCR: --ocr /path/to/ocr.json to check, --install-ocr to install locally.
   Run from the folder where you installed the DeskLatch tarball.`;
@@ -49,18 +53,82 @@ function moduleInstalled(name: string): boolean {
   }
 }
 
-async function writeMcpConfig(output: string) {
+async function writeMcpConfig(output: string, authorizationFile?: string) {
+  const mcpScript = fileURLToPath(new URL("./mcp.js", import.meta.url));
   const config = { mcpServers: { desklatch: {
     command: process.execPath,
-    args: [fileURLToPath(new URL("./mcp.js", import.meta.url)), "--demo"],
+    args: [mcpScript, ...(authorizationFile ? ["--windows", authorizationFile] : ["--demo"])],
   } } };
   const text = JSON.stringify(config, null, 2) + "\n";
   try {
     await writeFile(output, text, { encoding: "utf8", flag: "wx", mode: 0o600 });
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST" || await readFile(output, "utf8") !== text) throw error;
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    const previous = await readFile(output, "utf8");
+    if (previous !== text) {
+      if (!authorizationFile || !isManagedDemoConfig(previous, mcpScript)) {
+        throw new Error("The chosen MCP config path already contains a different configuration. Use --output with a new filename.");
+      }
+      await writeManagedFile(output, text);
+    }
   }
   console.log(`MCP configuration is ready at ${output}. Add its desklatch server entry to your client's MCP settings.`);
+  if (authorizationFile) {
+    const yamlValue = (value: string): string => JSON.stringify(value.replaceAll("\\", "/"));
+    const dshPatch = [
+      "- id: mcp-manager", "  config:", "    servers:", "      desklatch:", "        transport: stdio",
+      `        command: ${yamlValue(config.mcpServers.desklatch.command)}`,
+      "        args:",
+      ...config.mcpServers.desklatch.args.map(arg => `          - ${yamlValue(arg)}`), "",
+    ].join("\n");
+    await writeManagedFile(join(dirname(output), "desklatch.dsh-mcp.yml"), dshPatch);
+  }
+}
+
+function isManagedDemoConfig(source: string, mcpScript: string): boolean {
+  try {
+    const config = JSON.parse(source);
+    const servers = config?.mcpServers;
+    const server = servers?.desklatch;
+    return Object.keys(config).length === 1 && Object.keys(servers).length === 1
+      && Object.keys(server).length === 2 && typeof server.command === "string"
+      && Array.isArray(server.args) && server.args.length === 2
+      && server.args[0] === mcpScript && server.args[1] === "--demo";
+  } catch {
+    return false;
+  }
+}
+
+async function writeManagedFile(path: string, text: string): Promise<void> {
+  const temporary = path + "." + randomUUID() + ".tmp";
+  try {
+    await writeFile(temporary, text, { encoding: "utf8", flag: "wx", mode: 0o600 });
+    if (await readFile(temporary, "utf8") !== text) throw new Error("Could not read back the generated setup file.");
+    await rename(temporary, path);
+  } finally {
+    await rm(temporary, { force: true }).catch(() => undefined);
+  }
+}
+
+async function writeWindowsLaunchers(root: string, authorizationFile: string): Promise<void> {
+  const launcherJson = {
+    node: process.execPath,
+    cli: fileURLToPath(new URL("./windows-authorization.js", import.meta.url)),
+    authorizationFile,
+  };
+  await writeManagedFile(join(dirname(authorizationFile), "launcher.json"), JSON.stringify(launcherJson, null, 2) + "\n");
+  await writeManagedFile(join(root, "DeskLatch-Authorize.ps1"), [
+    '$ErrorActionPreference = "Stop"',
+    '$config = [IO.File]::ReadAllText((Join-Path $PSScriptRoot ".desklatch/windows/launcher.json"), [Text.Encoding]::UTF8) | ConvertFrom-Json',
+    '& $config.node $config.cli --show $config.authorizationFile',
+    'exit $LASTEXITCODE', "",
+  ].join("\r\n"));
+  await writeManagedFile(join(root, "DeskLatch-Authorize.cmd"), [
+    "@echo off", "setlocal",
+    '"%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -NoLogo -NoProfile -STA -WindowStyle Hidden -ExecutionPolicy Bypass -File "%~dp0DeskLatch-Authorize.ps1"',
+    "exit /b %ERRORLEVEL%", "",
+  ].join("\r\n"));
+  console.log("Open DeskLatch-Authorize.cmd to choose the Windows applications that DeskLatch may operate.");
 }
 
 async function readOcrConfig(path: string): Promise<OcrOptions> {
@@ -80,6 +148,9 @@ async function main() {
     install: { type: "boolean" },
     output: { type: "string" },
     bundle: { type: "string" },
+    windows: { type: "boolean" },
+    demo: { type: "boolean" },
+    "register-windows-location": { type: "boolean" },
     e2b: { type: "boolean" },
     "install-e2b": { type: "boolean" },
     "env-file": { type: "string" },
@@ -89,12 +160,17 @@ async function main() {
   } });
   if (parsed.values.help) { console.log(usage); return; }
   if (parsed.positionals.length > 1) throw new Error(usage);
+  if (parsed.values.windows && parsed.values.demo) throw new Error("Choose either --windows or --demo.");
+  const windows = parsed.values.demo !== true && (parsed.values.windows === true || process.platform === "win32");
+  if (windows && (process.platform !== "win32" || process.arch !== "x64")) {
+    throw new Error("The DeskLatch Windows desktop preview requires Windows x64.");
+  }
   const interactive = parsed.positionals.length === 0 && stdin.isTTY;
   if (parsed.positionals.length === 0 && !interactive) throw new Error(usage);
 
   let route: Route;
   let bundle = parsed.values.bundle;
-  let install = parsed.values.install ?? false;
+  let install = windows || parsed.values.install === true;
   let installE2b = parsed.values["install-e2b"] ?? false;
   let e2b = installE2b || parsed.values.e2b === true;
   let envFile = parsed.values["env-file"];
@@ -142,9 +218,22 @@ async function main() {
     route = chooseRoute(parsed.positionals[0]!);
   }
 
+  const authorizationFile = windows ? windowsProductGrantsFile(process.cwd()) : undefined;
+  if (parsed.values["register-windows-location"]) {
+    if (route !== "dsh" || !authorizationFile) throw new Error("Desktop location registration requires the Windows DSH route.");
+    if (process.env.DESKLATCH_WINDOWS_GRANTS_FILE) return;
+    await stat(join(dirname(authorizationFile), "launcher.json"));
+    await registerWindowsAuthorizationPath(authorizationFile);
+    return;
+  }
+
   const packages: [string, string, boolean][] = [];
   if (route === "mcp") packages.push(["@modelcontextprotocol/sdk/client/index.js", "@modelcontextprotocol/sdk@1.32.2", install],
     ["playwright-core", "playwright-core@1.65.1", install]);
+  if (windows) {
+    packages.push(["koffi", "koffi@3.3.8", true]);
+    if (route === "mcp") packages.push(["@trycua/cua-driver", "@trycua/cua-driver@0.54.0", true]);
+  }
   if (installE2b) packages.push(["@e2b/desktop", "@e2b/desktop@2.5.0", true]);
   const selectedInstalls = packages.filter(([, , shouldInstall]) => shouldInstall).map(([, spec]) => spec);
   if (selectedInstalls.length) {
@@ -152,7 +241,7 @@ async function main() {
     if (!npm) throw new Error("Run via npm exec -- desklatch-setup to install the selected packages.");
     const installEnvironment = { ...process.env };
     delete installEnvironment.E2B_API_KEY;
-    execFileSync(process.execPath, [npm, "install", "--save-exact", "--no-audit", "--no-fund", ...selectedInstalls], {
+    execFileSync(process.execPath, [npm, "install", "--save-exact", "--ignore-scripts", "--no-audit", "--no-fund", ...selectedInstalls], {
       cwd: process.cwd(), stdio: "inherit", windowsHide: true, env: installEnvironment,
     });
   }
@@ -162,9 +251,13 @@ async function main() {
     process.exitCode = 1;
   }
 
+  if (authorizationFile) {
+    await prepareWindowsAuthorizationFile(authorizationFile);
+    await writeWindowsLaunchers(process.cwd(), authorizationFile);
+  }
   if (route === "mcp") {
-    await writeMcpConfig(resolve(parsed.values.output ?? "desklatch.mcp.json"));
-    if (moduleInstalled("playwright-core")) {
+    await writeMcpConfig(resolve(parsed.values.output ?? "desklatch.mcp.json"), authorizationFile);
+    if (!windows && moduleInstalled("playwright-core")) {
       const { chromium } = await import("playwright-core");
       if (!findChromiumExecutable() && !existsSync(chromium.executablePath())) {
         console.log("Install Chrome or Edge, or run npm exec -- playwright-core install chromium.");

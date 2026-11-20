@@ -1,0 +1,474 @@
+import { createDeskSession, type DeskSession } from "../session.js";
+import { createWorkspace, createOnDemandWorkspaceApplication, type OnDemandWorkspaceApplication, type Workspace, type WorkspaceOpenedApplication } from "../workspace.js";
+import type { Capability, DesktopBackend, Dispatch, Delivery, Frame, ObserveOptions, RiskPolicy } from "../contracts.js";
+import type { ActResult, ApprovalHandler, ApprovalResolution, DeskObserveOptions, DeskObservation, DeskSessionActOptions } from "../core/session-types.js";
+import { readWindowsProductGrants as readPersistedWindowsProductGrants } from "./windows-grants.js";
+import type { WindowsProductGrants } from "./windows-grants.js";
+import { listWindowsAppWindows as listNativeWindowsAppWindows, verifyWindowsAppWindow as verifyNativeWindowsAppWindow } from "./windows-inventory.js";
+import type { WindowsAppWindow } from "./windows-inventory.js";
+import {
+  createWindowsDesktopBackend,
+  createWindowsForegroundActivator,
+  CuaWindowsTransport,
+  loadWindowsPhysicalInspector,
+  type WindowsBackgroundSource,
+  type WindowsCuaDriver,
+  type WindowsDesktopAuthorization,
+  type WindowsForegroundActivator,
+  type WindowsPhysicalInspector,
+  type WindowsTransport,
+  type WindowsWindowTarget,
+} from "../backends/windows/index.js";
+
+/** Product-level grant file schema. App IDs, rather than window handles, are
+ * the durable authorization unit. */
+export type { WindowsProductGrants } from "./windows-grants.js";
+
+/** Inventory identity supplied by the trusted Windows host. */
+export type { WindowsAppWindow } from "./windows-inventory.js";
+
+export interface WindowsProductHostTestSeams {
+  readonly readWindowsProductGrants?: (file: string) => Promise<WindowsProductGrants>;
+  readonly listWindowsAppWindows?: () => Promise<readonly WindowsAppWindow[]>;
+  readonly verifyWindowsAppWindow?: (window: WindowsAppWindow) => Promise<boolean>;
+  readonly transportFactory?: (context: {
+    readonly app: { readonly id: string; readonly name: string };
+    readonly windows: readonly WindowsAppWindow[];
+    readonly grants: WindowsProductGrants;
+  }) => Promise<{
+    readonly transport: WindowsTransport;
+    readonly inspector?: WindowsPhysicalInspector;
+  }>;
+  readonly policy?: RiskPolicy;
+}
+
+export interface WindowsProductHostOptions {
+  readonly authorizationFile: string;
+  readonly onApprovalRequested?: ApprovalHandler;
+  /** Narrow deterministic seams; production uses the packaged grant/inventory modules. */
+  readonly test?: WindowsProductHostTestSeams;
+}
+
+interface OpenedProductApplication extends WorkspaceOpenedApplication {
+  readonly closeProduct?: () => Promise<void>;
+}
+
+interface ProductRuntime {
+  readonly session: DeskSession;
+  readonly grants: WindowsProductGrants;
+  readonly windows: readonly WindowsAppWindow[];
+  readonly inspector: WindowsPhysicalInspector;
+  readonly foregroundActivator?: WindowsForegroundActivator;
+  readonly close: () => Promise<void>;
+}
+
+const WINDOWS_BACKGROUND_SOURCE: WindowsBackgroundSource = "cua-uia-0.54";
+const conditionalImport: (specifier: string) => Promise<Record<string, unknown>> =
+  new Function("specifier", "return import(specifier)") as (specifier: string) => Promise<Record<string, unknown>>;
+
+/**
+ * Create the product Windows host. Only granted application IDs are enrolled
+ * in Workspace. Each app session binds every currently verified window owned by
+ * that app, including owned child dialogs, without exposing child handles as
+ * separate product grants.
+ */
+export async function createWindowsProductHost(options: WindowsProductHostOptions): Promise<Workspace> {
+  if (!options || typeof options.authorizationFile !== "string" || options.authorizationFile.trim().length === 0) {
+    throw new TypeError("invalid_windows_authorization_file");
+  }
+  const initial = await readGrants(options, options.authorizationFile);
+  const entryById = new Map<string, OnDemandWorkspaceApplication>();
+  const entryFor = (app: { readonly id: string; readonly name: string }, grants: WindowsProductGrants): OnDemandWorkspaceApplication => {
+    const existing = entryById.get(app.id);
+    if (existing) return existing;
+    const entry = createOnDemandWorkspaceApplication({
+      id: app.id,
+      name: app.name,
+      capabilities: productCapabilities(grants),
+      allowModelImages: grants.allowDesktopCapture,
+      open: signal => openGrantedApplication(options, app, signal),
+    });
+    entryById.set(app.id, entry);
+    return entry;
+  };
+  for (const app of initial.apps) entryFor(app, initial);
+  let currentGrants = initial;
+  return createWorkspace({
+    applications: [...entryById.values()],
+    canAutomate: application => currentGrants.apps.some(app => app.id === application.id),
+    discover: async () => {
+      currentGrants = await readGrants(options, options.authorizationFile);
+      return currentGrants.apps.map(app => entryFor(app, currentGrants));
+    },
+  });
+}
+
+async function openGrantedApplication(
+  options: WindowsProductHostOptions,
+  app: { readonly id: string; readonly name: string },
+  signal?: AbortSignal,
+): Promise<OpenedProductApplication> {
+  const grants = await readGrants(options, options.authorizationFile);
+  const granted = grants.apps.find(candidate => candidate.id === app.id);
+  if (!granted) throw productError("application_automation_blocked");
+  const windows = await verifiedAppWindows(options, app.id);
+  if (windows.length === 0) throw productError("application_window_unavailable");
+  signal?.throwIfAborted();
+
+  let runtime = await openProductRuntime(options, granted, grants, windows, signal);
+  const ensureRuntime = async (ensureSignal?: AbortSignal): Promise<{ readonly grants: WindowsProductGrants; readonly live: readonly WindowsAppWindow[] }> => {
+    const currentGrants = await readGrants(options, options.authorizationFile);
+    if (!currentGrants.apps.some(candidate => candidate.id === app.id)) throw productError("application_automation_blocked");
+    const live = await verifiedAppWindows(options, app.id);
+    if (live.length === 0) throw productError("application_window_unavailable");
+    // A disappearing sibling is not, by itself, a reason to invalidate an
+    // action aimed at another still-verified window. Rebind when a new or
+    // replaced window appears (so newly opened owned dialogs become usable),
+    // and let the dispatch guard verify only the exact recipient.
+    if (hasNewOrReplacedWindow(live, runtime.windows)
+      || runtime.grants.allowDesktopCapture !== currentGrants.allowDesktopCapture
+      || runtime.grants.allowForegroundInput !== currentGrants.allowForegroundInput) {
+      ensureSignal?.throwIfAborted();
+      const replacement = await openProductRuntime(options, currentGrants.apps.find(candidate => candidate.id === app.id)!, currentGrants, live, ensureSignal);
+      const previous = runtime;
+      runtime = replacement;
+      await previous.close();
+    }
+    return { grants: currentGrants, live };
+  };
+
+  const verifyFront = async (): Promise<boolean> => {
+    try {
+      const { grants: currentGrants, live } = await ensureRuntime();
+      if (!currentGrants.allowForegroundInput) return live.length > 0;
+      const verify = options.test?.verifyWindowsAppWindow ?? verifyNativeWindowsAppWindow;
+      for (const window of live) {
+        const latest = await readGrants(options, options.authorizationFile);
+        if (!latest.apps.some(candidate => candidate.id === app.id)
+          || latest.allowForegroundInput !== runtime.grants.allowForegroundInput
+          || !(await verify(window))) return false;
+        const evidence = await runtime.inspector.read(toWindowTarget(window));
+        if (evidence?.foregroundHwnd === window.hwnd) return true;
+      }
+    } catch {
+      return false;
+    }
+    return false;
+  };
+
+  const activate = async (context: { readonly signal?: AbortSignal }): Promise<unknown> => {
+    try {
+      const { grants: currentGrants, live } = await ensureRuntime(context.signal);
+      if (!currentGrants.allowForegroundInput) return true;
+      if (!runtime.foregroundActivator) return false;
+      const target = live[0];
+      const verify = options.test?.verifyWindowsAppWindow ?? verifyNativeWindowsAppWindow;
+      const latest = await readGrants(options, options.authorizationFile);
+      if (!latest.apps.some(candidate => candidate.id === app.id)
+        || latest.allowForegroundInput !== runtime.grants.allowForegroundInput
+        || !(await verify(target))) return false;
+      const result = await runtime.foregroundActivator(toWindowTarget(target), { signal: context.signal });
+      return result.status === "dispatched";
+    } catch {
+      return false;
+    }
+  };
+
+  return {
+    session: wrapProductSession(() => runtime.session, options, app.id, () => runtime.close(), async signal => { await ensureRuntime(signal); }),
+    activate,
+    verifyFront,
+    closeProduct: () => runtime.close(),
+  };
+}
+
+async function openProductRuntime(
+  options: WindowsProductHostOptions,
+  app: { readonly id: string; readonly name: string },
+  grants: WindowsProductGrants,
+  windows: readonly WindowsAppWindow[],
+  signal?: AbortSignal,
+): Promise<ProductRuntime> {
+  let driver: WindowsCuaDriver | undefined;
+  let transport: WindowsTransport;
+  let inspector: WindowsPhysicalInspector | undefined;
+  if (options.test?.transportFactory) {
+    const created = await options.test.transportFactory({ app, windows, grants });
+    transport = created.transport;
+    inspector = created.inspector;
+  } else {
+    driver = await createCuaDriver();
+    const opened = await CuaWindowsTransport.open(driver, `desklatch-product-${safeId(app.id)}`, signal);
+    transport = opened;
+    inspector = await loadWindowsPhysicalInspector();
+  }
+  if (!inspector) {
+    await transport.close?.().catch(() => undefined);
+    await (driver as (WindowsCuaDriver & { shutdown?: () => Promise<void> }) | undefined)?.shutdown?.().catch(() => undefined);
+    throw productError("windows_physical_inspector_unavailable");
+  }
+
+  const authorization: WindowsDesktopAuthorization = {
+    targets: windows.map(toWindowTarget),
+    allowDesktopCapture: grants.allowDesktopCapture,
+    allowForegroundInput: grants.allowForegroundInput,
+    background: { source: WINDOWS_BACKGROUND_SOURCE },
+    version: grants.version.toString(),
+  };
+  const guardedTransport = createGrantGuardedTransport(transport, options, app.id, windows, grants);
+  const foregroundActivator: WindowsForegroundActivator | undefined = grants.allowForegroundInput
+    ? createWindowsForegroundActivator(guardedTransport, inspector)
+    : undefined;
+  let session: DeskSession;
+  try {
+    const backend = await createWindowsDesktopBackend({
+      transport: guardedTransport,
+      inspector,
+      authorization,
+      ...(foregroundActivator ? { activateForeground: foregroundActivator } : {}),
+    });
+    const guardedBackend = createGrantGuardedBackend(backend, options, app.id, grants);
+    session = createDeskSession(guardedBackend, {
+      allowModelImages: grants.allowDesktopCapture,
+      onApprovalRequested: options.onApprovalRequested,
+      ...(options.test?.policy ? { policy: options.test.policy } : {}),
+    });
+  } catch (error) {
+    await transport.close?.().catch(() => undefined);
+    await (driver as (WindowsCuaDriver & { shutdown?: () => Promise<void> }) | undefined)?.shutdown?.().catch(() => undefined);
+    throw error;
+  }
+  let closed = false;
+  const close = async (): Promise<void> => {
+    if (closed) return;
+    closed = true;
+    await session.close().catch(() => undefined);
+    const ownedDriver = driver as (WindowsCuaDriver & { shutdown?: () => Promise<void>; uniffiDestroy?: () => void }) | undefined;
+    await ownedDriver?.shutdown?.().catch(() => undefined);
+    ownedDriver?.uniffiDestroy?.();
+  };
+  return { session, grants, windows, inspector, foregroundActivator, close };
+}
+
+function createGrantGuardedTransport(
+  transport: WindowsTransport,
+  options: WindowsProductHostOptions,
+  appId: string,
+  windows: readonly WindowsAppWindow[],
+  expectedGrants: WindowsProductGrants,
+): WindowsTransport {
+  const authorizationLive = async (requireForeground = false): Promise<string | undefined> => {
+    try {
+      const grants = await readGrants(options, options.authorizationFile);
+      if (!grants.apps.some(app => app.id === appId)) return "application_automation_blocked";
+      if (grants.allowDesktopCapture !== expectedGrants.allowDesktopCapture
+        || grants.allowForegroundInput !== expectedGrants.allowForegroundInput) return "window_scope_changed";
+      if (requireForeground && !grants.allowForegroundInput) return "foreground_input_not_authorized";
+      return undefined;
+    } catch {
+      return "application_automation_blocked";
+    }
+  };
+  const verify = options.test?.verifyWindowsAppWindow ?? verifyNativeWindowsAppWindow;
+  const verifyTarget = async (target: WindowsWindowTarget): Promise<boolean> => {
+    const candidate = windows.find(window => window.pid === target.pid && window.hwnd === target.hwnd);
+    return candidate !== undefined && await verify(candidate);
+  };
+  return {
+    source: transport.source,
+    open: transport.open ? signal => transport.open!(signal) : undefined,
+    observeWindow: async (target, callOptions) => {
+      const code = await authorizationLive();
+      if (code) throw productError(code);
+      if (!(await verifyTarget(target))) throw productError("window_scope_changed");
+      return transport.observeWindow(target, callOptions);
+    },
+    observeDesktopImage: transport.observeDesktopImage ? async callOptions => {
+      const code = await authorizationLive();
+      if (code) throw productError(code);
+      return transport.observeDesktopImage!(callOptions);
+    } : undefined,
+    dispatch: async (step, target, callOptions) => {
+      const code = await authorizationLive(target.foreground);
+      if (code) return { status: "refused", code };
+      if (!(await verifyTarget(target.window))) return { status: "refused", code: "window_scope_changed" };
+      return transport.dispatch(step, target, callOptions);
+    },
+    bringToFront: transport.bringToFront ? async (target, callOptions) => {
+      const code = await authorizationLive(true);
+      if (code) return { status: "refused", code };
+      if (!(await verifyTarget(target))) return { status: "refused", code: "window_scope_changed" };
+      return transport.bringToFront!(target, callOptions);
+    } : undefined,
+    close: transport.close ? () => transport.close!() : undefined,
+  };
+}
+
+function createGrantGuardedBackend(
+  backend: DesktopBackend,
+  options: WindowsProductHostOptions,
+  appId: string,
+  expectedGrants: WindowsProductGrants,
+): DesktopBackend {
+  const authorizationLive = async (): Promise<{ readonly ok: true } | { readonly ok: false; readonly code: string }> => {
+    try {
+      const grants = await readGrants(options, options.authorizationFile);
+      if (!grants.apps.some(app => app.id === appId)) return { ok: false, code: "application_automation_blocked" };
+      if (grants.allowDesktopCapture !== expectedGrants.allowDesktopCapture
+        || grants.allowForegroundInput !== expectedGrants.allowForegroundInput) {
+        return { ok: false, code: "window_scope_changed" };
+      }
+      return { ok: true };
+    } catch {
+      return { ok: false, code: "application_automation_blocked" };
+    }
+  };
+  return {
+    capabilities: backend.capabilities,
+    observe: async (request: ObserveOptions): Promise<Frame> => {
+      const authorization = await authorizationLive();
+      if (!authorization.ok) throw productError(authorization.code);
+      return backend.observe(request);
+    },
+    hitTest: backend.hitTest ? (frame, point, signal) => backend.hitTest!(frame, point, signal) : undefined,
+    dispatch: async (request: Dispatch): Promise<Delivery> => {
+      const authorization = await authorizationLive();
+      if (!authorization.ok) return { status: "refused", code: authorization.code };
+      return backend.dispatch(request);
+    },
+    close: () => backend.close(),
+  };
+}
+
+function wrapProductSession(
+  getSession: () => DeskSession,
+  options: WindowsProductHostOptions,
+  appId: string,
+  closeProduct: () => Promise<void>,
+  beforeOperation?: (signal?: AbortSignal) => Promise<void>,
+): DeskSession {
+  const pendingApprovals = new Set<string>();
+  const grantLive = async (): Promise<boolean> => {
+    try {
+      const grants = await readGrants(options, options.authorizationFile);
+      return grants.apps.some(app => app.id === appId);
+    } catch {
+      return false;
+    }
+  };
+  return {
+    get capabilities() { return getSession().capabilities; },
+    get allowModelImages() { return getSession().allowModelImages; },
+    get allowModelDocumentText() { return getSession().allowModelDocumentText; },
+    get limits() { return getSession().limits; },
+    observe: async (input?: DeskObserveOptions): Promise<DeskObservation> => {
+      if (!(await grantLive())) throw productError("application_automation_blocked");
+      await beforeOperation?.(input?.signal);
+      return getSession().observe(input);
+    },
+    act: async (input: unknown, signal?: AbortSignal, actOptions?: DeskSessionActOptions): Promise<ActResult> => {
+      if (!(await grantLive())) {
+        await denyPendingApprovals(getSession, pendingApprovals);
+        return { status: "stopped", code: "application_automation_blocked", steps: stepsForInput(input) };
+      }
+      await beforeOperation?.(signal);
+      const result = await getSession().act(input, signal, actOptions);
+      if (result.requestId) pendingApprovals.add(result.requestId);
+      return result;
+    },
+    resolveApproval: async (requestId: string, decision: "approve" | "deny"): Promise<ApprovalResolution> => {
+      if (!(await grantLive())) {
+        await denyPendingApprovals(getSession, pendingApprovals, requestId);
+        return { requestId, status: "stopped", code: "application_automation_blocked", steps: [] };
+      }
+      pendingApprovals.delete(requestId);
+      const result = await getSession().resolveApproval(requestId, decision);
+      if (result.requestId && result.code === "approval_required") pendingApprovals.add(result.requestId);
+      return result;
+    },
+    correct: (reason?: string) => getSession().correct(reason),
+    cancel: (reason?: string) => getSession().cancel(reason),
+    close: closeProduct,
+  };
+}
+
+async function denyPendingApprovals(
+  getSession: () => DeskSession,
+  pendingApprovals: Set<string>,
+  only?: string,
+): Promise<void> {
+  const ids = only === undefined ? [...pendingApprovals] : [only];
+  pendingApprovals.clear();
+  for (const requestId of ids) await getSession().resolveApproval(requestId, "deny").catch(() => undefined);
+}
+
+function productCapabilities(grants: WindowsProductGrants): readonly Capability[] {
+  const targets = grants.allowForegroundInput && grants.allowDesktopCapture
+    ? ["selector", "ref", "point"] as const
+    : ["selector", "ref"] as const;
+  return Object.freeze([
+    Object.freeze({ kind: "click", targets, buttons: ["left"] as const, counts: [1] as const }),
+    Object.freeze({ kind: "type", targets: ["selector", "ref"] as const }),
+    Object.freeze({ kind: "scroll", targets, directions: ["up", "down", "left", "right"] as const, units: ["line", "page"] as const }),
+  ]);
+}
+
+async function readGrants(options: WindowsProductHostOptions, file: string): Promise<WindowsProductGrants> {
+  const reader = options.test?.readWindowsProductGrants ?? readPersistedWindowsProductGrants;
+  return reader(file);
+}
+
+async function verifiedAppWindows(options: WindowsProductHostOptions, appId: string): Promise<readonly WindowsAppWindow[]> {
+  const verify = options.test?.verifyWindowsAppWindow ?? verifyNativeWindowsAppWindow;
+  const list = options.test?.listWindowsAppWindows ?? listNativeWindowsAppWindows;
+  const windows = (await list())
+    .filter(window => window.appId === appId)
+    .sort((left, right) => left.id.localeCompare(right.id));
+  const verified: WindowsAppWindow[] = [];
+  for (const window of windows) {
+    if (await verify(window)) verified.push(window);
+  }
+  return verified;
+}
+
+async function createCuaDriver(): Promise<WindowsCuaDriver> {
+  const module = await conditionalImport("@trycua/cua-driver");
+  const CuaDriver = module.CuaDriver as { readonly create?: (value?: unknown) => WindowsCuaDriver } | undefined;
+  if (!CuaDriver?.create) throw productError("cua_driver_unavailable");
+  return CuaDriver.create(undefined);
+}
+
+function toWindowTarget(window: WindowsAppWindow): WindowsWindowTarget {
+  return { pid: window.pid, hwnd: window.hwnd, title: window.title };
+}
+
+function hasNewOrReplacedWindow(live: readonly WindowsAppWindow[], bound: readonly WindowsAppWindow[]): boolean {
+  return live.some(candidate => {
+    const prior = bound.find(window => window.hwnd === candidate.hwnd && window.pid === candidate.pid);
+    return prior === undefined || !sameWindowIdentity(candidate, prior);
+  });
+}
+
+function sameWindowIdentity(left: WindowsAppWindow, right: WindowsAppWindow): boolean {
+  return left.id === right.id
+    && left.pid === right.pid
+    && left.hwnd === right.hwnd
+    && left.processStartedAt === right.processStartedAt
+    && left.ownerHwnd === right.ownerHwnd;
+}
+
+function stepsForInput(input: unknown): readonly { readonly index: number; readonly status: "not_dispatched"; readonly code: string }[] {
+  if (!input || typeof input !== "object" || !Array.isArray((input as Record<string, unknown>).steps)) return [];
+  return (input as { readonly steps: readonly unknown[] }).steps.map((_step, index) => ({ index: index + 1, status: "not_dispatched" as const, code: "application_automation_blocked" }));
+}
+
+function safeId(value: string): string {
+  const normalized = value.replace(/[^A-Za-z0-9._-]/gu, "_");
+  return normalized.length > 0 ? normalized.slice(0, 80) : "app";
+}
+
+function productError(code: string): Error & { readonly code: string } {
+  const error = new Error(code) as Error & { readonly code: string };
+  Object.defineProperty(error, "code", { value: code, enumerable: true });
+  return error;
+}

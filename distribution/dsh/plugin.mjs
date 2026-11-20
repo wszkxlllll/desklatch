@@ -2,19 +2,26 @@ import { createDeskDshApprovalBridge, createDeskDshPlugin } from "desklatch/dsh"
 import { createDemoDeskSession } from "desklatch/demo";
 
 /**
- * Official Cordis entry for the portable DeskLatch demo bundle.
+ * Official Cordis entry for the portable DeskLatch bundle.
  *
- * The agent loop remains DSH-owned. This module only binds the host-owned
- * demo session and bridges DSH's approval service into DeskLatch's callback.
+ * The agent loop remains DSH-owned. Windows uses the host-owned native CUA
+ * authorization; non-Windows environments retain the explicit browser demo
+ * fallback for development and packaging probes.
  */
 export default {
   name: "desklatch-dsh",
   inject: ["tools"],
-  apply(ctx) {
+  async apply(ctx) {
     const approval = createDeskDshApprovalBridge(ctx);
-    return ctx.plugin(createDeskDshPlugin(
-      () => createDemoDeskSession({ onApprovalRequested: approval.onApprovalRequested }),
-      { approval },
-    ));
+    const openSession = process.platform === "win32"
+      ? async () => {
+        const { createWindowsProductHost, readWindowsAuthorizationPath } = await import("desklatch/windows-product");
+        return createWindowsProductHost({
+          authorizationFile: await readWindowsAuthorizationPath(),
+          onApprovalRequested: approval.onApprovalRequested,
+        });
+      }
+      : () => createDemoDeskSession({ onApprovalRequested: approval.onApprovalRequested });
+    await ctx.plugin(createDeskDshPlugin(openSession, { approval })).await();
   },
 };

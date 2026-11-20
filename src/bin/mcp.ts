@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createDeskMcpServer } from "../integrations/mcp.js";
 import { resolveDeskToolHost } from "../integrations/shared.js";
@@ -7,9 +7,14 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 
 /** The command-line argument is a trusted operator-owned module, outside the model's tool surface. */
 async function main() {
-  if (process.argv.length !== 3) throw Error("usage: desklatch-mcp --demo | <trusted-host-module.mjs>");
-  const input = process.argv[2];
-  const opened = input === "--demo"
+  const [input, authorizationFile, extra] = process.argv.slice(2);
+  const windows = input === "--windows";
+  if (!input || extra !== undefined || (windows ? !authorizationFile || !isAbsolute(authorizationFile) : authorizationFile !== undefined)) {
+    throw Error("usage: desklatch-mcp --windows <authorization-file> | --demo | <trusted-host-module.mjs>");
+  }
+  const opened = windows
+    ? await (await import("../product/windows-mcp.js")).createWindowsMcpHost(authorizationFile!)
+    : input === "--demo"
     ? await (await import("../demo.js")).createDemoDeskSession()
     : await openHost(input);
   const toolHost = resolveDeskToolHost(opened);
@@ -37,7 +42,8 @@ async function openHost(input: string) {
 
 main().catch(() => {
   // stdout is reserved for MCP. Host exceptions may contain credentials or paths.
-  if (process.argv.length !== 3) console.error("usage: desklatch-mcp --demo | <trusted-host-module.mjs>");
+  if (process.argv[2] === "--windows") console.error("DeskLatch could not start the Windows desktop host. Check installation and application authorization.");
+  else if (process.argv.length !== 3) console.error("usage: desklatch-mcp --windows <authorization-file> | --demo | <trusted-host-module.mjs>");
   else if (process.argv[2] === "--demo") console.error("DeskLatch demo could not start. Run desklatch-setup mcp to check Playwright and Chromium.");
   else console.error("DeskLatch MCP host could not start");
   process.exitCode = 1;

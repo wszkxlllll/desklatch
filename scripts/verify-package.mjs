@@ -21,6 +21,7 @@ try {
   assert.equal(basename(packed.filename), packed.filename);
   const files = new Set(packed.files.map(file => file.path));
   for (const path of ["schema/act-input.schema.json", "dist/bin/mcp.js", "dist/bin/setup.js", "dist/demo.js", "dist/reuse.js", "dist/reuse.d.ts", "dist/backends/e2b/chromium_pipe.py",
+    "dist/bin/windows-authorization.js", "dist/product/windows-authorization.ps1", "dist/product/windows-approval.ps1",
     "dist/workspace.js", "dist/workspace.d.ts", "dist/backends/e2b/atspi_worker.py", "dist/backends/e2b/x11-recipient.py",
     "dist/backends/windows/dialog-transport.ps1",
     "dist/evidence/rapidocr_worker.py", "dist/integrations/dsh.js", "dist/integrations/langchain-images.js",
@@ -59,7 +60,7 @@ try {
   run(["--input-type=module", "--eval", probe], consumer);
   console.log(`Installed ${packed.name}@${packed.version} from tarball. Independent host verified field replay and the two workspace tools with zero optional peers.`);
 
-  run([npm, "exec", "--", "desklatch-setup", "mcp", "--install"], consumer);
+  run([npm, "exec", "--", "desklatch-setup", "mcp", "--demo", "--install"], consumer);
   const mcpProbe = `import assert from 'node:assert/strict';
     import { access, readFile } from 'node:fs/promises';
     import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -85,9 +86,9 @@ try {
   if (process.argv.includes("--with-e2b")) {
     const sampleValue = "setup-validation-only";
     await writeFile(join(consumer, "check.env"), `E2B_API_KEY=${sampleValue}\n`, { encoding: "utf8", mode: 0o600 });
-    const installedE2B = run([npm, "exec", "--", "desklatch-setup", "mcp", "--install-e2b"], consumer, true);
+    const installedE2B = run([npm, "exec", "--", "desklatch-setup", "mcp", "--demo", "--install-e2b"], consumer, true);
     assert.match(installedE2B, /E2B \(E2B_API_KEY_MISSING\)/u);
-    const withE2B = run([npm, "exec", "--", "desklatch-setup", "mcp", "--e2b", "--env-file", "check.env"], consumer);
+    const withE2B = run([npm, "exec", "--", "desklatch-setup", "mcp", "--demo", "--e2b", "--env-file", "check.env"], consumer);
     assert.match(withE2B, /E2B \(ready\)/u);
     assert.ok(!withE2B.includes(sampleValue));
     console.log("Selecting E2B installed the SDK and verified its local credential configuration without a sandbox.");

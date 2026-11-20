@@ -223,9 +223,12 @@ const ACTION_VERBS = {
   security: /(?:^|[\s_:-])(?:grant|permission|permissions|admin|administrator|role|authorize|密码|凭据|权限|管理员|授权)(?:$|[\s_:-])/iu,
 };
 
-const SAFE_ACTION_TEXT = /(?:^|[\s_:-])(?:cancel|close|back|next|previous|open|view|show|inspect|browse|filter|search|query|find|expand|collapse|刷新|取消|关闭|返回|下一步|上一步|打开|查看|浏览|筛选|搜索|查询|展开|折叠)(?:$|[\s_:-])/iu;
+const VIEW_ACTION_TEXT = /^(?:(?:view|inspect|browse|filter|search|query|find|expand|collapse|refresh)(?:$|[\s:…])|(?:查看|浏览|筛选|搜索|查询|展开|折叠|刷新))/iu;
+const NAVIGATION_ACTION_TEXT = /^(?:back|previous|(?:previous|next) page|close|cancel|settings|preferences|help|返回|上一步|上一页|下一页|关闭|取消|设置|帮助)$/iu;
+const MENU_CAPTION_TEXT = /^(?:file|edit|view|tools|window|format|文件|编辑|视图|工具|窗口|格式)$/iu;
+const OPEN_VIEW_TEXT = /^(?:(?:open|show|hide|close) (?:.+ )?(?:menu|panel|popup|popover|sidebar|tab|dialog)|(?:打开|显示|隐藏|关闭).*(?:菜单|面板|弹窗|侧栏|选项卡|对话框))$/iu;
 
-const NEGATED_RISK_TEXT = /(?:\bdo\s+not\s+(?:send|publish|post|submit)\b|\bdon['’]t\s+(?:send|publish|post|submit)\b|\bnot\s+(?:send|publish|post|submit)\b|不要(?:发送|发布|提交))/iu;
+const NEGATED_RISK_TEXT = /^(?:(?:do not|don['’]t|not) (?:send|publish|post|submit)|(?:不|不要|取消)(?:发送|发布|提交))$/iu;
 
 /** Default local-only policy. It never invokes OCR, a reviewer, or external code. */
 export const defaultRiskPolicy: RiskPolicy = createRiskPolicy();
@@ -485,7 +488,7 @@ function classifyStructurally(input: RiskInput, forbiddenHotkeys: ReadonlySet<st
 
   const primaryClick = step.kind === "click" && (step.button ?? "left") === "left" && (step.count ?? 1) === 1;
   const targetRole = normalizeText(target.role).toLowerCase();
-  const actionLabel = isNonActionRole(targetRole) ? "" : normalizeText(target.name);
+  const actionLabel = isNonActionRole(targetRole) ? "" : normalizeText(target.name).replace(/(?:\.{3}|…)$/u, "").trimEnd();
   if ((step.kind === "click" || enter) && (effect === undefined || effect === "unknown")) {
     const namedRisk = actionLabelRisk(actionLabel);
     if (namedRisk !== undefined) {
@@ -517,14 +520,10 @@ function classifyStructurally(input: RiskInput, forbiddenHotkeys: ReadonlySet<st
       return { decision: "review", code: "key_effect_unknown", reason: "The effect of this key is not established by the control's default action." };
     }
   }
-  if (effect === "unknown") {
-    return { decision: "review", code: "unknown_effect", category: "unknown", reason: "The target's immediate consequence is unknown." };
-  }
-
   // Text contents are intentionally not inspected. A draft body containing
   // “do not send”, “pay”, or similar words is still merely typed text.
   if (step.kind === "type" || step.kind === "setValue") {
-    if (effect === "read" || effect === "navigate" || effect === "edit" || effect === undefined) {
+    if (effect !== "unknown" || (target.states.includes("editable") && target.actions.includes(step.kind))) {
       return { decision: "allow", code: "structural_text_input", reason: "Typing into a non-sensitive editable target is a local structural action." };
     }
   }
@@ -533,22 +532,30 @@ function classifyStructurally(input: RiskInput, forbiddenHotkeys: ReadonlySet<st
     return { decision: "allow", code: "structural_low_impact", reason: "The target has a non-consequential structural effect." };
   }
 
-  // A target without a declared effect is only safe when the action and role
-  // make the immediate consequence clear. Labels/nearby text are ignored.
-  if (isExplicitNegation(actionLabel)) {
-    return { decision: "allow", code: "negated_action_label", reason: "A negated label is not evidence of a send/payment operation." };
-  }
-
+  // An undeclared effect still leaves the actual recipient and gesture as
+  // evidence. Treat a window-only hit or a generic confirmation as ambiguous.
   if (step.kind === "scroll") {
-    if (target.filterAction === true || targetRole.includes("scroll") || targetRole.includes("list") || targetRole.includes("document") || targetRole.includes("pane")) {
+    if (target.actions.includes("scroll") && /^(?:scrollbar|scrollarea|list|listbox|tree|document|pane|table|grid)$/iu.test(targetRole)) {
       return { decision: "allow", code: "structural_scroll", reason: "Scrolling within a structurally identified region is low impact." };
     }
     return { decision: "review", code: "ambiguous_scroll_target", reason: "The scroll recipient is not structurally identified as a bounded view." };
   }
 
-  if (step.kind === "click") {
-    if (SAFE_ACTION_TEXT.test(actionLabel) || isReadOnlyHistoryLabel(actionLabel) || isDraftActionLabel(actionLabel) || target.filterAction === true) {
-      return { decision: "allow", code: "structural_safe_click", reason: "The action target is a clear navigation/filter control." };
+  if (primaryClick || enter) {
+    if (target.states.includes("visible") && target.states.includes("enabled") && target.actions.includes("click")) {
+      if (/^(?:tab|tab[ _-]?item)$/iu.test(targetRole)) {
+        return { decision: "allow", code: "structural_tab_selection", reason: "The action selects an identified tab." };
+      }
+      const opensMenu = /^(?:menu[ _-]?item)$/u.test(targetRole) && MENU_CAPTION_TEXT.test(actionLabel);
+      const commandControl = /^(?:button|split[ _-]?button|menu[ _-]?item|link|hyperlink)$/u.test(targetRole);
+      const localCommand = VIEW_ACTION_TEXT.test(actionLabel) || NAVIGATION_ACTION_TEXT.test(actionLabel) || OPEN_VIEW_TEXT.test(actionLabel)
+        || isReadOnlyHistoryLabel(actionLabel) || isDraftActionLabel(actionLabel) || isExplicitNegation(actionLabel);
+      if (opensMenu || (commandControl && localCommand)) {
+        return { decision: "allow", code: "structural_safe_click", reason: "The action target is a clear navigation/filter control." };
+      }
+    }
+    if (effect === "unknown") {
+      return { decision: "review", code: "unknown_effect", category: "unknown", reason: "The target's immediate consequence is unknown." };
     }
     return { decision: "review", code: "ambiguous_click_target", reason: "The click target's immediate consequence is not established." };
   }
@@ -571,7 +578,12 @@ function checkStateForAction(step: Step, target: Control): LocalClassification |
 }
 
 function actionLabelRisk(value: string): RiskCategory | undefined {
-  if (value.length === 0 || isExplicitNegation(value)) return undefined;
+  if (value.length === 0 || isExplicitNegation(value) || isReadOnlyHistoryLabel(value) || isDraftActionLabel(value)) return undefined;
+  if (/^(?:(?:确认|立即)?(?:发送|发布|提交|转发|共享))/u.test(value)) return "external";
+  if (/^(?:确认|立即)?(?:付款|支付|购买|结算|退款)/u.test(value)) return "financial";
+  if (/^(?:(?:确认|永久|彻底)?(?:删除|清空|覆盖|替换|撤销)|取消(?:订单|订阅|预约)|关闭(?:账号|账户))/u.test(value)) return "destructive";
+  if (/^(?:cancel (?:the )?(?:order|booking|subscription)|close (?:the )?account)(?:$|\s)/iu.test(value)) return "destructive";
+  if (/^(?:(?:确认)?授权|修改权限|启用宏)|\b(?:passwords?|credentials?|enable macros?)\b/iu.test(value)) return "security";
   if (ACTION_VERBS.external.test(value)) return "external";
   if (ACTION_VERBS.financial.test(value)) return "financial";
   if (ACTION_VERBS.destructive.test(value)) return "destructive";
@@ -847,7 +859,7 @@ function isReadOnlyHistoryLabel(value: string): boolean {
 }
 
 function isDraftActionLabel(value: string): boolean {
-  return /^(?:save|store|保存)\s+(?:as\s+)?(?:draft|locally|草稿)$/iu.test(value);
+  return /^(?:(?:save|store)\s+(?:as\s+)?(?:draft|locally)|(?:保存|另存)(?:为)?(?:本地)?草稿)$/iu.test(value);
 }
 
 function isBoundedRegion(region: Rect): boolean {

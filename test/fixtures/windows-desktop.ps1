@@ -1,5 +1,6 @@
 param(
-  [switch]$PopupOnStart
+  [switch]$PopupOnStart,
+  [switch]$ProductFixture
 )
 
 # Run with: powershell.exe -NoProfile -STA -File windows-desktop.ps1
@@ -95,6 +96,22 @@ $increment.Add_Click({
   $status.Text = "Clicked $script:count"
 })
 $editor.Add_TextChanged({ $status.Text = "Text length: $($editor.Text.Length)" })
+if ($ProductFixture) {
+  $form.Text = 'DeskLatch Native Acceptance'
+  $form.Size = New-Object System.Drawing.Size(560, 460)
+  $layout.RowCount = 7
+  $actions = New-Object System.Windows.Forms.FlowLayoutPanel
+  $actions.AutoSize = $true
+  foreach ($name in @('Search', 'Continue', 'Send message')) {
+    $button = New-Object System.Windows.Forms.Button
+    $button.Text = $name
+    $button.AutoSize = $true
+    $button.Add_Click({ param($source, $eventArgs) [Console]::WriteLine('clicked:' + $source.Text) })
+    [void]$actions.Controls.Add($button)
+  }
+  $null = $layout.Controls.Add($actions, 0, 5)
+  $layout.SetColumnSpan($actions, 2)
+}
 $popupButton.Add_Click({
   $popup = New-Object System.Windows.Forms.Form
   $popup.Text = 'DeskLatch Fixture Popup'
@@ -115,7 +132,7 @@ $popupButton.Add_Click({
   $close.AccessibleName = 'Close popup'
   $close.AutoSize = $true
   $close.Location = New-Object System.Drawing.Point(24, 64)
-  $close.Add_Click({ $popup.Close() })
+  $close.Add_Click({ param($source, $eventArgs) $source.FindForm().Close() })
   $popup.Controls.Add($popupLabel)
   $popup.Controls.Add($close)
   $popup.Show($form)

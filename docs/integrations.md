@@ -14,15 +14,11 @@ flowchart LR
 
 ## DeepSeek Harness 原生插件
 
-Windows 使用 [安装向导](../distribution/windows/README.md)。手动安装时，下载 [Release 上的 DSH 包](https://github.com/wszkxlllll/desklatch/releases/tag/v0.1.0-dev.0)，先启动 DSH 桌面版完成首次初始化，再从系统托盘完全退出。经验证的版本为 DSH `0.2.2-rc.5`。
-
-```sh
-dsh plugin --profile desktop add /path/to/desklatch-dsh-0.1.0-dev.0.tgz
-```
+Windows 使用 [安装向导](../distribution/windows/README.md)。先启动 DSH 桌面版完成首次初始化，再从系统托盘完全退出。运行向导，选择原生插件，安装完成后打开授权页并勾选应用。经验证的版本为 DSH `0.2.2-rc.5`。
 
 Windows 官方桌面版的 `resources/runtime/cli/bin/dsh.cmd` 位于应用安装目录，可用脚本全路径运行该命令。重新打开 DSH，在 **设置 → 模型** 选择已配置的模型即可试用。 [官方插件命令](https://github.com/deepseek-ai/deepseek-harness/blob/master/apps/cli/reference/README.md) · [模型配置](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/user/guide/providers.md)
 
-DSH 加载安装包里的 `dsh.bundle.patch`，挂载 Cordis 插件，注册 `desklatch_observe` 和 `desklatch_act`。发生审批时，插件把 DeskLatch 的等待请求交给 DSH 的会话审批服务，由用户决定是否恢复原动作。安装包默认打开隔离的试用表单。
+DSH 加载安装包里的 `dsh.bundle.patch`，挂载 Cordis 插件，注册 `desklatch_observe` 和 `desklatch_act`。Windows 插件加载 CUA 和授权页保存的应用范围。发生审批时，插件把等待请求交给 DSH 的会话审批服务，由用户决定是否恢复原动作。
 
 已有 DSH Agent 循环的应用可以自行给插件提供已授权的会话。下例中的 `openDeskSession` 由宿主实现，并把回调传给 `createDeskSession`。
 
@@ -50,17 +46,17 @@ const handle = await ctx.agents.create({
 支持本地 stdio MCP 的客户端可使用 Windows 向导生成的配置。也可以在 Node.js 22.19 或更高版本下，下载核心包并在新目录运行以下命令。
 
 ```sh
-npm install --omit=optional /path/to/desklatch-0.1.0-dev.0.tgz
+npm install --omit=optional /path/to/desklatch-0.1.0-dev.1.tgz
 npm exec -- desklatch-setup mcp --install
 ```
 
-将 `desklatch.mcp.json` 中的 `mcpServers.desklatch` 导入客户端。客户端按配置启动本地进程，并通过 MCP 发现、调用两个工具。试用所需浏览器可以是 Chrome、Edge 或 Playwright 安装的 Chromium，路径可通过 `DESKLATCH_CHROMIUM` 指定。经 DSH 的官方 MCP 客户端使用时，工具名会带 `mcp__desklatch__` 前缀。[DSH 的 MCP 接入](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/subsystems/mcp.md)
+在授权页保存应用范围，再将 `desklatch.mcp.json` 中的 `mcpServers.desklatch` 导入客户端。Windows 配置会加载本机操作后端，关键动作通过 Windows 审批窗口确认。经 DSH 的官方 MCP 客户端使用时，可以从安装目录的 `desklatch.dsh-mcp.yml` 复制 `servers.desklatch` 配置，替换现有同名条目，工具调用带 `mcp__desklatch__` 前缀。[DSH 的 MCP 接入](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/subsystems/mcp.md)
 
-试用配置由已安装的 `desklatch-mcp --demo` 启动。要接入应用自己的桌面，将 `--demo` 换成绝对路径指向的宿主模块。模块导出 `openDeskSession()`，返回当前授权的会话。宿主也可以直接创建 `createDeskMcpServer(endpoints)`，连接它自己的 MCP transport。会话通过 `onApprovalRequested` 回调交出待确认的动作。宿主展示请求后调用 `resolveApproval` 回传用户决定。[MCP 宿主示例](../examples/frameworks/browser-host.mjs)
+`desklatch-mcp --demo` 用于隔离浏览器示例。要接入应用自己的桌面，可以给启动命令传入宿主模块的绝对路径。模块导出 `openDeskSession()`，返回当前授权的会话。宿主也可以直接创建 `createDeskMcpServer(endpoints)`，连接自己的 MCP transport。会话通过 `onApprovalRequested` 回调交出待确认的动作。宿主展示请求后调用 `resolveApproval` 回传用户决定。[MCP 宿主示例](../examples/frameworks/browser-host.mjs)
 
 ## TypeScript SDK
 
-在宿主项目安装 [Release 的核心包](https://github.com/wszkxlllll/desklatch/releases/tag/v0.1.0-dev.0)，再安装实际使用的框架和驱动。下面的 `page` 是宿主已打开且授权的 Playwright Page，`allowedOrigin` 是允许操作的来源。
+在宿主项目安装 [Release 的核心包](https://github.com/wszkxlllll/desklatch/releases/tag/v0.1.0-dev.1)，再安装实际使用的框架和驱动。下面的 `page` 是宿主已打开且授权的 Playwright Page，`allowedOrigin` 是允许操作的来源。
 
 ```ts
 import { createDeskSession, createDeskTools } from "desklatch";

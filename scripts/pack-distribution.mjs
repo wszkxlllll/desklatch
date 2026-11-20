@@ -31,9 +31,8 @@ function npmEnvironment() {
   };
 }
 
-async function runNpm(arguments_, cwd, { offline = false } = {}) {
+async function runNpm(arguments_, cwd) {
   const environment = npmEnvironment();
-  if (offline) environment.npm_config_offline = "true";
   try {
     return await execFile(npmNode, [npmScript, ...arguments_], {
       cwd,
@@ -144,7 +143,12 @@ async function createDshStage(coreTarball, version) {
     await copyBundleSource(stage);
 
     const playwrightVersion = rootManifest.devDependencies?.["playwright-core"] || "1.65.1";
-    const dependencies = { desklatch: `file:${coreTarball.replaceAll("\\", "/")}`, "playwright-core": playwrightVersion };
+    const windowsDriverVersion = rootManifest.devDependencies?.["@trycua/cua-driver"] || "0.54.0";
+    const koffiVersion = rootManifest.devDependencies?.koffi || "3.3.8";
+    const dependencies = {
+      desklatch: `file:${coreTarball.replaceAll("\\", "/")}`,
+      "playwright-core": playwrightVersion,
+    };
     const initialManifest = {
       name: "desklatch-dsh",
       version,
@@ -182,7 +186,12 @@ async function createDshStage(coreTarball, version) {
 
     const finalManifest = {
       ...initialManifest,
-      dependencies: { desklatch: version, "playwright-core": playwrightVersion },
+      dependencies: {
+        desklatch: version,
+        "playwright-core": playwrightVersion,
+        "@trycua/cua-driver": windowsDriverVersion,
+        koffi: koffiVersion,
+      },
       bundleDependencies: bundled,
     };
     await writeJson(join(stage, "package.json"), finalManifest);
@@ -206,9 +215,9 @@ async function installProbe(dshTarball) {
     const relocatedBundle = join(consumer, "desklatch-dsh.tgz");
     await copyFile(dshTarball, relocatedBundle);
     await runNpm([
-      "install", "--offline", "--legacy-peer-deps", "--ignore-scripts", "--omit=optional", "--no-package-lock", "--no-audit", "--no-fund",
+      "install", "--legacy-peer-deps", "--ignore-scripts", "--no-package-lock", "--no-audit", "--no-fund",
       "./desklatch-dsh.tgz",
-    ], consumer, { offline: true });
+    ], consumer);
     const probe = `import assert from "node:assert/strict";
 const core = await import("desklatch");
 assert.equal(typeof core.createDeskSession, "function");
@@ -218,6 +227,18 @@ assert.equal(bundle.default?.name, "desklatch-dsh");
 assert.equal(typeof bundle.default?.apply, "function");
 assert.throws(() => import.meta.resolve("@deepseek-ai/dsh-mcp-client"), { code: "ERR_MODULE_NOT_FOUND" });
 assert.throws(() => import.meta.resolve("@e2b/desktop"), { code: "ERR_MODULE_NOT_FOUND" });
+if (process.platform === "win32" && process.arch === "x64") {
+  const { CuaDriver } = await import("@trycua/cua-driver");
+  assert.equal(typeof (await import("koffi")).default.load, "function");
+  assert.equal(typeof (await import("desklatch/windows-product")).createWindowsProductHost, "function");
+  const driver = CuaDriver.create(undefined);
+  try {
+    assert.equal((await driver.metadata()).driverVersion, ${JSON.stringify(rootManifest.devDependencies["@trycua/cua-driver"])});
+  } finally {
+    await driver.shutdown();
+    driver.uniffiDestroy?.();
+  }
+}
 console.log("portable dsh bundle imports verified");
 `;
     const probePath = join(consumer, "node_modules", "desklatch-dsh", "probe.mjs");

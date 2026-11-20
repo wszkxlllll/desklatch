@@ -1,6 +1,6 @@
 {
   "name": "desklatch",
-  "version": "0.1.0-dev.0",
+  "version": "0.1.0-dev.1",
   "private": true,
   "description": "A host-controlled computer-use runtime for AI agents",
   "type": "module",
@@ -31,6 +31,10 @@
     "./windows": {
       "types": "./dist/backends/windows/index.d.ts",
       "import": "./dist/backends/windows/index.js"
+    },
+    "./windows-product": {
+      "types": "./dist/product/windows-product.d.ts",
+      "import": "./dist/product/windows-product.js"
     },
     "./cua-background": {
       "types": "./dist/backends/cua-background/index.d.ts",

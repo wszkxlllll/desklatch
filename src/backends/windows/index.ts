@@ -232,6 +232,7 @@ class WindowsDesktopSession implements WindowsDesktopBackend {
         }
       }
       const built = view === "image" ? emptyFrame() : buildControlsFrame(snapshots, options.where, this.#transport.source === "native-uia-v1");
+      const controlsInFrame = await this.removeOwnedDialogCopies(built.internal, options.signal);
       let image = undefined;
       let complete = built.complete;
       if (view === "image" || view === "both") {
@@ -240,12 +241,12 @@ class WindowsDesktopSession implements WindowsDesktopBackend {
       }
       const frame: Frame = Object.freeze({
         scope: frameScope,
-        controls: Object.freeze(built.controls),
+        controls: Object.freeze(controlsInFrame.map(item => item.control)),
         complete,
         ...(image ? { image } : {}),
       });
       const controls = new Map<string, InternalControl>();
-      for (const control of built.internal) controls.set(control.control.id, control);
+      for (const control of controlsInFrame) controls.set(control.control.id, control);
       const canvasControls = makeCanvasControls(frameScope, snapshots, built.targetBounds, this.foregroundPointAllowed());
       const internalFrame: InternalFrame = {
         frame,
@@ -259,6 +260,44 @@ class WindowsDesktopSession implements WindowsDesktopBackend {
       this.#current = internalFrame;
       return frame;
     });
+  }
+
+  private async removeOwnedDialogCopies(controls: readonly InternalControl[], signal?: AbortSignal): Promise<readonly InternalControl[]> {
+    const inspector = this.#ownedDialogInspector;
+    if (this.#transport.source !== "cua-uia-0.54" || !inspector || this.#authorization.targets.length < 2) return controls;
+
+    const matching = new Map<string, InternalControl[]>();
+    for (const item of controls) {
+      const { role, name, rect, actions } = item.control;
+      if (!rect || actions.length === 0) continue;
+      const key = JSON.stringify([item.window.pid, role, name, rect.x, rect.y, rect.width, rect.height, actions]);
+      const group = matching.get(key);
+      if (group) group.push(item);
+      else matching.set(key, [item]);
+    }
+
+    const dialogsByOwner = new Map<bigint, readonly WindowsOwnedDialog[]>();
+    const duplicates = new Set<string>();
+    for (const group of matching.values()) {
+      if (new Set(group.map(item => item.window.hwnd)).size < 2) continue;
+      const point = center(group[0].control.rect!);
+      for (const item of group) {
+        const evidence = await this.readPhysical(item.window, point, signal);
+        if (!evidence?.visible || evidence.occludingHwnd === undefined) continue;
+        const popup = group.find(other => other !== item && other.window.hwnd === evidence.occludingHwnd);
+        if (!popup) continue;
+        let owned = dialogsByOwner.get(item.window.hwnd);
+        if (!owned) {
+          owned = await inspector.findOwnedDialogs(item.window, { signal }).catch(() => []);
+          signal?.throwIfAborted();
+          dialogsByOwner.set(item.window.hwnd, owned);
+        }
+        if (owned.some(dialog => dialog.hwnd === popup.window.hwnd && isOwnedDialogEvidence(dialog, item.window))) {
+          duplicates.add(item.key);
+        }
+      }
+    }
+    return controls.filter(item => !duplicates.has(item.key));
   }
 
   hitTest(frame: Frame, point: Point, signal?: AbortSignal): Promise<Control | undefined> {
@@ -510,8 +549,7 @@ function buildControlsFrame(
   snapshots: ReadonlyArray<{ target: WindowsWindowTarget; snapshot?: WindowsWindowSnapshot; evidence?: WindowsPhysicalEvidence; focus?: WindowsFocusEvidence }>,
   where?: Selector,
   nativeUiAutomation = false,
-): { controls: Control[]; internal: InternalControl[]; targetBounds: ReadonlyMap<string, Rect>; complete: boolean } {
-  const controls: Control[] = [];
+): { internal: InternalControl[]; targetBounds: ReadonlyMap<string, Rect>; complete: boolean } {
   const internal: InternalControl[] = [];
   const targetBounds = new Map<string, Rect>();
   for (const item of snapshots) {
@@ -579,7 +617,8 @@ function buildControlsFrame(
         ...(sensitive ? { sensitive: true } : {}),
         ...(element.valueDescription ? { labels: Object.freeze([element.valueDescription]) } : {}),
         ...(!sensitive && element.approvalContext ? { approvalContext: element.approvalContext } : {}),
-        effect: sensitive ? "sensitive" : actions.includes("type") || actions.includes("setValue") ? "edit" : actions.includes("scroll") ? "read" : actions.length ? "unknown" : "read",
+        effect: sensitive ? "sensitive" : actions.includes("click") ? "unknown"
+          : actions.includes("type") || actions.includes("setValue") ? "edit" : actions.includes("scroll") || !actions.length ? "read" : "unknown",
       });
       const internalControl: InternalControl = {
         control,
@@ -592,13 +631,10 @@ function buildControlsFrame(
         ...(localRect ? { localRect } : {}),
         source: element,
       };
-      if (!where || matchesSelector(control, where, internalControl)) {
-        controls.push(control);
-        internal.push(internalControl);
-      }
+      if (!where || matchesSelector(control, where, internalControl)) internal.push(internalControl);
     }
   }
-  return { controls, internal, targetBounds, complete };
+  return { internal, targetBounds, complete };
 }
 
 function makeCanvasControls(
@@ -642,8 +678,8 @@ function makeCanvasControls(
   return controls;
 }
 
-function emptyFrame(): { controls: Control[]; internal: InternalControl[]; targetBounds: ReadonlyMap<string, Rect>; complete: boolean } {
-  return { controls: [], internal: [], targetBounds: new Map(), complete: false };
+function emptyFrame(): { internal: InternalControl[]; targetBounds: ReadonlyMap<string, Rect>; complete: boolean } {
+  return { internal: [], targetBounds: new Map(), complete: false };
 }
 
 function statesFor(element: WindowsWindowElement, rect: Rect | undefined): State[] {

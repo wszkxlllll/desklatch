@@ -111,6 +111,34 @@ test('foreign popup occlusion is checked immediately before dispatch', async () 
   await backend.close();
 });
 
+test('only a natively verified owned dialog can remove the duplicate under its owner', async () => {
+  const dialog = { ...targetB, pid: targetA.pid };
+  const bounds = { x: 20, y: 30, width: 420, height: 280 };
+  const fake = fakeDesktopTransport();
+  fake.transport.observeWindow = async target => snapshot(target, target.title, bounds.x, bounds.y);
+  fake.inspector.read = async (target, point) => ({ target, visible: true, minimized: false, bounds,
+    ...(point && target.hwnd === targetA.hwnd ? { occludingHwnd: dialog.hwnd } : {}) });
+  let verified = false;
+  const backend = await createWindowsDesktopBackend({
+    authorization: { targets: [targetA, dialog], background: { source: 'cua-uia-0.54' } },
+    transport: fake.transport,
+    inspector: fake.inspector,
+    ownedDialogInspector: { async findOwnedDialogs(target) {
+      return verified && target.hwnd === targetA.hwnd ? [{ target, hwnd: dialog.hwnd, pid: dialog.pid,
+        ownerHwnd: targetA.hwnd, ownerChain: [targetA.hwnd], bounds }] : [];
+    } },
+  });
+  const where = { name: 'Go' };
+  assert.equal((await backend.observe({ view: 'controls', where })).controls.length, 2);
+  verified = true;
+  const frame = await backend.observe({ view: 'controls', where });
+  assert.equal(frame.controls.length, 1);
+  const delivery = await backend.dispatch({ frame, step: { kind: 'click', target: where } });
+  assert.equal(delivery.status, 'dispatched');
+  assert.equal(fake.calls.at(-1).target.window.hwnd, dialog.hwnd);
+  await backend.close();
+});
+
 test('CUA select-only ListItems remain read-only without a semantic-to-coordinate click fallback', async () => {
   const transport = {
     source: 'cua-uia-0.54',

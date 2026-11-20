@@ -12,7 +12,7 @@ tarball there first, then start the interactive chooser for both optional
 features. Each feature offers `install`, `existing`, and `skip` (the default).
 
 ```sh
-npm install --omit=optional /path/to/desklatch-0.1.0-dev.0.tgz
+npm install --omit=optional /path/to/desklatch-0.1.0-dev.1.tgz
 npm exec -- desklatch-setup
 ```
 
@@ -31,9 +31,10 @@ npm exec -- desklatch-setup dsh --bundle path/to/desklatch-dsh.tgz
 npm exec -- desklatch-setup dsh --bundle path/to/desklatch-dsh.tgz --install-e2b --install-ocr
 ```
 
-The optional configuration is for the host that owns the desktop session.
-The packaged starter plugin and generated MCP demo still use an isolated local
-browser. The DSH bundle is installed separately with the official DSH command.
+On Windows, the starter plugin and the generated MCP configuration open the
+local Windows host. The setup wizard installs and checks the selected extra
+dependencies. A host can use those configurations to add OCR evidence or
+create an E2B session.
 [Connection setup](integrations.md)
 
 ## Local OCR

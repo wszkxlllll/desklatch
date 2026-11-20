@@ -62,7 +62,13 @@ export function createWindowsOwnedDialogInspector(api: WindowsOwnedDialogNativeA
  * lazy: non-Windows hosts and callers that do not need dialog discovery never
  * load a native DLL or enumerate desktop windows.
  */
-export async function loadWindowsOwnedDialogInspector(): Promise<WindowsOwnedDialogInspector | undefined> {
+let windowsOwnedDialogInspector: Promise<WindowsOwnedDialogInspector | undefined> | undefined;
+
+export function loadWindowsOwnedDialogInspector(): Promise<WindowsOwnedDialogInspector | undefined> {
+  return windowsOwnedDialogInspector ??= openWindowsOwnedDialogInspector();
+}
+
+async function openWindowsOwnedDialogInspector(): Promise<WindowsOwnedDialogInspector | undefined> {
   if (process.platform !== "win32" || process.arch !== "x64") return undefined;
   try {
     const module = await dynamicImport("koffi");
@@ -70,13 +76,11 @@ export async function loadWindowsOwnedDialogInspector(): Promise<WindowsOwnedDia
     if (!koffi || typeof (koffi as { load?: unknown }).load !== "function") return undefined;
     const native = koffi as {
       load(path: string): { func: (...args: any[]) => NativeFunction };
-      opaque(): unknown;
       pointer(...args: unknown[]): unknown;
       proto(convention: string, name: string, result: string, args: readonly unknown[]): unknown;
     };
     const user32 = native.load("C:\\Windows\\System32\\user32.dll");
-    const hwndType = native.pointer("HWND", native.opaque());
-    const enumWindowsProc = native.proto("__stdcall", "EnumWindowsProc", "bool", [hwndType, "intptr_t"]);
+    const enumWindowsProc = native.proto("__stdcall", "DeskLatchOwnedWindowProc", "int", ["uintptr_t", "intptr_t"]);
     const enumWindows = user32.func("__stdcall", "EnumWindows", "int", [native.pointer(enumWindowsProc), "intptr_t"]);
     const isWindow = user32.func("int __stdcall IsWindow(uintptr_t hwnd)");
     const isWindowVisible = user32.func("int __stdcall IsWindowVisible(uintptr_t hwnd)");
@@ -88,7 +92,7 @@ export async function loadWindowsOwnedDialogInspector(): Promise<WindowsOwnedDia
 
     return createWindowsOwnedDialogInspector({
       enumerateTopLevelWindows(visit) {
-        const result = Number(enumWindows((hwnd: unknown) => visit(toBigInt(hwnd) ?? 0n), 0));
+        const result = Number(enumWindows((hwnd: unknown) => visit(toBigInt(hwnd) ?? 0n) ? 1 : 0, 0));
         return result !== 0;
       },
       isWindow(hwnd) {
