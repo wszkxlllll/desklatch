@@ -17,6 +17,7 @@ function fixtureState(target, title) {
 }
 
 function makeHostFixture() {
+  let foreground;
   let grants = {
     version: 1,
     apps: [{ id: 'editor', name: 'Editor' }, { id: 'browser', name: 'Browser' }],
@@ -33,10 +34,20 @@ function makeHostFixture() {
   const dispatches = [];
   const imageCaptures = [];
   const windowImageCaptures = [];
+  const restored = [];
   const seams = {
     async readWindowsProductGrants() { return grants; },
-    async listWindowsAppWindows() { return windows; },
-    async verifyWindowsAppWindow(window) { return windows.some(candidate => candidate.id === window.id && candidate.hwnd === window.hwnd); },
+    async listWindowsAppWindows({ includeMinimized = false } = {}) {
+      return windows.filter(window => includeMinimized || !window.minimized);
+    },
+    async verifyWindowsAppWindow(window) {
+      return windows.some(candidate => candidate.id === window.id && candidate.hwnd === window.hwnd && !candidate.minimized);
+    },
+    async restoreMinimizedWindow(window) {
+      restored.push(window.hwnd);
+      window.minimized = false;
+      return true;
+    },
     async transportFactory(context) {
       contexts.push(context);
       return {
@@ -58,7 +69,8 @@ function makeHostFixture() {
             windowImageCaptures.push({ appId: context.app.id, target });
             return { mimeType: 'image/png', dataBase64: 'AA==', width: 1000, height: 1000 };
           },
-          async bringToFront() {
+          async bringToFront(target) {
+            foreground = target;
             return { status: 'dispatched' };
           },
         },
@@ -67,15 +79,62 @@ function makeHostFixture() {
             const bounds = target.hwnd === 10001n
               ? { x: 20, y: 30, width: 400, height: 260 }
               : { x: 500, y: 30, width: 400, height: 260 };
-            return { target, visible: true, minimized: false, bounds };
+            const minimized = context.windows.find(window => window.hwnd === target.hwnd)?.minimized === true;
+            return { target, visible: !minimized, minimized, bounds, foregroundHwnd: foreground?.hwnd, foregroundPid: foreground?.pid };
           },
         },
       };
     },
     policy: () => ({ decision: 'allow', code: 'product_test' }),
   };
-  return { seams, windows, contexts, dispatches, imageCaptures, windowImageCaptures, setGrants(value) { grants = value; } };
+  return { seams, windows, contexts, dispatches, imageCaptures, windowImageCaptures, restored, setGrants(value) { grants = value; } };
 }
+
+test('explicit activation restores a granted minimized window on first switch and when returning to the active app', async () => {
+  const fixture = makeHostFixture();
+  fixture.setGrants({ version: 1, apps: [{ id: 'browser', name: 'Browser' }], allowDesktopCapture: false, allowForegroundInput: true });
+  const browser = fixture.windows.find(window => window.appId === 'browser');
+  browser.minimized = true;
+  const workspace = await createWindowsProductHost({ authorizationFile: 'ignored-for-seams', test: fixture.seams });
+  try {
+    assert.deepEqual((await workspace.observe({ workspace: true })).applications.map(app => app.id), ['browser']);
+    assert.deepEqual(fixture.restored, []);
+    assert.equal((await workspace.act({ activate: 'browser' })).code, 'activated');
+    assert.deepEqual(fixture.restored, [browser.hwnd]);
+    assert.equal((await workspace.observe({ view: 'controls' })).controls.some(control => control.name === 'Go'), true);
+
+    browser.minimized = true;
+    await workspace.observe({ workspace: true });
+    assert.deepEqual(fixture.restored, [browser.hwnd]);
+    assert.equal((await workspace.act({ activate: 'browser' })).code, 'activated');
+    assert.deepEqual(fixture.restored, [browser.hwnd, browser.hwnd]);
+    assert.equal((await workspace.act({ activate: 'browser' })).code, 'already_active');
+  } finally {
+    await workspace.close();
+  }
+});
+
+test('minimized activation requires current application and foreground permissions', async () => {
+  const fixture = makeHostFixture();
+  fixture.windows.find(window => window.appId === 'browser').minimized = true;
+  const workspace = await createWindowsProductHost({ authorizationFile: 'ignored-for-seams', test: fixture.seams });
+  try {
+    assert.equal((await workspace.act({ activate: 'browser' })).code, 'application_window_unavailable');
+    assert.deepEqual(fixture.restored, []);
+
+    const grant = { version: 1, apps: [{ id: 'browser', name: 'Browser' }], allowDesktopCapture: false, allowForegroundInput: true };
+    fixture.setGrants(grant);
+    const list = fixture.seams.listWindowsAppWindows;
+    fixture.seams.listWindowsAppWindows = async options => {
+      if (options?.includeMinimized) fixture.setGrants({ ...grant, apps: [] });
+      return list(options);
+    };
+    assert.equal((await workspace.act({ activate: 'browser' })).code, 'application_automation_blocked');
+    assert.deepEqual(fixture.restored, []);
+  } finally {
+    await workspace.close();
+  }
+});
 
 test('product host exposes only granted apps and includes owned child windows under the app grant', async () => {
   const fixture = makeHostFixture();

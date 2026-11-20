@@ -38,6 +38,8 @@ export interface WorkspaceApplication {
   readonly activate?: WorkspaceActivator;
   /** Must independently return true after activate has completed. */
   readonly verifyFront?: WorkspaceFrontVerifier;
+  /** On an explicit activate call, bring the current app back if it lost focus. */
+  readonly reactivateOnFocusLoss?: boolean;
   /** Optional browser adapter; its own URL allowlist remains authoritative. */
   readonly navigate?: WorkspaceNavigator;
   /** Optional host-owned pair for discovering and replaying verified steps. */
@@ -48,6 +50,7 @@ export interface WorkspaceOpenedApplication {
   readonly session: DeskSession;
   readonly activate?: WorkspaceActivator;
   readonly verifyFront?: WorkspaceFrontVerifier;
+  readonly reactivateOnFocusLoss?: boolean;
   readonly navigate?: WorkspaceNavigator;
   /** Optional host-owned pair for discovering and replaying verified steps. */
   readonly stepReuse?: DiscoverableStepReuse;
@@ -221,6 +224,8 @@ function sameOnDemandDeclaration(left: OnDemandWorkspaceApplication, right: OnDe
 
 const SAFE_HOST_CODES = new Set([
   "activation_failed", "activation_driver_refused", "activation_not_verified", "activation_unsupported", "activation_cancelled",
+  "application_automation_blocked", "application_window_unavailable", "foreground_input_not_authorized",
+  "window_restore_failed", "window_scope_changed",
   "navigation_failed", "navigation_not_authorized", "navigation_not_allowed", "navigation_unsupported",
   "unauthorized_navigation", "browser_origin_not_allowlisted",
   "invalid_url", "url_too_large", "unsupported_scheme", "credentials_not_allowed", "unauthorized_origin",
@@ -473,6 +478,7 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
         session: opened.session,
         ...(typeof opened.activate === "function" ? { activate: opened.activate.bind(opened) } : {}),
         ...(typeof opened.verifyFront === "function" ? { verifyFront: opened.verifyFront.bind(opened) } : {}),
+        ...(opened.reactivateOnFocusLoss === true ? { reactivateOnFocusLoss: true } : {}),
         ...(entry.allowNavigation === true && typeof opened.navigate === "function" ? { navigate: opened.navigate.bind(opened) } : {}),
         ...(entry.allowStepReuse === true && hasOwn(opened, "stepReuse") ? { stepReuse: opened.stepReuse } : {}),
       } : undefined;
@@ -683,9 +689,11 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
         // Treat an unsuccessful probe as loss of physical focus below.
       }
       activeId = null;
-      invalidateObservations();
-      activation += 1;
-      return stopped("activation_not_verified", undefined, null);
+      if (application.reactivateOnFocusLoss !== true) {
+        invalidateObservations();
+        activation += 1;
+        return stopped("activation_not_verified", undefined, null);
+      }
     }
     if (signal?.aborted) return stopped("cancelled", undefined, publicActiveId());
     const prior = current();

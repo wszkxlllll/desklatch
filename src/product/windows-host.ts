@@ -8,7 +8,11 @@ import type { RapidOcrCpuRunnerOptions } from "../evidence/rapidocr.js";
 import type { RapidOcrV5MobileRunner } from "../evidence/ocr.js";
 import { readWindowsProductGrants as readPersistedWindowsProductGrants } from "./windows-grants.js";
 import type { WindowsProductGrants } from "./windows-grants.js";
-import { listWindowsAppWindows as listNativeWindowsAppWindows, verifyWindowsAppWindow as verifyNativeWindowsAppWindow } from "./windows-inventory.js";
+import {
+  listWindowsAppWindows as listNativeWindowsAppWindows,
+  restoreMinimizedWindowsAppWindow,
+  verifyWindowsAppWindow as verifyNativeWindowsAppWindow,
+} from "./windows-inventory.js";
 import type { WindowsAppWindow } from "./windows-inventory.js";
 import {
   createWindowsDesktopBackend,
@@ -33,8 +37,9 @@ export type { WindowsAppWindow } from "./windows-inventory.js";
 
 export interface WindowsProductHostTestSeams {
   readonly readWindowsProductGrants?: (file: string) => Promise<WindowsProductGrants>;
-  readonly listWindowsAppWindows?: () => Promise<readonly WindowsAppWindow[]>;
+  readonly listWindowsAppWindows?: typeof listNativeWindowsAppWindows;
   readonly verifyWindowsAppWindow?: (window: WindowsAppWindow) => Promise<boolean>;
+  readonly restoreMinimizedWindow?: typeof restoreMinimizedWindowsAppWindow;
   readonly transportFactory?: (context: {
     readonly app: { readonly id: string; readonly name: string };
     readonly windows: readonly WindowsAppWindow[];
@@ -125,15 +130,18 @@ async function openGrantedApplication(
   const grants = await readGrants(options, options.authorizationFile);
   const granted = grants.apps.find(candidate => candidate.id === app.id);
   if (!granted) throw productError("application_automation_blocked");
-  const windows = await verifiedAppWindows(options, app.id);
+  // An on-demand application is opened only by an explicit activation.
+  const windows = await windowsForActivation(options, app.id, grants, signal);
   if (windows.length === 0) throw productError("application_window_unavailable");
   signal?.throwIfAborted();
 
   let runtime = await openProductRuntime(options, granted, grants, windows, signal);
-  const ensureRuntime = async (ensureSignal?: AbortSignal): Promise<{ readonly grants: WindowsProductGrants; readonly live: readonly WindowsAppWindow[] }> => {
+  const ensureRuntime = async (ensureSignal?: AbortSignal, activating = false): Promise<{ readonly grants: WindowsProductGrants; readonly live: readonly WindowsAppWindow[] }> => {
     const currentGrants = await readGrants(options, options.authorizationFile);
     if (!currentGrants.apps.some(candidate => candidate.id === app.id)) throw productError("application_automation_blocked");
-    const live = await verifiedAppWindows(options, app.id);
+    const live = activating
+      ? await windowsForActivation(options, app.id, currentGrants, ensureSignal)
+      : await verifiedAppWindows(options, app.id);
     if (live.length === 0) throw productError("application_window_unavailable");
     // A disappearing sibling is not, by itself, a reason to invalidate an
     // action aimed at another still-verified window. Rebind when a new or
@@ -162,7 +170,8 @@ async function openGrantedApplication(
           || latest.allowForegroundInput !== runtime.grants.allowForegroundInput
           || !(await verify(window))) return false;
         const evidence = await runtime.inspector.read(toWindowTarget(window));
-        if (evidence?.foregroundHwnd === window.hwnd) return true;
+        if (evidence?.visible && !evidence.minimized && evidence.foregroundHwnd === window.hwnd
+          && (evidence.foregroundPid === undefined || evidence.foregroundPid === window.pid)) return true;
       }
     } catch {
       return false;
@@ -171,27 +180,23 @@ async function openGrantedApplication(
   };
 
   const activate = async (context: { readonly signal?: AbortSignal }): Promise<unknown> => {
-    try {
-      const { grants: currentGrants, live } = await ensureRuntime(context.signal);
-      if (!currentGrants.allowForegroundInput) return true;
-      if (!runtime.foregroundActivator) return false;
-      const target = live[0];
-      const verify = options.test?.verifyWindowsAppWindow ?? verifyNativeWindowsAppWindow;
-      const latest = await readGrants(options, options.authorizationFile);
-      if (!latest.apps.some(candidate => candidate.id === app.id)
-        || latest.allowForegroundInput !== runtime.grants.allowForegroundInput
-        || !(await verify(target))) return false;
-      const result = await runtime.foregroundActivator(toWindowTarget(target), { signal: context.signal });
-      return result.status === "dispatched";
-    } catch {
-      return false;
-    }
+    const { grants: currentGrants, live } = await ensureRuntime(context.signal, true);
+    if (!currentGrants.allowForegroundInput) return true;
+    if (!runtime.foregroundActivator) return false;
+    const target = live.find(window => window.ownerHwnd === undefined) ?? live[0];
+    const verify = options.test?.verifyWindowsAppWindow ?? verifyNativeWindowsAppWindow;
+    const latest = await readGrants(options, options.authorizationFile);
+    if (!latest.apps.some(candidate => candidate.id === app.id) || !latest.allowForegroundInput
+      || !(await verify(target))) return false;
+    const result = await runtime.foregroundActivator(toWindowTarget(target), { signal: context.signal });
+    return result.status === "dispatched";
   };
 
   return {
     session: wrapProductSession(() => runtime.session, options, app.id, () => runtime.close(), async signal => { await ensureRuntime(signal); }),
     activate,
     verifyFront,
+    reactivateOnFocusLoss: true,
     closeProduct: () => runtime.close(),
   };
 }
@@ -480,13 +485,38 @@ async function verifiedAppWindows(options: WindowsProductHostOptions, appId: str
   const verify = options.test?.verifyWindowsAppWindow ?? verifyNativeWindowsAppWindow;
   const list = options.test?.listWindowsAppWindows ?? listNativeWindowsAppWindows;
   const windows = (await list())
-    .filter(window => window.appId === appId)
+    .filter(window => window.appId === appId && !window.minimized)
     .sort((left, right) => left.id.localeCompare(right.id));
   const verified: WindowsAppWindow[] = [];
   for (const window of windows) {
     if (await verify(window)) verified.push(window);
   }
   return verified;
+}
+
+async function windowsForActivation(
+  options: WindowsProductHostOptions,
+  appId: string,
+  grants: WindowsProductGrants,
+  signal?: AbortSignal,
+): Promise<readonly WindowsAppWindow[]> {
+  const windows = await verifiedAppWindows(options, appId);
+  if (windows.length > 0 || !grants.allowForegroundInput) return windows;
+
+  const list = options.test?.listWindowsAppWindows ?? listNativeWindowsAppWindows;
+  const target = (await list({ includeMinimized: true })).find(window =>
+    window.appId === appId && window.minimized === true && window.ownerHwnd === undefined);
+  if (!target) return windows;
+
+  const latest = await readGrants(options, options.authorizationFile);
+  if (!latest.apps.some(app => app.id === appId)) throw productError("application_automation_blocked");
+  if (!latest.allowForegroundInput) throw productError("foreground_input_not_authorized");
+  signal?.throwIfAborted();
+  const restore = options.test?.restoreMinimizedWindow ?? restoreMinimizedWindowsAppWindow;
+  if (!await restore(target, signal)) throw productError("window_restore_failed");
+  const live = await verifiedAppWindows(options, appId);
+  if (!live.some(window => sameWindowIdentity(window, target))) throw productError("window_scope_changed");
+  return live;
 }
 
 async function selectOcrTarget(
