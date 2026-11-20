@@ -33,7 +33,7 @@
     <script>
       document.getElementById('disclosure').addEventListener('click', function () {
         const panel = document.getElementById('advanced');
-        const open = panel.style.display !== 'none';
+        const open = this.getAttribute('aria-expanded') === 'true';
         panel.style.display = open ? 'none' : 'block';
         this.setAttribute('aria-expanded', String(!open));
       });

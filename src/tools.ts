@@ -29,7 +29,7 @@ export interface DesktopToolSession {
   act(input: unknown, signal?: AbortSignal): Promise<unknown>;
 }
 
-const states = ["visible", "enabled", "editable", "focused", "checked", "selected"] as const;
+const states = ["visible", "enabled", "editable", "focused", "checked", "selected", "expanded"] as const;
 const fields = ["role", "name", "within", "state"];
 const record = (input: unknown): input is Record<string, unknown> =>
   !!input && typeof input === "object" && !Array.isArray(input);

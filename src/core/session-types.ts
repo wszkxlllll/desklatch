@@ -1,4 +1,4 @@
-import type { ActionKind, Capability, Control, DocumentObservation, DocumentRead, Frame, RiskPolicy, Selector, State } from "../contracts.js";
+import type { ActionKind, Capability, Control, DocumentObservation, DocumentRead, Expect, Frame, RiskPolicy, Selector, State, Step } from "../contracts.js";
 
 export interface ControlObservation {
   ref: string;
@@ -12,6 +12,8 @@ export interface ControlObservation {
   labels?: readonly string[];
   effect?: Control["effect"];
   filterAction?: boolean;
+  disclosure?: boolean;
+  sameDocumentTab?: boolean;
 }
 
 export interface DeskObservation {
@@ -52,6 +54,25 @@ export interface ActResult {
   candidates?: readonly CandidateSummary[];
   requestId?: string;
   observationId?: string;
+}
+
+/** Host-only execution controls. Model-facing tools never expose this value. */
+export interface DeskSessionActOptions {
+  /** Run a verified replay with a pre-dispatch expectation short-circuit. */
+  readonly replay?: boolean;
+  /** Receive independently observed post-action evidence for host-owned capture. */
+  readonly onVerifiedStep?: (evidence: VerifiedStepEvidence) => void;
+}
+
+/** Evidence emitted only after the normal target, policy, dispatch, and expect checks. */
+export interface VerifiedStepEvidence {
+  readonly index: number;
+  readonly step: Step;
+  readonly target: Control;
+  readonly after: Control;
+  readonly expectation: Expect;
+  /** True only when the expected state was absent in the pre-action frame and present after dispatch. */
+  readonly changed: boolean;
 }
 
 export interface ApprovalRequest {
@@ -99,7 +120,9 @@ export interface DeskSession {
   readonly allowModelDocumentText: boolean;
   readonly limits: Readonly<{ maxSteps: number; maxTextLength: number; maxScrollAmount: number }>;
   observe(options?: DeskObserveOptions): Promise<DeskObservation>;
-  act(raw: unknown, signal?: AbortSignal): Promise<ActResult>;
+  act(raw: unknown, signal?: AbortSignal, options?: DeskSessionActOptions): Promise<ActResult>;
+  /** Host-only replay boundary; absent on legacy/session adapters. */
+  replay?(raw: unknown, signal?: AbortSignal): Promise<ActResult>;
   resolveApproval(requestId: string, decision: ApprovalDecision): Promise<ApprovalResolution>;
   correct(reason?: string): void;
   cancel(reason?: string): void;

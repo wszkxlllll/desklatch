@@ -13,7 +13,7 @@ export interface LocalBrowserOptions extends BrowserBackendOptions {
 /** Launches a temporary, headless context; it never opens a user profile. */
 export async function createLocalBrowserBackend(options: LocalBrowserOptions = {}): Promise<BrowserBackend> {
   const { chromium } = await import("playwright-core");
-  const executablePath = options.executablePath ?? findExecutable();
+  const executablePath = options.executablePath ?? findChromiumExecutable();
   const browser = await chromium.launch({
     headless: options.headless ?? true,
     ...(executablePath ? { executablePath } : {}),
@@ -37,7 +37,8 @@ export async function createLocalBrowserBackend(options: LocalBrowserOptions = {
   }
 }
 
-function findExecutable(): string | undefined {
+/** Resolve a locally installed Chromium without downloading or using a user profile. */
+export function findChromiumExecutable(): string | undefined {
   const candidates = [
     process.env.DESKLATCH_CHROMIUM,
     process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH,

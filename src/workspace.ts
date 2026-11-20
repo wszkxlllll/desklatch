@@ -965,7 +965,7 @@ export function createWorkspace(options: WorkspaceOptions = {}): Workspace {
     if (activation) workspaceBranches.push({ required: ["activate"], not: { anyOf: [{ required: ["navigate"] }, { required: ["steps"] }, { required: ["observationId"] }, ...reuseNot] } });
     if (navigation) workspaceBranches.push({ required: ["navigate"], not: { anyOf: [{ required: ["activate"] }, { required: ["steps"] }, { required: ["observationId"] }, ...reuseNot] } });
     workspaceBranches.push({ required: regularRequired, not: { anyOf: [{ required: ["activate"] }, { required: ["navigate"] }, ...reuseNot] } });
-    if (reuseEnabled) workspaceBranches.push({ required: ["reuse"], not: { anyOf: [{ required: ["activate"] }, { required: ["navigate"] }, { required: ["steps"] }, { required: ["observationId"] }] } });
+    if (reuseEnabled) workspaceBranches.push({ required: ["reuse"], not: { anyOf: [{ required: ["activate"] }, { required: ["navigate"] }, { required: ["steps"] }] } });
     const schema: AnyRecord = {
       ...withoutRequired,
       additionalProperties: false,

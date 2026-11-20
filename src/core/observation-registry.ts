@@ -140,6 +140,8 @@ export class ObservationRegistry {
     if (control.labels && control.labels.length > 0) result.labels = control.labels.map((label) => sanitizeText(label, 256));
     if (control.effect !== undefined) result.effect = control.effect;
     if (control.filterAction !== undefined) result.filterAction = control.filterAction;
+    if (control.disclosure !== undefined) result.disclosure = control.disclosure;
+    if (control.sameDocumentTab !== undefined) result.sameDocumentTab = control.sameDocumentTab;
     if (control.value !== undefined) {
       if (sensitive) result.valueRedacted = true;
       else result.value = sanitizeText(control.value, 1_024);

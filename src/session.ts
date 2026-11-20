@@ -23,8 +23,10 @@ import type {
   DeskObservation,
   DeskObserveOptions,
   DeskSession,
+  DeskSessionActOptions,
   DeskSessionOptions,
   StepReceipt,
+  VerifiedStepEvidence,
 } from "./core/session-types.js";
 export type {
   ActResult,
@@ -37,13 +39,15 @@ export type {
   DeskObservation,
   DeskObserveOptions,
   DeskSession,
+  DeskSessionActOptions,
   DeskSessionOptions,
   StepReceipt,
   StepReceiptStatus,
+  VerifiedStepEvidence,
 } from "./core/session-types.js";
 import { randomUUID } from "node:crypto";
 import { validateRequest } from "./request.js";
-import { matchControl } from "./grounding.js";
+import { canonicalRole, matchControl } from "./grounding.js";
 import { defaultRiskPolicy, recheckRiskApproval } from "./policy.js";
 import { awaitAbortable, deepFreeze, freezeCapabilities, intersectCapabilities, mergeSignals, safeAdapterCode, safeValidationCode } from "./core/session-support.js";
 import { approvalActionParams, approvalSummary, normalizeApprovalDecision } from "./core/session-approval.js";
@@ -78,6 +82,8 @@ interface SuspendedBatch {
 interface ActiveExecution {
   controller: AbortController;
   epoch: number;
+  replay: boolean;
+  onVerifiedStep?: (evidence: VerifiedStepEvidence) => void;
   reason?: string;
   pendingApprovals: Set<PendingApproval>;
   pinnedObservations: Set<StoredObservation>;
@@ -182,6 +188,39 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
 
   function hasState(control: Control, state: State): boolean {
     return control.states.includes(state);
+  }
+
+  function isExactNamedSelector(value: unknown): value is Selector {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    const selector = value as Record<string, unknown>;
+    return typeof selector.role === "string" && selector.role.trim().length > 0
+      && typeof selector.name === "string" && selector.name.trim().length > 0
+      && Object.keys(selector).every((key) => ["role", "name", "within", "state"].includes(key))
+      && (selector.within === undefined || typeof selector.within === "string")
+      && (selector.state === undefined || typeof selector.state === "string");
+  }
+
+  function selectorSignature(value: Selector): string {
+    return JSON.stringify(["role", "name", "within", "state"].flatMap((key) =>
+      Object.hasOwn(value, key) ? [key, (value as Record<string, unknown>)[key]] : []));
+  }
+
+  /**
+   * Only browser/native controls carrying an independent read-only marker may
+   * be short-circuited or emitted as click-capture evidence. Effect alone is
+   * intentionally insufficient: arbitrary host controls can report `read`.
+   */
+  function isVerifiedClickCandidate(step: Extract<import("./contracts.js").Step, { kind: "click" }>, target: Control): boolean {
+    if ((step.button ?? "left") !== "left" || (step.count ?? 1) !== 1) return false;
+    if (!isExactNamedSelector(step.target) || !step.expect || !isExactNamedSelector(step.expect.target)) return false;
+    if (selectorSignature(step.target) !== selectorSignature(step.expect.target)) return false;
+    if (!("state" in step.expect) || step.expect.state === "present") return false;
+    const state = "state" in step.expect ? step.expect.state : undefined;
+    const disclosure = (target as Control & { disclosure?: unknown }).disclosure === true && state === "expanded";
+    const filter = target.filterAction === true && canonicalRole(target.role) === "checkbox" && state === "checked";
+    const tab = canonicalRole(target.role) === "tab"
+      && (target as Control & { sameDocumentTab?: unknown }).sameDocumentTab === true && state === "selected";
+    return target.effect === "read" && (disclosure || filter || tab);
   }
 
   function currentReason(execution: ActiveExecution): string {
@@ -450,11 +489,13 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
     }
   }
 
-  function startExecution(callSignal?: AbortSignal): ActiveExecution {
+  function startExecution(callSignal?: AbortSignal, executionOptions: DeskSessionActOptions = {}): ActiveExecution {
     const controller = new AbortController();
     const execution: ActiveExecution = {
       controller,
       epoch,
+      replay: executionOptions.replay === true,
+      ...(executionOptions.onVerifiedStep ? { onVerifiedStep: executionOptions.onVerifiedStep } : {}),
       pendingApprovals: new Set(),
       pinnedObservations: new Set(),
       focusRecords: new Map(),
@@ -582,9 +623,10 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
     return queued;
   }
 
-  async function checkExpectation(expectation: Expect, signal: AbortSignal): Promise<{ ok: boolean; code?: string }> {
-    const deadline = Date.now() + Math.max(0, expectTimeoutMs);
+  async function checkExpectation(expectation: Expect, signal: AbortSignal, waitForChange = true): Promise<{ ok: boolean; code?: string; control?: Control }> {
+    const deadline = Date.now() + (waitForChange ? Math.max(0, expectTimeoutMs) : 0);
     let lastCode = "expect_failed";
+    let lastControl: Control | undefined;
     while (true) {
       if (signal.aborted) return { ok: false, code: "cancelled" };
       const stored = await observeInternal({ view: "controls", where: expectation.target, signal }, false);
@@ -597,19 +639,21 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
             ? "expect_target_ambiguous"
             : "expect_target_not_found";
         } else if ("state" in expectation) {
-          if (expectation.state === "present" || hasState(result.control, expectation.state)) return { ok: true };
+          if (expectation.state === "present" || hasState(result.control, expectation.state)) return { ok: true, control: result.control };
+          lastControl = result.control;
           lastCode = "expect_state_failed";
         } else if (isSensitiveControl(result.control) || result.control.value === undefined) {
           // A valueEquals readback must never turn an unreadable/protected
           // field into evidence of success.
           return { ok: false, code: "expect_value_unavailable" };
         } else if (result.control.value === expectation.valueEquals) {
-          return { ok: true };
+          return { ok: true, control: result.control };
         } else {
+          lastControl = result.control;
           lastCode = "expect_value_failed";
         }
       }
-      if (Date.now() >= deadline) return { ok: false, code: lastCode };
+      if (Date.now() >= deadline) return { ok: false, code: lastCode, ...(lastControl ? { control: lastControl } : {}) };
       const delay = Math.min(25, Math.max(1, deadline - Date.now()));
       await new Promise<void>((resolve) => {
         const timer = setTimeout(resolve, delay);
@@ -731,6 +775,36 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
           return stoppedResult(request, index, currentReason(execution), receipts, step.kind);
         }
 
+        // Host-owned replay may avoid toggling a disclosure/tab that already
+        // satisfies its recorded goal. The target and risk policy above still
+        // ran against the fresh live frame; this read is the final pre-dispatch
+        // expectation check and never retries the action.
+        if (execution.replay && step.kind === "click") {
+          if (!isVerifiedClickCandidate(step, prepared.target)) {
+            return stoppedResult(request, index, "replay_unsafe_target", receipts, step.kind);
+          }
+          let current: { ok: boolean; code?: string; control?: Control };
+          try {
+            current = await checkExpectation(step.expect!, execution.controller.signal, false);
+          } catch {
+            if (execution.controller.signal.aborted) return stoppedResult(request, index, currentReason(execution), receipts, step.kind);
+            current = { ok: false, code: "expect_observe_failed" };
+          }
+          if (current.ok && current.control !== undefined && current.control.id === prepared.target.id
+            && isVerifiedClickCandidate(step, current.control)) {
+            receipts.push({ index, kind: step.kind, status: "verified", code: "already_satisfied" });
+            continue;
+          }
+          if (current.code === "cancelled") return stoppedResult(request, index, current.code, receipts, step.kind);
+          // A click may proceed only when this exact live target was found and
+          // the one expected state is still absent. Ambiguous, incomplete,
+          // missing, or structurally changed evidence must stop before input.
+          if (current.code !== "expect_state_failed" || current.control === undefined
+            || current.control.id !== prepared.target.id || !isVerifiedClickCandidate(step, current.control)) {
+            return stoppedResult(request, index, current.code ?? "expect_failed", receipts, step.kind);
+          }
+        }
+
         const dispatch: Dispatch = {
           step,
           frame: prepared.frame,
@@ -773,7 +847,7 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
           execution.focusRecords.set(index, { scope: prepared.frame.scope, controlId: prepared.target.id, step: index });
         }
         if (step.expect) {
-          let expectation: { ok: boolean; code?: string };
+          let expectation: { ok: boolean; code?: string; control?: Control };
           try {
             expectation = await checkExpectation(step.expect, execution.controller.signal);
           } catch {
@@ -789,6 +863,23 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
             return stoppedResult(request, index, expectation.code ?? "expect_failed", receipts);
           }
           receipts.push({ index, kind: step.kind, status: "verified" });
+          if (execution.onVerifiedStep && expectation.control && step.kind === "click") {
+            const stateChanged = "state" in step.expect && step.expect.state !== "present"
+              && !hasState(prepared.target, step.expect.state)
+              && hasState(expectation.control, step.expect.state);
+            try {
+              execution.onVerifiedStep({
+                index,
+                step,
+                target: prepared.target,
+                after: expectation.control,
+                expectation: step.expect,
+                changed: stateChanged,
+              });
+            } catch {
+              // Capture is opportunistic and must never change the action receipt.
+            }
+          }
         } else {
           receipts.push({ index, kind: step.kind, status: "dispatched" });
         }
@@ -799,7 +890,7 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
     }
   }
 
-  async function execute(raw: unknown, queuedEpoch: number, signal?: AbortSignal): Promise<ActResult> {
+  async function execute(raw: unknown, queuedEpoch: number, signal?: AbortSignal, executionOptions: DeskSessionActOptions = {}): Promise<ActResult> {
     let request: ActRequest | undefined;
     try {
       request = preflight(raw);
@@ -809,7 +900,7 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
     if (closed) return stoppedResult(request, 1, "closed");
     if (queuedEpoch !== epoch || globalAbort.signal.aborted || signal?.aborted) return stoppedResult(request, 1, "cancelled");
 
-    const execution = startExecution(signal);
+    const execution = startExecution(signal, executionOptions);
     // focusFromStep is scoped to this act batch, never to a prior batch.
     execution.focusRecords.clear();
     return runBatch(request, execution, 0, []);
@@ -847,9 +938,17 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
     }
   }
 
-  function act(raw: unknown, signal?: AbortSignal): Promise<ActResult> {
+  function act(raw: unknown, signal?: AbortSignal, executionOptions: DeskSessionActOptions = {}): Promise<ActResult> {
     const queuedEpoch = epoch;
-    const run = () => execute(raw, queuedEpoch, signal);
+    const run = () => execute(raw, queuedEpoch, signal, executionOptions);
+    const next = actQueue.then(run, run);
+    actQueue = next.then(() => undefined, () => undefined);
+    return next;
+  }
+
+  function replay(raw: unknown, signal?: AbortSignal): Promise<ActResult> {
+    const queuedEpoch = epoch;
+    const run = () => execute(raw, queuedEpoch, signal, { replay: true });
     const next = actQueue.then(run, run);
     actQueue = next.then(() => undefined, () => undefined);
     return next;
@@ -908,6 +1007,7 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
     limits: sessionLimits,
     observe,
     act,
+    replay,
     resolveApproval,
     correct,
     cancel,

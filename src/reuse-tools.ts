@@ -72,15 +72,16 @@ export function addReuseActSchema(schema: Record<string, unknown>): Record<strin
   };
   result.oneOf = [
     regularBranch,
-    { required: ["reuse"], maxProperties: 1 },
+    { required: ["reuse"], maxProperties: 2, not: { required: ["steps"] } },
   ];
   return result;
 }
 
 export interface ReuseCandidateAction {
-  readonly kind: "type" | "setValue";
+  readonly kind: "click" | "type" | "setValue";
   readonly target: { role?: string; name?: string; within?: string };
-  readonly parameter: string;
+  readonly parameter?: string;
+  readonly expectState?: string;
 }
 
 export interface ReuseCandidate {
@@ -118,9 +119,10 @@ interface SelectorSnapshot {
 }
 
 interface CandidateActionInternal {
-  readonly kind: "type" | "setValue";
+  readonly kind: "click" | "type" | "setValue";
   readonly selector: SelectorSnapshot;
-  readonly parameter: string;
+  readonly parameter?: string;
+  readonly expectState?: string;
   readonly publicAction: ReuseCandidateAction;
 }
 
@@ -135,6 +137,7 @@ interface CandidateBinding {
   readonly key: string;
   readonly recordSignature: string;
   readonly contextSignature: string;
+  readonly observationId: string;
 }
 
 interface CandidateScope {
@@ -221,22 +224,29 @@ function publicSelector(selector: SelectorSnapshot): { role?: string; name?: str
 }
 
 function extractCandidate(record: VerifiedStepRecord, storeIndex: number): CandidateInternal | undefined {
-  if (!isRecord(record.request) || !Array.isArray(record.request.steps) || record.parameterNames.length === 0) return undefined;
+  if (!isRecord(record.request) || !Array.isArray(record.request.steps)) return undefined;
   const names = new Set(record.parameterNames);
   const actions: CandidateActionInternal[] = [];
   for (const rawStep of record.request.steps) {
-    if (!isRecord(rawStep) || (rawStep.kind !== "type" && rawStep.kind !== "setValue")) return undefined;
+    if (!isRecord(rawStep) || (rawStep.kind !== "click" && rawStep.kind !== "type" && rawStep.kind !== "setValue")) return undefined;
     const selector = selectorSnapshot(rawStep.target);
-    if (selector === undefined || !isRecord(rawStep.expect) || !selectorSnapshot(rawStep.expect.target)
-      || typeof rawStep.expect.valueEquals !== "object" && typeof rawStep.expect.valueEquals !== "string") return undefined;
+    if (selector === undefined || !isRecord(rawStep.expect) || !selectorSnapshot(rawStep.expect.target)) return undefined;
+    if (rawStep.kind === "click") {
+      if (!isRecord(rawStep.expect) || typeof rawStep.expect.state !== "string" || rawStep.expect.state === "present"
+        || (rawStep.button !== undefined && rawStep.button !== "left") || (rawStep.count !== undefined && rawStep.count !== 1)) return undefined;
+      const publicAction: ReuseCandidateAction = {
+        kind: "click",
+        target: publicSelector(selector),
+        expectState: rawStep.expect.state,
+      };
+      actions.push({ kind: "click", selector, expectState: rawStep.expect.state, publicAction });
+      continue;
+    }
+    if (typeof rawStep.expect.valueEquals !== "object" && typeof rawStep.expect.valueEquals !== "string") return undefined;
     const parameter = markerName(rawStep[rawStep.kind === "type" ? "text" : "value"], names);
     const expectedParameter = markerName(rawStep.expect.valueEquals, names);
     if (parameter === undefined || parameter !== expectedParameter) return undefined;
-    const publicAction: ReuseCandidateAction = {
-      kind: rawStep.kind,
-      target: publicSelector(selector),
-      parameter,
-    };
+    const publicAction: ReuseCandidateAction = { kind: rawStep.kind, target: publicSelector(selector), parameter };
     actions.push({ kind: rawStep.kind, selector, parameter, publicAction });
   }
   if (actions.length === 0) return undefined;
@@ -269,11 +279,12 @@ function queryScore(query: string, candidate: CandidateInternal): number {
   const queryTokens = tokenize(query);
   if (queryTokens.length === 0) return 0;
   const fields = [candidate.record.key, ...candidate.actions.flatMap((action) => [
-    action.parameter,
+    action.parameter ?? "",
     action.selector.role ?? "",
     action.selector.name ?? "",
     action.selector.within ?? "",
     action.selector.state ?? "",
+    action.expectState ?? "",
   ])].join(" ");
   const fieldTokens = tokenize(fields);
   const fieldText = fields.normalize("NFKC").toLocaleLowerCase();
@@ -322,15 +333,22 @@ function normalizeQuery(value: unknown): string {
   return query;
 }
 
-function parseReuseRequest(raw: unknown): { ref: string; values: Readonly<Record<string, Scalar>> } | undefined {
+function parseReuseRequest(raw: unknown): { ref: string; observationId?: string; values: Readonly<Record<string, Scalar>> } | undefined {
   if (!isRecord(raw) || !Object.hasOwn(raw, "reuse")) return undefined;
-  if (Object.keys(raw).some((key) => key !== "reuse") || !isRecord(raw.reuse)) throw new Error("reuse_invalid");
+  if (Object.keys(raw).some((key) => key !== "reuse" && key !== "observationId") || !isRecord(raw.reuse)) throw new Error("reuse_invalid");
   if (Object.keys(raw.reuse).some((key) => key !== "ref" && key !== "values")
     || typeof raw.reuse.ref !== "string" || raw.reuse.ref.trim().length === 0 || raw.reuse.ref.length > 256
     || /[\u0000\r\n]/u.test(raw.reuse.ref)) throw new Error("reuse_invalid");
+  if (raw.observationId !== undefined
+    && (typeof raw.observationId !== "string" || raw.observationId.trim().length === 0
+      || raw.observationId.length > 512 || /[\u0000\r\n]/u.test(raw.observationId))) throw new Error("reuse_invalid");
   const values = raw.reuse.values === undefined ? {} : raw.reuse.values;
   if (!isRecord(values) || Object.values(values).some((value) => !isScalar(value))) throw new Error("reuse_invalid");
-  return { ref: raw.reuse.ref, values: values as Readonly<Record<string, Scalar>> };
+  return {
+    ref: raw.reuse.ref,
+    ...(raw.observationId === undefined ? {} : { observationId: raw.observationId }),
+    values: values as Readonly<Record<string, Scalar>>,
+  };
 }
 
 function stoppedResult(code: string): ActResult {
@@ -342,14 +360,33 @@ function digest(value: string): string {
 }
 
 function automaticCaptureShape(request: unknown): { parameters: { name: string; paths: string[] }[]; shape: ReuseJson } | undefined {
-  if (!isRecord(request) || Object.hasOwn(request, "observationId") || !Array.isArray(request.steps) || request.steps.length === 0) return undefined;
+  if (!isRecord(request) || !Array.isArray(request.steps) || request.steps.length === 0) return undefined;
+  if (Object.hasOwn(request, "observationId")
+    && (typeof request.observationId !== "string" || request.observationId.trim().length === 0
+      || request.observationId.length > 512 || /[\u0000\r\n]/u.test(request.observationId))) return undefined;
   const parameters: { name: string; paths: string[] }[] = [];
   const shapeSteps: ReuseJson[] = [];
   for (let index = 0; index < request.steps.length; index += 1) {
     const step = request.steps[index];
-    if (!isRecord(step) || (step.kind !== "type" && step.kind !== "setValue")) return undefined;
+    if (!isRecord(step) || (step.kind !== "click" && step.kind !== "type" && step.kind !== "setValue")) return undefined;
     const target = selectorSnapshot(step.target);
     const expect = isRecord(step.expect) ? selectorSnapshot(step.expect.target) : undefined;
+    if (step.kind === "click") {
+      const expectedState = isRecord(step.expect) ? step.expect.state : undefined;
+      const targetRole = target?.role?.normalize("NFKC").trim().toLocaleLowerCase("en-US");
+      if (target === undefined || expect === undefined || !isRecord(step.expect)
+        || canonicalJson(target as unknown as ReuseJson) !== canonicalJson(expect as unknown as ReuseJson)
+        || typeof expectedState !== "string" || expectedState === "present"
+        || (step.button !== undefined && step.button !== "left") || (step.count !== undefined && step.count !== 1)
+        || (targetRole !== "tab" && !(targetRole === "button" && expectedState === "expanded")
+          && !(targetRole === "checkbox" && expectedState === "checked"))) return undefined;
+      shapeSteps.push({
+        kind: "click",
+        target: target as unknown as ReuseJson,
+        expect: { target: expect as unknown as ReuseJson, state: expectedState },
+      });
+      continue;
+    }
     const expectedValue = isRecord(step.expect) ? step.expect.valueEquals : undefined;
     const payload = step.kind === "type" ? step.text : step.value;
     if (target === undefined || expect === undefined || !isRecord(step.expect)
@@ -412,6 +449,13 @@ function candidateAvailability(
       matched += 1;
       if (matches[0].match.unconfirmed) fallback = true;
       if (!matches[0].control.actions.includes(action.kind)) unavailable = true;
+      if (action.kind === "click") {
+        const control = matches[0].control;
+        const structural = control.effect === "read" && ((control.disclosure === true && action.expectState === "expanded")
+          || (control.filterAction === true && canonicalRole(control.role) === "checkbox" && action.expectState === "checked")
+          || (canonicalRole(control.role) === "tab" && control.sameDocumentTab === true && action.expectState === "selected"));
+        if (!structural) unavailable = true;
+      }
     } else if (observation.complete) {
       // A complete observation is authoritative enough to reject a role/name
       // mismatch. Incomplete control lists are deliberately handled below.
@@ -526,6 +570,7 @@ export function createDiscoverableStepReuse(options: DiscoverableStepReuseOption
         key: entry.candidate.record.key,
         recordSignature: entry.candidate.recordSignature,
         contextSignature,
+        observationId: observation.observationId,
       });
       publicCandidates.push({
         ref,
@@ -558,7 +603,7 @@ export function createDiscoverableStepReuse(options: DiscoverableStepReuseOption
   async function replay(raw: unknown, signal?: AbortSignal): Promise<ActResult> {
     if (closed) return stoppedResult("closed");
     if (signal?.aborted) return stoppedResult("cancelled");
-    let request: { ref: string; values: Readonly<Record<string, Scalar>> };
+    let request: { ref: string; observationId?: string; values: Readonly<Record<string, Scalar>> };
     try {
       const parsed = parseReuseRequest(raw);
       if (parsed === undefined) return stoppedResult("reuse_invalid");
@@ -570,6 +615,7 @@ export function createDiscoverableStepReuse(options: DiscoverableStepReuseOption
     if (currentScope === undefined) return stoppedResult("reuse_not_found");
     const binding = currentScope.refs.get(request.ref);
     if (binding === undefined) return stoppedResult("reuse_not_found");
+    if (request.observationId !== undefined && request.observationId !== binding.observationId) return stoppedResult("reuse_stale");
     // A ref is consumed on its first use. This makes stale/cross-scope races
     // fail closed and avoids hidden automatic retries after an uncertain act.
     currentScope.refs.delete(request.ref);

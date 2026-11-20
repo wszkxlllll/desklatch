@@ -1,5 +1,5 @@
 import type { ActRequest, Step } from "./contracts.js";
-import type { ActResult, ApprovalDecision, ApprovalResolution, DeskSession, StepReceipt } from "./core/session-types.js";
+import type { ActResult, ApprovalDecision, ApprovalResolution, DeskSession, DeskSessionActOptions, StepReceipt, VerifiedStepEvidence } from "./core/session-types.js";
 import { validateRequest } from "./request.js";
 
 /** JSON values are deliberately the only values accepted by host-owned reuse stores. */
@@ -38,13 +38,21 @@ export interface ReuseRunOptions {
  * observation id, ref, point, or focus target.
  */
 export interface VerifiedStepRecord {
-  readonly version: 1;
+  readonly version: 1 | 2;
   readonly key: string;
   readonly request: ReuseJson;
   readonly parameterNames: readonly string[];
+  /** Non-sensitive proof class retained so a store cannot invent a click recipe. */
+  readonly clickEvidence?: readonly VerifiedClickRecordEvidence[];
   readonly context?: ReuseJson;
   readonly coverage?: ReuseJson;
   readonly verifiedAt: number;
+}
+
+export interface VerifiedClickRecordEvidence {
+  readonly index: number;
+  readonly state: string;
+  readonly structural: "disclosure" | "filter" | "tab";
 }
 
 /**
@@ -69,6 +77,7 @@ export type ReuseMissCode =
   | "parameter_missing"
   | "parameter_invalid"
   | "request_invalid"
+  | "replay_unsupported"
   | "store_error";
 
 export interface ReuseMiss {
@@ -241,6 +250,52 @@ function equivalentSelector(left: unknown, right: unknown): boolean {
   return leftCanonical !== undefined && leftCanonical === rightCanonical;
 }
 
+function normalizedText(value: string): string {
+  return value.normalize("NFKC").trim().replace(/\s+/gu, " ").toLocaleLowerCase("en-US");
+}
+
+function evidenceMatchesSelector(control: VerifiedStepEvidence["target"], selector: AnyRecord): boolean {
+  if (typeof selector.role !== "string" || normalizedText(control.role) !== normalizedText(selector.role)) return false;
+  if (typeof selector.name !== "string" || control.name === undefined || normalizedText(control.name) !== normalizedText(selector.name)) return false;
+  if (selector.within !== undefined && (control.within === undefined || normalizedText(control.within) !== normalizedText(String(selector.within)))) return false;
+  return true;
+}
+
+/**
+ * A click can enter the cache only through the session's host callback. The
+ * callback carries live before/after controls, so a forged completed receipt
+ * or an arbitrary `effect:"read"` action cannot create a reusable click.
+ */
+function validClickEvidence(step: Step, index: number, evidence: VerifiedStepEvidence | undefined): boolean {
+  if (step.kind !== "click" || evidence === undefined || evidence.index !== index + 1
+    || canonicalJson(evidence.step as unknown as ReuseJson) !== canonicalJson(step as unknown as ReuseJson)) return false;
+  if ((step.button ?? "left") !== "left" || (step.count ?? 1) !== 1 || !isSelector(step.target) || !isSelector(step.expect?.target)) return false;
+  if (!equivalentSelector(step.target, step.expect!.target) || !("state" in step.expect!)
+    || step.expect!.state === "present" || !["selected", "expanded", "checked"].includes(step.expect!.state)) return false;
+  if (canonicalJson(evidence.expectation as unknown as ReuseJson) !== canonicalJson(step.expect as unknown as ReuseJson)
+    || !evidence.changed) return false;
+  if (evidence.target.effect !== "read") return false;
+  const expectedState = step.expect!.state;
+  const structural = evidence.target.disclosure === true && expectedState === "expanded"
+    || evidence.target.filterAction === true && normalizedText(evidence.target.role) === "checkbox" && expectedState === "checked"
+    || normalizedText(evidence.target.role) === "tab" && evidence.target.sameDocumentTab === true && expectedState === "selected";
+  if (!structural || evidence.target.id !== evidence.after.id
+    || !evidenceMatchesSelector(evidence.target, step.target as AnyRecord)
+    || !evidenceMatchesSelector(evidence.after, step.expect!.target as AnyRecord)) return false;
+  return !evidence.target.states.includes(step.expect!.state as never)
+    && evidence.after.states.includes(step.expect!.state as never);
+}
+
+function clickEvidenceRecord(step: Step, index: number, evidence: VerifiedStepEvidence | undefined): VerifiedClickRecordEvidence | undefined {
+  if (!validClickEvidence(step, index, evidence) || step.expect === undefined || !("state" in step.expect)) return undefined;
+  const structural = evidence!.target.disclosure === true && step.expect.state === "expanded"
+    ? "disclosure"
+    : evidence!.target.filterAction === true && normalizedText(evidence!.target.role) === "checkbox" && step.expect.state === "checked" ? "filter"
+      : evidence!.target.sameDocumentTab === true && step.expect.state === "selected" ? "tab" : undefined;
+  if (structural === undefined) return undefined;
+  return { index: index + 1, state: step.expect.state, structural };
+}
+
 function assertReusableStep(step: unknown): asserts step is Step {
   if (!isRecord(step) || typeof step.kind !== "string") throw new ReuseValidationError("invalid_capture");
   if (step.kind !== "type" && step.kind !== "setValue") throw new ReuseValidationError("invalid_capture");
@@ -290,11 +345,16 @@ function allowedParameterPath(step: Step, index: number, parts: readonly string[
     && (step.kind === "type" || step.kind === "setValue");
 }
 
-function parameterizeRequest(request: ActRequest, options: ReuseCaptureOptions): { template: ReuseJson; names: string[] } {
-  if (request.observationId !== undefined) throw new ReuseValidationError("invalid_capture");
+function parameterizeRequest(
+  request: ActRequest,
+  options: ReuseCaptureOptions,
+  clickEvidence: readonly VerifiedStepEvidence[] = [],
+): { template: ReuseJson; names: string[]; version: 1 | 2; clickEvidence: VerifiedClickRecordEvidence[] } {
   const parameterPaths = validateParameterOptions(options);
   const template = cloneJson({ steps: request.steps } as unknown as ReuseJson);
   const names: string[] = [];
+  const capturedClicks: VerifiedClickRecordEvidence[] = [];
+  let hasClick = false;
   for (const [name, paths] of parameterPaths) {
     for (const parts of paths) {
       const index = Number(parts[1]);
@@ -308,17 +368,22 @@ function parameterizeRequest(request: ActRequest, options: ReuseCaptureOptions):
   }
   for (let index = 0; index < request.steps.length; index += 1) {
     const step = request.steps[index];
-    assertReusableStep(step);
-    if (step.expect === undefined) throw new ReuseValidationError("invalid_capture");
-    if (step.kind !== "type" && step.kind !== "setValue" || !("valueEquals" in step.expect)) {
-      throw new ReuseValidationError("invalid_capture");
+    if (step.kind === "click") {
+      hasClick = true;
+      const captured = clickEvidenceRecord(step, index, clickEvidence.find((entry) => entry.index === index + 1));
+      if (captured === undefined) {
+        throw new ReuseValidationError("invalid_capture");
+      }
+      capturedClicks.push(captured);
+      continue;
     }
+    assertReusableStep(step);
+    if (step.kind !== "type" && step.kind !== "setValue") throw new ReuseValidationError("invalid_capture");
+    if (step.expect === undefined || !("valueEquals" in step.expect)) throw new ReuseValidationError("invalid_capture");
     const payloadPath = step.kind === "type" ? `steps.${index}.text` : `steps.${index}.value`;
     const payloadValue = step.kind === "type" ? step.text : step.value;
     const expectedValue = step.expect.valueEquals;
-    if (typeof expectedValue !== "string" || payloadValue !== expectedValue) {
-      throw new ReuseValidationError("invalid_capture");
-    }
+    if (typeof expectedValue !== "string" || payloadValue !== expectedValue) throw new ReuseValidationError("invalid_capture");
     const expectPath = `steps.${index}.expect.valueEquals`;
     const payloadName = parameterNameAt(parameterPaths, payloadPath);
     const expectName = parameterNameAt(parameterPaths, expectPath);
@@ -326,7 +391,11 @@ function parameterizeRequest(request: ActRequest, options: ReuseCaptureOptions):
       throw new ReuseValidationError("invalid_capture");
     }
   }
-  return { template, names };
+  if (clickEvidence.some((entry) => {
+    const step = entry.index >= 1 && entry.index <= request.steps.length ? request.steps[entry.index - 1] : undefined;
+    return step === undefined || !validClickEvidence(step, entry.index - 1, entry);
+  })) throw new ReuseValidationError("invalid_capture");
+  return { template, names, version: hasClick ? 2 : 1, clickEvidence: capturedClicks };
 }
 
 function markerAt(root: unknown, parts: readonly string[], names: ReadonlySet<string>): string | undefined {
@@ -352,8 +421,18 @@ function collectMarkerNames(value: unknown, result = new Set<string>()): Set<str
   return result;
 }
 
-function validateTemplateStep(step: unknown, index: number, names: ReadonlySet<string>): boolean {
-  if (!isRecord(step) || !isSelector(step.target) || !["type", "setValue"].includes(String(step.kind))) return false;
+function validateTemplateStep(step: unknown, index: number, names: ReadonlySet<string>, allowClick = false): boolean {
+  if (!isRecord(step) || !isSelector(step.target)) return false;
+  if (step.kind === "click") {
+    const clickExpect = isRecord(step.expect) ? step.expect : undefined;
+    if (!allowClick || clickExpect === undefined || !isSelector(clickExpect.target)
+      || !equivalentSelector(step.target, clickExpect.target)
+      || (step.button !== undefined && step.button !== "left")
+      || (step.count !== undefined && step.count !== 1)
+      || !("state" in clickExpect) || clickExpect.state === "present" || typeof clickExpect.state !== "string") return false;
+    return !hasUnexpectedMarker(step, ["steps", String(index)], new Set());
+  }
+  if (step.kind !== "type" && step.kind !== "setValue") return false;
   if (!isRecord(step.expect) || !isSelector(step.expect.target)) return false;
   if (!equivalentSelector(step.target, step.expect.target)) return false;
   if ("state" in step.expect && typeof step.expect.state !== "string") return false;
@@ -379,16 +458,31 @@ function validateTemplateStep(step: unknown, index: number, names: ReadonlySet<s
 }
 
 function validateRecord(record: unknown): record is VerifiedStepRecord {
-  if (!isRecord(record) || record.version !== 1 || typeof record.key !== "string" || record.key.trim().length === 0 || record.key.length > MAX_KEY_LENGTH || /[\u0000\r\n]/u.test(record.key) || !Array.isArray(record.parameterNames)
+  if (!isRecord(record) || (record.version !== 1 && record.version !== 2) || typeof record.key !== "string" || record.key.trim().length === 0 || record.key.length > MAX_KEY_LENGTH || /[\u0000\r\n]/u.test(record.key) || !Array.isArray(record.parameterNames)
     || !record.parameterNames.every((name) => typeof name === "string" && PARAMETER_NAME.test(name))
     || !isJson(record.request) || (record.context !== undefined && !isJson(record.context))
     || (record.coverage !== undefined && !isJson(record.coverage))
+    || (record.clickEvidence !== undefined && (!Array.isArray(record.clickEvidence) || !record.clickEvidence.every((entry) => isRecord(entry)
+      && typeof entry.index === "number" && Number.isSafeInteger(entry.index) && entry.index >= 1 && typeof entry.state === "string"
+      && ((entry.structural === "disclosure" && entry.state === "expanded")
+        || (entry.structural === "filter" && entry.state === "checked")
+        || (entry.structural === "tab" && entry.state === "selected")))))
     || typeof record.verifiedAt !== "number" || !Number.isSafeInteger(record.verifiedAt) || record.verifiedAt < 0) return false;
   if (!isRecord(record.request) || !Array.isArray(record.request.steps) || record.request.steps.length === 0 || "observationId" in record.request) return false;
   try {
     if (new Set(record.parameterNames).size !== record.parameterNames.length) return false;
     const names = new Set(record.parameterNames);
-    if (!record.request.steps.every((step, index) => validateTemplateStep(step, index, names))) return false;
+    if (!record.request.steps.every((step, index) => validateTemplateStep(step, index, names, record.version === 2))) return false;
+    if (record.version === 1 && record.request.steps.some((step) => isRecord(step) && step.kind === "click")) return false;
+    if (record.version === 2 && !record.request.steps.some((step) => isRecord(step) && step.kind === "click")) return false;
+    const clickIndexes = record.request.steps.flatMap((step, index) => isRecord(step) && step.kind === "click" ? [index + 1] : []);
+    if (record.version === 1 && record.clickEvidence !== undefined) return false;
+    const clickEvidenceEntries: readonly unknown[] = Array.isArray(record.clickEvidence) ? record.clickEvidence as readonly unknown[] : [];
+    if (record.version === 2 && (!record.clickEvidence || clickEvidenceEntries.length !== clickIndexes.length
+      || clickEvidenceEntries.some((entry, index) => {
+        if (!isRecord(entry)) return true;
+        return entry.index !== clickIndexes[index];
+      }))) return false;
     const markerNames = collectMarkerNames(record.request);
     if (markerNames.size !== names.size || [...markerNames].some((name) => !names.has(name))) return false;
     const serializedRequest = JSON.stringify(record.request);
@@ -558,13 +652,18 @@ interface ActProvenance {
   readonly request: ReuseJson;
   readonly requestSignature: string;
   readonly resultSignature: string;
+  readonly clickEvidence: readonly VerifiedStepEvidence[];
 }
 
 function jsonSnapshot(value: unknown): ReuseJson | undefined {
   return isJson(value) ? cloneJson(value) : undefined;
 }
 
-function resultProvenance(result: unknown, request: ReuseJson | undefined): ActProvenance | undefined {
+function resultProvenance(
+  result: unknown,
+  request: ReuseJson | undefined,
+  clickEvidence: readonly VerifiedStepEvidence[] = [],
+): ActProvenance | undefined {
   if (request === undefined) return undefined;
   const snapshot = jsonSnapshot(result);
   if (snapshot === undefined) return undefined;
@@ -572,6 +671,7 @@ function resultProvenance(result: unknown, request: ReuseJson | undefined): ActP
     request,
     requestSignature: canonicalJson(request),
     resultSignature: canonicalJson(snapshot),
+    clickEvidence: Object.freeze([...clickEvidence]),
   };
 }
 
@@ -656,7 +756,13 @@ export function createVerifiedStepReuse(options: VerifiedStepReuseOptions): Veri
     } catch {
       return { status: "miss", reused: false, key: normalizedKey, code: "request_invalid" };
     }
-    const result = await options.session.act(request, normalizedOptions.signal);
+    const hasVerifiedClick = request.steps.some((step) => step.kind === "click");
+    if (hasVerifiedClick && typeof options.session.replay !== "function") {
+      return { status: "miss", reused: false, key: normalizedKey, code: "replay_unsupported" };
+    }
+    const result = hasVerifiedClick
+      ? await options.session.replay!(request, normalizedOptions.signal)
+      : await options.session.act(request, normalizedOptions.signal);
     const succeeded = result.status === "completed"
       && result.steps.length === request.steps.length
       && result.steps.every((receipt, index) => receipt.index === index + 1 && receipt.status === "verified");
@@ -666,8 +772,10 @@ export function createVerifiedStepReuse(options: VerifiedStepReuseOptions): Veri
   const api: VerifiedStepReuse = {
     async act(raw, signal) {
       const request = jsonSnapshot(raw);
-      const result = await options.session.act(raw, signal);
-      rememberProvenance(result, resultProvenance(result, request));
+      const clickEvidence: VerifiedStepEvidence[] = [];
+      const actOptions: DeskSessionActOptions = { onVerifiedStep: (evidence) => clickEvidence.push(evidence) };
+      const result = await options.session.act(raw, signal, actOptions);
+      rememberProvenance(result, resultProvenance(result, request, clickEvidence));
       return result;
     },
 
@@ -675,7 +783,7 @@ export function createVerifiedStepReuse(options: VerifiedStepReuseOptions): Veri
       const provenance = pendingProvenance.get(requestId);
       const result = await options.session.resolveApproval(requestId, decision);
       pendingProvenance.delete(requestId);
-      rememberProvenance(result, provenance === undefined ? undefined : resultProvenance(result, provenance.request));
+      rememberProvenance(result, provenance === undefined ? undefined : resultProvenance(result, provenance.request, provenance.clickEvidence));
       return result;
     },
 
@@ -700,14 +808,15 @@ export function createVerifiedStepReuse(options: VerifiedStepReuseOptions): Veri
       if (!validateResult(validated, result)) throw new ReuseValidationError("invalid_capture");
       if (captureOptions.context !== undefined && !isJson(captureOptions.context)) throw new ReuseValidationError("invalid_capture");
       if (captureOptions.coverage !== undefined && !isJson(captureOptions.coverage)) throw new ReuseValidationError("invalid_capture");
-      const { template, names } = parameterizeRequest(validated, captureOptions);
+      const parameterized = parameterizeRequest(validated, captureOptions, provenance.clickEvidence);
       const verifiedAt = captureOptions.now ?? Date.now();
       if (!Number.isSafeInteger(verifiedAt) || verifiedAt < 0) throw new ReuseValidationError("invalid_capture");
       const record = serializeRecord({
-        version: 1,
+        version: parameterized.version,
         key: normalizedKey,
-        request: template,
-        parameterNames: names,
+        request: parameterized.template,
+        parameterNames: parameterized.names,
+        ...(parameterized.clickEvidence.length === 0 ? {} : { clickEvidence: parameterized.clickEvidence }),
         ...(captureOptions.context === undefined ? {} : { context: cloneJson(captureOptions.context) }),
         ...(captureOptions.coverage === undefined ? {} : { coverage: cloneJson(captureOptions.coverage) }),
         verifiedAt,

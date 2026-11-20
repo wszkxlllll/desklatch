@@ -11,7 +11,7 @@ export interface MatchResult {
   candidates?: Control[];
 }
 
-const STATES: readonly State[] = ["visible", "enabled", "editable", "focused", "checked", "selected"];
+const STATES: readonly State[] = ["visible", "enabled", "editable", "focused", "checked", "selected", "expanded"];
 const ACTIONS: readonly ActionKind[] = ["click", "type", "setValue", "scroll", "keypress", "hotkey", "drag"];
 const EFFECTS: readonly Effect[] = [
   "read",

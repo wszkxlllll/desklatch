@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>自动操作权限 · DeskLatch</title>
+    <link rel="stylesheet" href="/styles.css">
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="topbar-inner">
+        <a class="brand" href="/" aria-label="DeskLatch 设置">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <span>DeskLatch</span>
+        </a>
+        <span class="environment"><span aria-hidden="true"></span>本机预览</span>
+      </div>
+    </header>
+
+    <div class="layout">
+      <nav class="sidebar" aria-label="设置导航">
+        <a href="#applications" class="nav-link current" aria-current="location">应用与窗口</a>
+        <a href="#browser" class="nav-link">浏览器范围</a>
+      </nav>
+
+      <main id="main">
+        <div class="page-heading">
+          <h1>自动操作权限</h1>
+          <p>选择 DeskLatch 可以操作的应用和窗口，以及浏览器可访问的范围。</p>
+          <span class="preview-note">现在显示的是示例窗口，可在下方验证真实的权限判断。</span>
+        </div>
+
+        <p id="load-status" class="load-state" role="status">正在读取本机设置…</p>
+        <button id="retry" class="button secondary" type="button" hidden>重新加载</button>
+
+        <div id="settings" hidden>
+          <section id="applications" aria-labelledby="apps-heading" tabindex="-1">
+            <div class="section-heading">
+              <div>
+                <h2 id="apps-heading">应用与窗口</h2>
+                <p>关闭应用会同时禁止它下面的所有窗口。</p>
+              </div>
+              <span id="window-count" class="count"></span>
+            </div>
+
+            <div id="app-list" class="app-list" aria-labelledby="apps-heading"></div>
+
+            <div class="permission-test">
+              <div>
+                <h3>验证当前授权</h3>
+                <p>用已保存的设置试一次，看看该窗口是否允许自动接入。</p>
+              </div>
+              <form id="check-form" class="check-form">
+                <label class="sr-only" for="check-target">选择要验证的窗口</label>
+                <select id="check-target" required></select>
+                <button type="submit" class="button secondary" id="check-button">验证权限</button>
+              </form>
+              <p class="check-result" id="check-result" role="status" hidden></p>
+            </div>
+          </section>
+
+          <section id="browser" aria-labelledby="browser-heading">
+            <div class="section-heading">
+              <div>
+                <h2 id="browser-heading">浏览器范围</h2>
+                <p>应用与窗口的权限继续生效。这里设置已允许的浏览器可以访问哪些站点。</p>
+              </div>
+            </div>
+            <fieldset class="browser-modes">
+              <legend class="sr-only">选择浏览器范围</legend>
+              <label class="mode">
+                <input type="radio" name="browser-mode" value="public">
+                <span><strong>公开浏览</strong><small>使用独立浏览器查公开资料，允许跨站跳转。</small></span>
+              </label>
+              <label class="mode">
+                <input type="radio" name="browser-mode" value="sites">
+                <span><strong>指定站点</strong><small>将浏览范围限制在列表内，适合固定工作系统。</small></span>
+              </label>
+            </fieldset>
+
+            <div id="site-settings" class="site-settings" hidden>
+              <ul id="site-list" aria-label="已允许的站点"></ul>
+              <form id="site-form" class="site-form">
+                <label class="sr-only" for="site-address">要允许的网站地址</label>
+                <input id="site-address" type="url" placeholder="https://www.example.com" required>
+                <button type="submit" class="button secondary">添加站点</button>
+              </form>
+              <p id="site-status" class="site-status" role="status"></p>
+            </div>
+            <div class="permission-test" id="browser-test" hidden>
+              <div>
+                <h3>验证站点范围</h3>
+                <p>按当前设置，在临时浏览器里试访问一次。</p>
+              </div>
+              <form id="site-check-form" class="check-form">
+                <label class="sr-only" for="site-check-target">选择要验证的站点</label>
+                <select id="site-check-target" required></select>
+                <button type="submit" class="button secondary" id="site-check-button">验证访问</button>
+              </form>
+              <p class="check-result" id="site-check-result" role="status" hidden></p>
+            </div>
+          </section>
+
+          <footer class="save-bar" id="save-bar" aria-label="保存设置">
+            <p id="save-status" role="status"></p>
+            <div class="save-actions">
+              <button class="button secondary" type="button" id="reset">撤销更改</button>
+              <button class="button primary" type="button" id="save">保存设置</button>
+            </div>
+          </footer>
+        </div>
+      </main>
+    </div>
+  </body>
+</html>

@@ -68,6 +68,16 @@ export type { BrowserBackend, BrowserBackendOptions, BrowserDelivery, BrowserPag
 export { BrowserBackendError } from "./types.js";
 export { createLocalBrowserBackend } from "./local.js";
 export {
+  createPublicBrowserWorkspace,
+  isPublicAddress,
+  PublicBrowserError,
+} from "./public.js";
+export type {
+  PublicBrowserErrorCode,
+  PublicBrowserOptions,
+  PublicBrowserWorkspace,
+} from "./public.js";
+export {
   createWorkspaceNavigator,
   WorkspaceNavigationError,
 } from "./workspace-navigation.js";

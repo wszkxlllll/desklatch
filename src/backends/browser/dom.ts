@@ -118,6 +118,7 @@ export function toControl(raw: RawControl, id: string, stableKey: string): Inter
     effect: classifyEffect({ ...raw, filterAction: raw.filterAction }),
     filterAction: raw.filterAction,
     ...(raw.disclosure ? { disclosure: true } : {}),
+    ...(raw.sameDocumentTab ? { sameDocumentTab: true } : {}),
     ...(raw.enterMaySubmit ? { enterMaySubmit: true } : {}),
     ...(raw.approvalContext ? { approvalContext: raw.approvalContext } : {}),
     __path: raw.path,
@@ -475,6 +476,7 @@ export function createRawCollectionScript() {
       if (document.activeElement === element) states.push("focused");
       if ((element as HTMLInputElement).checked || element.getAttribute("aria-checked") === "true") states.push("checked");
       if (element.getAttribute("aria-selected") === "true" || element.hasAttribute("selected")) states.push("selected");
+      if (expanded === "true") states.push("expanded");
       const actions: string[] = [];
       if (!graphic && (["button", "checkbox", "link", "menuitem", "option", "radio", "switch", "tab"].includes(role) || ["A", "BUTTON", "SUMMARY"].includes(element.tagName))) actions.push("click");
       if (!graphic && editable(element, role)) actions.push("type", "setValue");

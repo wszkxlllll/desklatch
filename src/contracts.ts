@@ -1,6 +1,6 @@
 export type ActionKind = "click" | "type" | "setValue" | "scroll" | "keypress" | "hotkey" | "drag";
 export type TargetForm = "selector" | "ref" | "point" | "focus" | "path";
-export type State = "visible" | "enabled" | "editable" | "focused" | "checked" | "selected";
+export type State = "visible" | "enabled" | "editable" | "focused" | "checked" | "selected" | "expanded";
 export type View = "controls" | "image" | "both" | "document";
 /** A read-only request for bounded, rendered page text. This is opt-in at the browser host. */
 export interface DocumentReadOptions {
@@ -69,6 +69,10 @@ export interface Control {
   approvalContext?: { token: string; summary?: string };
   /** Set only for a structurally identified, low-risk search/filter operation. */
   filterAction?: boolean;
+  /** Host-provided structural evidence for a same-page disclosure control. */
+  disclosure?: boolean;
+  /** Host-provided structural evidence for a same-document tab. */
+  sameDocumentTab?: boolean;
   /** The backend found that Enter in this field can submit its enclosing form. */
   enterMaySubmit?: boolean;
 }
