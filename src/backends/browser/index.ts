@@ -63,6 +63,16 @@ import {
 export type { BrowserBackend, BrowserBackendOptions, BrowserDelivery, BrowserPageLike, BrowserRiskSignal } from "./types.js";
 export { BrowserBackendError } from "./types.js";
 export { createLocalBrowserBackend } from "./local.js";
+export {
+  createWorkspaceNavigator,
+  WorkspaceNavigationError,
+} from "./workspace-navigation.js";
+export type {
+  WorkspaceNavigationErrorCode,
+  WorkspaceNavigationOptions,
+  WorkspaceNavigationResult,
+  WorkspaceNavigator,
+} from "./workspace-navigation.js";
 
 interface BrowserPrivateState {
   frames: WeakMap<Frame, FrameState>;

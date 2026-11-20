@@ -9,6 +9,7 @@ import type {
   Step,
   Target,
 } from "../../contracts.js";
+import type { WindowsOwnedDialog, WindowsOwnedDialogInspector } from "./dialogs.js";
 
 /**
  * The host, not the model, chooses the exact native windows that are in scope.
@@ -43,7 +44,7 @@ export interface WindowsDesktopAuthorization {
    * the HWND/PID list and should only be enabled for an explicitly authorized
    * image recipient. */
   readonly allowDesktopCapture?: boolean;
-  /** Explicitly permits foreground input for future coordinate-only actions. */
+  /** Explicitly permits foreground pointer or keyboard input after re-checks. */
   readonly allowForegroundInput?: boolean;
   /** Explicit opt-in for a verified native background delivery source. */
   readonly background?: { readonly source: WindowsBackgroundSource };
@@ -88,6 +89,8 @@ export interface WindowsWindowElement {
   readonly inWebContent?: boolean;
   readonly actions: readonly string[];
   readonly parentIndex?: string;
+  /** Optional native UIA RuntimeId, when the provider exposes one. */
+  readonly runtimeId?: string;
   readonly token?: string;
   /** Host-private binding to the material data shown in an enrolled dialog. */
   readonly approvalContext?: Control["approvalContext"];
@@ -117,13 +120,31 @@ export interface WindowsPhysicalEvidence {
   readonly minimized: boolean;
   readonly bounds?: Rect;
   readonly foregroundHwnd?: bigint;
+  /** PID associated with `foregroundHwnd`, read in the same user32 sample. */
+  readonly foregroundPid?: number;
   /** Top-level HWND at the tested point, if a native point check was made. */
   readonly occludingHwnd?: bigint;
   readonly code?: string;
 }
 
+/** Capture-free proof of the actual UIA focused element under an enrolled root. */
+export interface WindowsFocusEvidence {
+  readonly target: WindowsWindowTarget;
+  readonly focused: boolean;
+  readonly pid?: number;
+  /** Root HWND owning the focused element, never a discovered target. */
+  readonly hwnd?: bigint;
+  /** Native UIA RuntimeId serialized as a stable bounded string. */
+  readonly runtimeId?: string;
+  readonly role?: string;
+  readonly bounds?: Rect;
+  readonly code?: string;
+}
+
 export interface WindowsPhysicalInspector {
   read(target: WindowsWindowTarget, point?: Point, signal?: AbortSignal): Promise<WindowsPhysicalEvidence | undefined>;
+  /** Optional native UIA focus probe. Keyboard actions require this proof. */
+  readFocused?(target: WindowsWindowTarget, signal?: AbortSignal): Promise<WindowsFocusEvidence | undefined>;
   close?(): Promise<void>;
 }
 
@@ -151,6 +172,16 @@ export interface WindowsTransportDelivery {
   readonly focusId?: string;
 }
 
+/**
+ * Host-owned foreground activation callback. The callback receives only an
+ * already enrolled exact HWND/PID pair; it must not discover or choose a
+ * window. The backend still re-reads physical evidence after the callback.
+ */
+export type WindowsForegroundActivator = (
+  target: WindowsWindowTarget,
+  options: { readonly signal?: AbortSignal },
+) => Promise<WindowsTransportDelivery>;
+
 export interface WindowsTransport {
   /** Delivery/source identity; arbitrary transports cannot claim native background trust. */
   readonly source?: WindowsBackgroundSource;
@@ -171,11 +202,26 @@ export interface WindowsDesktopBackendOptions {
   readonly transport?: WindowsTransport;
   /** Test seam; production defaults to a read-only user32 inspector on Win32. */
   readonly inspector?: WindowsPhysicalInspector;
+  /** Optional host callback used to activate an already enrolled target. */
+  readonly activateForeground?: WindowsForegroundActivator;
+  /** Optional read-only ownership inspector for exact parent-owned dialogs. */
+  readonly ownedDialogInspector?: WindowsOwnedDialogInspector;
+  /** Alias retained for hosts that call the inspector a dialog inspector. */
+  readonly dialogInspector?: WindowsOwnedDialogInspector;
   readonly session?: string;
 }
 
 export interface WindowsDesktopBackend extends DesktopBackend {
   readonly authorizationScope: string;
+  /**
+   * Discover visible top-level dialogs owned by an enrolled parent. Results
+   * are evidence only; callers must explicitly enroll a returned HWND before
+   * observing or acting on it.
+   */
+  findOwnedDialogs(
+    target: WindowsWindowTarget,
+    options?: { readonly signal?: AbortSignal },
+  ): Promise<readonly WindowsOwnedDialog[]>;
 }
 
 export interface WindowsBackendError extends Error {

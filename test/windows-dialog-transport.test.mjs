@@ -99,6 +99,36 @@ test('native UIA transport exposes only actual patterns and protects password co
   await transport.close();
 });
 
+test('native UIA focus probe returns capture-free RuntimeId evidence for the exact root', async () => {
+  const fake = fakeWorker();
+  fake.worker.request = async request => {
+    fake.requests.push(request);
+    if (request.op === 'focus') return {
+      ok: true,
+      pid: target.pid,
+      window_id: String(target.hwnd),
+      focused: true,
+      focused_within_target: true,
+      focused_runtime_id: '1.7.42',
+      focused_role: 'Document',
+    };
+    return { ok: true, pid: target.pid, window_id: String(target.hwnd), elements_complete: true, elements: [] };
+  };
+  const transport = new NativeUiAutomationWindowsTransport({ worker: fake.worker });
+  await transport.open();
+  const focused = await transport.readFocused(target);
+  assert.deepEqual(focused, {
+    target,
+    focused: true,
+    pid: target.pid,
+    hwnd: target.hwnd,
+    runtimeId: '1.7.42',
+    role: 'Document',
+  });
+  assert.deepEqual(fake.requests.at(-1), { op: 'focus', pid: target.pid, hwnd: String(target.hwnd) });
+  await transport.close();
+});
+
 test('native UIA transport binds dispatch to the exact enrolled target and pattern', async () => {
   const fake = fakeWorker();
   const transport = new NativeUiAutomationWindowsTransport({ worker: fake.worker });

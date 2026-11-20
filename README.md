@@ -23,6 +23,13 @@ const node = new ToolNode(createLangChainTools(endpoints));
 // At host teardown: await session.close().
 ```
 
+多个应用共用一个模型会话时，宿主用 `createWorkspace({ applications })` 注册获准的浏览器页面和原生窗口，将 `workspace.tools` 交给同一个框架。模型仍然只看到两个工具。[工作区接口](docs/architecture.md#多个应用共用的工作区)
+
+| 工具 | 模型怎么用 |
+| --- | --- |
+| `observe` | 用 `{workspace:true}` 查看可选择的应用，也可以读取当前界面的控件、网页正文或获准的截图。 |
+| `act` | 用 `{activate:"editor"}` 切换到已登记的编辑器，用 `{navigate:url}` 在获准的浏览器打开网址，用 `{steps:[...]}` 操作当前界面。 |
+
 | 宿主 | 接入方式 |
 | --- | --- |
 | LangChain / LangGraph JS | `createLangChainTools(endpoints)` 返回框架工具。宿主自己绑定模型或创建 `ToolNode`。[可运行的 ToolNode 示例](examples/frameworks/langgraph.mjs) |

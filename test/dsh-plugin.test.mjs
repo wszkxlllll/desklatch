@@ -9,6 +9,7 @@ import { ToolsService } from "@deepseek-ai/dsh-tools";
 
 import { createDeskSession } from "desklatch";
 import { createDeskDshPlugin } from "desklatch/dsh";
+import { createWorkspace } from "desklatch/workspace";
 
 async function createDshContext() {
   const ctx = new Context();
@@ -42,6 +43,11 @@ function fixtureSession({ capabilities = [{ kind: "click", targets: ["selector"]
       calls.push({ kind: "act", input, signal });
       return { status: "completed", steps: [] };
     },
+    async resolveApproval(requestId) {
+      return { requestId, status: "stopped", code: "approval_not_found", steps: [] };
+    },
+    correct() {},
+    cancel() {},
     async close() {
       closes += 1;
     },
@@ -103,6 +109,42 @@ test("read-only host capabilities register observe only", async () => {
   try {
     assert.ok(runtime.ctx.tools.get("desklatch_observe"));
     assert.equal(runtime.ctx.tools.get("desklatch_act"), undefined);
+  } finally {
+    await fiber.dispose();
+    await runtime.executor.dispose();
+    await runtime.tools.dispose();
+    await runtime.prompt.dispose();
+  }
+  assert.equal(fixture.closes, 1);
+});
+
+test("native DSH plugin accepts a workspace host and invokes its navigate route", async () => {
+  const fixture = fixtureSession();
+  const navigations = [];
+  const workspace = createWorkspace({
+    applications: [{
+      id: "dsh-workspace-app",
+      name: "DSH workspace app",
+      session: fixture.session,
+      async navigate({ url }) {
+        navigations.push(url);
+        return { status: "completed", code: "navigated" };
+      },
+    }],
+    initialActive: "dsh-workspace-app",
+  });
+  const runtime = await createDshContext();
+  const fiber = runtime.ctx.plugin(createDeskDshPlugin(async () => workspace));
+  await fiber.await();
+  try {
+    const result = await executeModelToolFixture(runtime.ctx, {
+      callId: "dsh-workspace-act",
+      name: "desklatch_act",
+      arguments: { navigate: "https://workspace.test/dsh" },
+      signal: new AbortController().signal,
+    });
+    assert.match(result.content[0].text, /navigated/u);
+    assert.deepEqual(navigations, ["https://workspace.test/dsh"]);
   } finally {
     await fiber.dispose();
     await runtime.executor.dispose();

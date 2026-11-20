@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { createWindowsOwnedDialogInspector } from '../dist/backends/windows/index.js';
+import { createWindowsDesktopBackend, createWindowsOwnedDialogInspector } from '../dist/backends/windows/index.js';
 
 const target = { pid: 7001, hwnd: 0x70010001n, title: 'authorized parent' };
 
@@ -52,4 +52,27 @@ test('owned-dialog discovery can be cancelled without dispatching or changing wi
   controller.abort();
   const inspector = createWindowsOwnedDialogInspector(fakeNativeWindows());
   await assert.rejects(inspector.findOwnedDialogs(target, { signal: controller.signal }), { name: 'AbortError' });
+});
+
+test('desktop backend exposes owned-dialog evidence only for an enrolled parent', async () => {
+  const calls = [];
+  const owned = [{ target, hwnd: 0x70010002n, pid: target.pid, ownerHwnd: target.hwnd, ownerChain: [target.hwnd], bounds: { x: 90, y: 100, width: 280, height: 180 } }];
+  const backend = await createWindowsDesktopBackend({
+    authorization: { targets: [target] },
+    transport: {
+      async observeWindow(enrolled) { return { target: enrolled, title: 'parent', complete: true, elements: [] }; },
+      async dispatch() { return { status: 'dispatched' }; },
+    },
+    inspector: { async read(enrolled) { return { target: enrolled, visible: true, minimized: false }; } },
+    ownedDialogInspector: {
+      async findOwnedDialogs(enrolled) {
+        calls.push(enrolled);
+        return owned;
+      },
+    },
+  });
+  assert.deepEqual(await backend.findOwnedDialogs(target), owned);
+  assert.deepEqual(await backend.findOwnedDialogs({ pid: target.pid, hwnd: target.hwnd + 1n }), []);
+  assert.equal(calls.length, 1);
+  await backend.close();
 });

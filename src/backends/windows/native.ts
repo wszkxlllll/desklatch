@@ -1,5 +1,6 @@
 import type { Point, Rect } from "../../contracts.js";
-import type { WindowsPhysicalEvidence, WindowsPhysicalInspector, WindowsWindowTarget } from "./types.js";
+import { PowerShellNativeUiAutomationWorker, type NativeUiAutomationWorker } from "./dialog-transport.js";
+import type { WindowsFocusEvidence, WindowsPhysicalEvidence, WindowsPhysicalInspector, WindowsWindowTarget } from "./types.js";
 
 type DynamicImport = (specifier: string) => Promise<Record<string, unknown>>;
 type NativeFunction = (...args: any[]) => any;
@@ -37,7 +38,7 @@ export async function loadWindowsPhysicalInspector(): Promise<WindowsPhysicalIns
       getWindowRect,
       getWindow,
       getAncestor,
-    });
+    }, new PowerShellNativeUiAutomationWorker());
   } catch {
     // Native evidence is a hard pre-dispatch requirement. Returning undefined
     // lets the adapter honestly refuse input instead of guessing ownership.
@@ -58,9 +59,11 @@ interface User32Api {
 
 class User32Inspector implements WindowsPhysicalInspector {
   readonly #api: User32Api;
+  readonly #focusWorker?: NativeUiAutomationWorker;
 
-  constructor(api: User32Api) {
+  constructor(api: User32Api, focusWorker?: NativeUiAutomationWorker) {
     this.#api = api;
+    this.#focusWorker = focusWorker;
   }
 
   async read(target: WindowsWindowTarget, point?: Point, signal?: AbortSignal): Promise<WindowsPhysicalEvidence | undefined> {
@@ -89,6 +92,9 @@ class User32Inspector implements WindowsPhysicalInspector {
       const visible = Number(this.#api.isWindowVisible(hwnd)) !== 0 && bounds !== undefined &&
         bounds.width > 0 && bounds.height > 0 && !minimized;
       const foregroundHwnd = toBigInt(this.#api.getForegroundWindow());
+      const foregroundPid = foregroundHwnd === undefined
+        ? undefined
+        : readOwnerPid(this.#api.getWindowThreadProcessId, foregroundHwnd);
       const occludingHwnd = point !== undefined && visible && bounds !== undefined
         ? this.findOccluder(hwnd, point)
         : undefined;
@@ -98,12 +104,50 @@ class User32Inspector implements WindowsPhysicalInspector {
         minimized,
         ...(bounds ? { bounds } : {}),
         ...(foregroundHwnd !== undefined ? { foregroundHwnd } : {}),
+        ...(foregroundPid !== undefined ? { foregroundPid } : {}),
         ...(occludingHwnd !== undefined ? { occludingHwnd } : {}),
         ...(visible ? {} : { code: minimized ? "window_minimized" : "window_not_visible" }),
       };
     } catch {
       return undefined;
     }
+  }
+
+  async readFocused(target: WindowsWindowTarget, signal?: AbortSignal): Promise<WindowsFocusEvidence | undefined> {
+    signal?.throwIfAborted();
+    if (!this.#focusWorker) return undefined;
+    try {
+      if (!isPositiveHandle(target.hwnd) || Number(this.#api.isWindow(target.hwnd)) === 0) {
+        return { target, focused: false, code: "window_not_found" };
+      }
+      const ownerPid = readOwnerPid(this.#api.getWindowThreadProcessId, target.hwnd);
+      if (ownerPid !== target.pid) return { target, focused: false, code: "window_owner_changed" };
+      const value = await this.#focusWorker.request({ op: "focus", pid: target.pid, hwnd: target.hwnd.toString() }, signal ? { signal } : undefined);
+      const raw = record(value);
+      if (!raw) return { target, focused: false, code: "native_focus_invalid" };
+      const returnedPid = positiveInteger(raw.pid);
+      const returnedHwnd = toBigInt(raw.window_id ?? raw.windowId ?? raw.hwnd);
+      if (returnedPid !== target.pid || returnedHwnd !== target.hwnd) {
+        return { target, focused: false, code: "native_focus_identity_mismatch" };
+      }
+      return {
+        target,
+        focused: raw.focused === true && raw.focused_within_target === true,
+        pid: returnedPid,
+        hwnd: returnedHwnd,
+        ...(typeof raw.focused_runtime_id === "string" ? { runtimeId: raw.focused_runtime_id } : {}),
+        ...(typeof raw.focused_role === "string" ? { role: raw.focused_role } : {}),
+        ...(parseRect(raw.focused_bounds ?? raw.bounds) ? { bounds: parseRect(raw.focused_bounds ?? raw.bounds) } : {}),
+        ...(typeof raw.code === "string" ? { code: raw.code } : {}),
+      };
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      return { target, focused: false, code: errorCode(error) ?? "native_focus_unavailable" };
+    }
+  }
+
+  async close(): Promise<void> {
+    await this.#focusWorker?.close?.();
   }
 
   /**
@@ -148,6 +192,17 @@ function readRect(getWindowRect: NativeFunction, hwnd: bigint): Rect | undefined
   return { x: left, y: top, width: right - left, height: bottom - top };
 }
 
+function parseRect(value: unknown): Rect | undefined {
+  const item = record(value);
+  if (!item) return undefined;
+  const x = finiteNumber(item.x);
+  const y = finiteNumber(item.y);
+  const width = finiteNumber(item.width ?? item.w);
+  const height = finiteNumber(item.height ?? item.h);
+  if (x === undefined || y === undefined || width === undefined || height === undefined || width <= 0 || height <= 0) return undefined;
+  return { x, y, width, height };
+}
+
 function contains(rect: Rect, point: Point): boolean {
   return point.x >= rect.x && point.y >= rect.y && point.x < rect.x + rect.width && point.y < rect.y + rect.height;
 }
@@ -168,4 +223,27 @@ function toBigInt(value: unknown): bigint | undefined {
     }
   }
   return undefined;
+}
+
+function record(value: unknown): Record<string, any> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, any> : undefined;
+}
+
+function finiteNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function positiveInteger(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isSafeInteger(value) && value > 0) return value;
+  if (typeof value === "string" && /^\d+$/u.test(value)) {
+    const parsed = Number(value);
+    return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+  }
+  return undefined;
+}
+
+function errorCode(error: unknown): string | undefined {
+  if (!error || typeof error !== "object") return undefined;
+  const item = error as Record<string, unknown>;
+  return typeof item.code === "string" ? item.code : undefined;
 }

@@ -5,6 +5,7 @@ import type { Step, Rect } from "../../contracts.js";
 import {
   backendError,
   type WindowsDispatchTarget,
+  type WindowsFocusEvidence,
   type WindowsResolvedControl,
   type WindowsTransport,
   type WindowsTransportDelivery,
@@ -126,6 +127,43 @@ export class NativeUiAutomationWindowsTransport implements WindowsTransport {
       complete: complete && !degraded,
       ...(degraded ? { degraded: true } : {}),
       ...(stringField(raw, "snapshot_id", "snapshotId") ? { snapshotId: stringField(raw, "snapshot_id", "snapshotId") } : {}),
+    };
+  }
+
+  /**
+   * Read the actual UIA FocusedElement under an exact enrolled root. This is
+   * deliberately capture-free and does not activate the window. The worker
+   * proves PID/root ownership and returns the native RuntimeId so callers can
+   * compare focus with a fresh model binding instead of guessing from role or
+   * caption.
+   */
+  async readFocused(target: WindowsWindowTarget, signal?: AbortSignal): Promise<WindowsFocusEvidence | undefined> {
+    this.assertOpen();
+    validateTarget(target);
+    signal?.throwIfAborted();
+    const result = await this.request({
+      op: "focus",
+      pid: target.pid,
+      hwnd: target.hwnd.toString(),
+    }, signal);
+    const raw = objectRecord(result);
+    if (!raw) return undefined;
+    const returnedPid = positiveInteger(raw.pid);
+    const returnedHwnd = parseHandle(raw.window_id ?? raw.windowId ?? raw.hwnd);
+    if (returnedPid !== target.pid || returnedHwnd !== target.hwnd) return undefined;
+    const focused = raw.focused === true && raw.focused_within_target === true;
+    const runtimeId = stringField(raw, "focused_runtime_id", "runtime_id", "runtimeId");
+    const role = stringField(raw, "focused_role", "role");
+    const bounds = parseRect(raw.focused_bounds ?? raw.bounds);
+    return {
+      target,
+      focused,
+      pid: returnedPid,
+      hwnd: returnedHwnd,
+      ...(runtimeId ? { runtimeId } : {}),
+      ...(role ? { role } : {}),
+      ...(bounds ? { bounds } : {}),
+      ...(typeof raw.code === "string" ? { code: raw.code } : {}),
     };
   }
 
@@ -339,6 +377,7 @@ function parseElement(value: unknown): WindowsWindowElement | undefined {
     ...(password ? { password: true } : {}),
     actions: Object.freeze(actions),
     ...(integerString(item.parent_index ?? item.parentIndex) !== undefined ? { parentIndex: integerString(item.parent_index ?? item.parentIndex) } : {}),
+    ...(stringField(item, "runtime_id", "runtimeId") ? { runtimeId: stringField(item, "runtime_id", "runtimeId") } : {}),
     ...(parseRect(item.frame ?? item.bounding_rect ?? item.boundingRect) ? { rect: parseRect(item.frame ?? item.bounding_rect ?? item.boundingRect) } : {}),
     ...(token && token.length <= MAX_TOKEN_LENGTH && /^uia1\.[A-Za-z0-9_-]+$/u.test(token) ? { token } : {}),
     ...(materialContextToken && /^uia-material-v1\.[a-f0-9]{64}$/u.test(materialContextToken)

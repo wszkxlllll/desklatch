@@ -17,6 +17,7 @@ import type {
 } from "../../contracts.js";
 import { loadWindowsPhysicalInspector } from "./native.js";
 import { CuaWindowsTransport } from "./cua.js";
+import { loadWindowsOwnedDialogInspector, type WindowsOwnedDialog, type WindowsOwnedDialogInspector } from "./dialogs.js";
 import {
   backendError,
   type WindowsDesktopAuthorization,
@@ -24,7 +25,9 @@ import {
   type WindowsDesktopBackendOptions,
   type WindowsDispatchTarget,
   type WindowsPhysicalEvidence,
+  type WindowsFocusEvidence,
   type WindowsPhysicalInspector,
+  type WindowsForegroundActivator,
   type WindowsResolvedControl,
   type WindowsTransport,
   type WindowsWindowElement,
@@ -38,7 +41,8 @@ import {
  * visible HWND/PID allow-list; the model cannot discover or widen that scope.
  * Background UIA delivery is disabled unless authorization.background.source
  * exactly matches this transport's verified source. Foreground point actions
- * additionally require both allowForegroundInput and allowDesktopCapture.
+ * require both allowForegroundInput and allowDesktopCapture; keyboard chords
+ * require allowForegroundInput plus fresh native focus/foreground evidence.
  *
  * `transport` is useful for a native UIA worker and for deterministic tests.
  * When omitted, CUA 0.54 is loaded through the supplied driver and all CUA
@@ -50,18 +54,43 @@ export async function openWindowsDesktopBackend(options: WindowsDesktopBackendOp
   if (process.platform !== "win32" && !options.transport) throw backendError("windows_backend_unavailable");
   const transport = options.transport ?? await CuaWindowsTransport.open(options.driver!, options.session);
   const inspector = options.inspector ?? await loadWindowsPhysicalInspector();
+  const ownedDialogInspector = options.ownedDialogInspector ?? options.dialogInspector ?? await loadWindowsOwnedDialogInspector();
   try {
     await transport.open?.();
   } catch (error) {
     await transport.close?.().catch(() => undefined);
     throw error;
   }
-  const backend = new WindowsDesktopSession(authorization, transport, inspector);
+  const backend = new WindowsDesktopSession(authorization, transport, inspector, options.activateForeground, ownedDialogInspector);
   return backend;
 }
 
 /** Public factory alias matching the other backend modules. */
 export const createWindowsDesktopBackend = openWindowsDesktopBackend;
+
+/**
+ * Adapt an exact-window transport and read-only inspector into the reusable
+ * host callback accepted by `WindowsDesktopBackendOptions.activateForeground`.
+ * The callback activates only the supplied enrolled HWND/PID and reports
+ * refusal when the immediate user32 sample does not identify that same pair
+ * as foreground. It never discovers a replacement window.
+ */
+export function createWindowsForegroundActivator(
+  transport: Pick<WindowsTransport, "bringToFront">,
+  inspector: WindowsPhysicalInspector,
+): WindowsForegroundActivator {
+  if (typeof transport.bringToFront !== "function" || !inspector || typeof inspector.read !== "function") {
+    throw backendError("foreground_activation_unavailable");
+  }
+  return async (target, options) => {
+    const activation = await transport.bringToFront!(target, options);
+    if (activation.status !== "dispatched") return activation;
+    const evidence = await inspector.read(target, undefined, options.signal);
+    return foregroundMatches(evidence, target)
+      ? { status: "dispatched" }
+      : { status: "refused", code: "foreground_not_confirmed" };
+  };
+}
 
 export type {
   WindowsCuaDriver,
@@ -72,7 +101,9 @@ export type {
   WindowsBackgroundSource,
   WindowsDispatchTarget,
   WindowsPhysicalEvidence,
+  WindowsFocusEvidence,
   WindowsPhysicalInspector,
+  WindowsForegroundActivator,
   WindowsResolvedControl,
   WindowsToolResult,
   WindowsTransport,
@@ -121,6 +152,8 @@ class WindowsDesktopSession implements WindowsDesktopBackend {
   readonly #authorization: NormalizedAuthorization;
   readonly #transport: WindowsTransport;
   readonly #inspector?: WindowsPhysicalInspector;
+  readonly #activateForeground?: WindowsForegroundActivator;
+  readonly #ownedDialogInspector?: WindowsOwnedDialogInspector;
   readonly #scopePrefix: string;
   #current?: InternalFrame;
   readonly #knownFrames = new WeakMap<Frame, InternalFrame>();
@@ -128,13 +161,37 @@ class WindowsDesktopSession implements WindowsDesktopBackend {
   #tail: Promise<void> = Promise.resolve();
   #closing?: Promise<void>;
 
-  constructor(authorization: NormalizedAuthorization, transport: WindowsTransport, inspector?: WindowsPhysicalInspector) {
+  constructor(
+    authorization: NormalizedAuthorization,
+    transport: WindowsTransport,
+    inspector?: WindowsPhysicalInspector,
+    activateForeground?: WindowsForegroundActivator,
+    ownedDialogInspector?: WindowsOwnedDialogInspector,
+  ) {
     this.#authorization = authorization;
     this.#transport = transport;
     this.#inspector = inspector;
+    this.#activateForeground = activateForeground;
+    this.#ownedDialogInspector = ownedDialogInspector;
     this.#scopePrefix = scopeForAuthorization(authorization);
     this.capabilities = capabilitiesFor(authorization, transport, inspector);
     this.authorizationScope = this.#scopePrefix;
+  }
+
+  async findOwnedDialogs(
+    target: WindowsWindowTarget,
+    options: { readonly signal?: AbortSignal } = {},
+  ): Promise<readonly WindowsOwnedDialog[]> {
+    return this.enqueue(async () => {
+      this.assertOpen();
+      options.signal?.throwIfAborted();
+      if (!this.#ownedDialogInspector || !this.#authorization.targets.some(candidate => sameWindow(candidate, target))) return [];
+      const dialogs = await this.#ownedDialogInspector.findOwnedDialogs(target, options);
+      // Keep the inspector a source of evidence, not an authorization grant:
+      // a custom host inspector cannot widen the parent/PID boundary by
+      // returning an unrelated HWND.
+      return Object.freeze((Array.isArray(dialogs) ? dialogs : []).filter(dialog => isOwnedDialogEvidence(dialog, target)));
+    });
   }
 
   observe(options: ObserveOptions): Promise<Frame> {
@@ -150,18 +207,27 @@ class WindowsDesktopSession implements WindowsDesktopBackend {
       // routine re-observation does not widen or replace that grant, so it
       // must not mint a new scope merely because a snapshot was refreshed.
       const frameScope = this.#scopePrefix;
-      const snapshots: Array<{ target: WindowsWindowTarget; snapshot?: WindowsWindowSnapshot; evidence?: WindowsPhysicalEvidence }> = [];
+      const snapshots: Array<{ target: WindowsWindowTarget; snapshot?: WindowsWindowSnapshot; evidence?: WindowsPhysicalEvidence; focus?: WindowsFocusEvidence }> = [];
       if (view !== "image") {
         for (const target of this.#authorization.targets) {
           options.signal?.throwIfAborted();
           const evidence = await this.readPhysical(target, undefined, options.signal);
+          let focus: WindowsFocusEvidence | undefined;
+          if (this.#authorization.allowForegroundInput === true) {
+            try {
+              focus = await this.readFocused(target, options.signal);
+            } catch (error) {
+              if (options.signal?.aborted) throw error;
+              focus = undefined;
+            }
+          }
           try {
             const snapshot = await this.#transport.observeWindow(target, { signal: options.signal });
-            snapshots.push({ target, snapshot, ...(evidence ? { evidence } : {}) });
+            snapshots.push({ target, snapshot, ...(evidence ? { evidence } : {}), ...(focus ? { focus } : {}) });
           } catch {
             // A window can disappear between the host grant and the read. Keep
             // the frame honest and preserve other authorized windows.
-            snapshots.push({ target, ...(evidence ? { evidence } : {}) });
+            snapshots.push({ target, ...(evidence ? { evidence } : {}), ...(focus ? { focus } : {}) });
           }
         }
       }
@@ -258,22 +324,42 @@ class WindowsDesktopSession implements WindowsDesktopBackend {
       const pointTarget = "point" in step.target;
       const background = this.backgroundAllowed();
       const foregroundPermission = this.#authorization.allowForegroundInput === true && this.#authorization.allowDesktopCapture === true;
+      const keyboardPermission = this.#authorization.allowForegroundInput === true;
       const coordinateControl = resolved.control?.source.role === "Canvas";
-      const foreground = foregroundPermission && (resolved.control === undefined || coordinateControl || !background) &&
-        (pointTarget || step.kind === "click" || step.kind === "scroll");
+      const keyboard = step.kind === "keypress" || step.kind === "hotkey";
+      // Keyboard input is always an explicit foreground escalation. A
+      // selector/ref is still required to resolve a native control with a
+      // runtime identity; a window caption or blind point can never become
+      // focus.
+      if (keyboard && (!resolved.control || !resolved.control.source.runtimeId)) {
+        return refuse("keyboard_focus_not_confirmed");
+      }
+      const foreground = (keyboard ? keyboardPermission : foregroundPermission)
+        && (resolved.control === undefined || coordinateControl || keyboard || !background) &&
+        (pointTarget || step.kind === "click" || step.kind === "scroll" || keyboard);
       if (!background && !foreground) {
         return refuse(resolved.control ? "background_delivery_not_authorized" : "foreground_input_not_authorized");
       }
       if (!actionAllowed(step, resolved.control?.control, foreground)) return refuse("windows_action_not_supported");
       if (foreground) {
-        if (evidence.foregroundHwnd !== target.hwnd) {
-          if (!this.#transport.bringToFront) return refuse("foreground_activation_unavailable");
-          const activation = await this.#transport.bringToFront(target, { signal: request.signal }).catch(error => ({ status: "unknown" as const, code: errorCode(error) ?? "foreground_activation_unknown" }));
+        if (!foregroundMatches(evidence, target)) {
+          // Keep the transport receiver bound: CUA's implementation uses
+          // private session state when it calls bring_to_front.
+          const activate = this.#activateForeground ?? (this.#transport.bringToFront
+            ? (targetWindow: WindowsWindowTarget, activationOptions: { readonly signal?: AbortSignal }) =>
+              this.#transport.bringToFront!(targetWindow, activationOptions)
+            : undefined);
+          if (!activate) return refuse("foreground_activation_unavailable");
+          const activation = await activate(target, { signal: request.signal }).catch(error => ({ status: "unknown" as const, code: errorCode(error) ?? "foreground_activation_unknown" }));
           if (activation.status !== "dispatched") return activation;
           evidence = await this.readPhysical(target, point, request.signal);
-          if (!evidence || evidence.foregroundHwnd !== target.hwnd) return refuse("foreground_not_confirmed");
+          if (!foregroundMatches(evidence, target)) return refuse("foreground_not_confirmed");
         }
-        if (evidence.foregroundHwnd !== target.hwnd) return refuse("foreground_not_confirmed");
+        if (!foregroundMatches(evidence, target)) return refuse("foreground_not_confirmed");
+      }
+      if (keyboard) {
+        const focused = await this.readFocused(target, request.signal);
+        if (!focused || !focusMatchesControl(focused, resolved.control!)) return refuse("keyboard_focus_not_confirmed");
       }
       const dispatchedTarget: WindowsDispatchTarget = {
         window: target,
@@ -308,6 +394,12 @@ class WindowsDesktopSession implements WindowsDesktopBackend {
     signal?.throwIfAborted();
     if (this.#inspector) return this.#inspector.read(target, point, signal);
     return undefined;
+  }
+
+  private async readFocused(target: WindowsWindowTarget, signal?: AbortSignal): Promise<WindowsFocusEvidence | undefined> {
+    signal?.throwIfAborted();
+    if (!this.#inspector?.readFocused) return undefined;
+    return this.#inspector.readFocused(target, signal);
   }
 
   private backgroundAllowed(): boolean {
@@ -369,6 +461,7 @@ function capabilitiesFor(authorization: NormalizedAuthorization, transport: Wind
     ]);
   }
   const foreground = physicalEvidence && authorization.allowForegroundInput === true && authorization.allowDesktopCapture === true;
+  const keyboard = physicalEvidence && authorization.allowForegroundInput === true && inspector?.readFocused !== undefined;
   const targetForms = foreground ? ["selector", "ref", "point"] as const : ["selector", "ref"] as const;
   const capabilities: Capability[] = [];
   if (background || foreground) {
@@ -376,6 +469,20 @@ function capabilitiesFor(authorization: NormalizedAuthorization, transport: Wind
     capabilities.push(Object.freeze({ kind: "scroll", targets: targetForms, directions: ["up", "down", "left", "right"] as const, units: ["line", "page"] as const }));
   }
   if (background) capabilities.push(Object.freeze({ kind: "type", targets: ["selector", "ref"] as const }));
+  if (keyboard) {
+    const keyboardTargets = ["selector", "ref", "focus"] as const;
+    capabilities.push(Object.freeze({
+      kind: "keypress",
+      targets: keyboardTargets,
+      keys: ["F12", "Enter", "Escape", "Tab"],
+    }));
+    capabilities.push(Object.freeze({
+      kind: "hotkey",
+      targets: keyboardTargets,
+      keys: ["ctrl", "shift", "s"],
+      chords: [["ctrl", "s"], ["ctrl", "shift", "s"]],
+    }));
+  }
   return Object.freeze(capabilities);
 }
 
@@ -400,7 +507,7 @@ function parseHandle(value: unknown): bigint | undefined {
 }
 
 function buildControlsFrame(
-  snapshots: ReadonlyArray<{ target: WindowsWindowTarget; snapshot?: WindowsWindowSnapshot; evidence?: WindowsPhysicalEvidence }>,
+  snapshots: ReadonlyArray<{ target: WindowsWindowTarget; snapshot?: WindowsWindowSnapshot; evidence?: WindowsPhysicalEvidence; focus?: WindowsFocusEvidence }>,
   where?: Selector,
   nativeUiAutomation = false,
 ): { controls: Control[]; internal: InternalControl[]; targetBounds: ReadonlyMap<string, Rect>; complete: boolean } {
@@ -439,6 +546,26 @@ function buildControlsFrame(
       const actions: ActionKind[] = sensitive || element.inWebContent === true ? [] : actionKinds(element.actions, nativeUiAutomation);
       if (!nativeUiAutomation && !sensitive && editableRole(element.role) && element.actions.some(action => action.toLocaleLowerCase().replace(/[ -]/gu, "_") === "set_value")) {
         actions.push("type");
+      }
+      // Keyboard commands are meaningful only when UIA identified the
+      // focused element. They are foreground-only at dispatch time; this
+      // evidence does not grant focus or turn a select-only control into a
+      // coordinate action.
+      const nativeFocused = !nativeUiAutomation && !sensitive && item.focus?.focused === true
+        && item.focus.runtimeId !== undefined && item.focus.runtimeId === element.runtimeId;
+      if (nativeFocused && !states.includes("focused")) states.push("focused");
+      if (!nativeFocused) {
+        // A provider may advertise a generic keyboard action on every node;
+        // keep it out of the model surface unless native UIA focus was
+        // observed on this exact runtime identity.
+        const keypressIndex = actions.indexOf("keypress");
+        if (keypressIndex >= 0) actions.splice(keypressIndex, 1);
+        const hotkeyIndex = actions.indexOf("hotkey");
+        if (hotkeyIndex >= 0) actions.splice(hotkeyIndex, 1);
+      }
+      if (nativeFocused) {
+        if (!actions.includes("keypress")) actions.push("keypress");
+        if (!actions.includes("hotkey")) actions.push("hotkey");
       }
       const control: Control = Object.freeze({
         id,
@@ -537,6 +664,8 @@ function actionKinds(actions: readonly string[], nativeUiAutomation = false): Ac
     else if (normalized === "text" || normalized === "type" || normalized === "type_text") set.add("type");
     else if (normalized === "set_value" && nativeUiAutomation) set.add("setValue");
     else if (normalized === "scroll") set.add("scroll");
+    else if (!nativeUiAutomation && (normalized === "keypress" || normalized === "key_press")) set.add("keypress");
+    else if (!nativeUiAutomation && (normalized === "hotkey" || normalized === "shortcut")) set.add("hotkey");
   }
   return [...set];
 }
@@ -614,6 +743,8 @@ function actionAllowed(step: Step, control?: Control, foreground = false): boole
   if (step.kind === "type") return control.actions.includes("type") && step.text.length > 0;
   if (step.kind === "setValue") return control.actions.includes("setValue");
   if (step.kind === "scroll") return control.actions.includes("scroll") && Number.isSafeInteger(step.amount) && step.amount > 0;
+  if (step.kind === "keypress") return foreground && control.actions.includes("keypress") && validKey(step.key);
+  if (step.kind === "hotkey") return foreground && control.actions.includes("hotkey") && validHotkey(step.keys);
   return false;
 }
 
@@ -622,6 +753,34 @@ function usableEvidence(evidence: WindowsPhysicalEvidence | undefined, target: W
   if (evidence.occludingHwnd !== undefined && evidence.occludingHwnd !== target.hwnd) return false;
   if (evidence.bounds && !contains(evidence.bounds, point)) return false;
   return true;
+}
+
+function foregroundMatches(evidence: WindowsPhysicalEvidence | undefined, target: WindowsWindowTarget): boolean {
+  if (!evidence || evidence.foregroundHwnd !== target.hwnd) return false;
+  // Custom inspectors written before foregroundPid was added remain usable,
+  // but the Win32 inspector always supplies both identities. Whenever the PID
+  // is present it is a mandatory match so an HWND reuse can never be accepted.
+  return evidence.foregroundPid === undefined || evidence.foregroundPid === target.pid;
+}
+
+function focusMatchesControl(evidence: WindowsFocusEvidence, control: WindowsResolvedControl): boolean {
+  if (!evidence.focused || evidence.pid !== control.window.pid || evidence.hwnd !== control.window.hwnd) return false;
+  // RuntimeId equality is the native identity check. Role/name/bounds are
+  // descriptive evidence only and never substitute for a replaced element.
+  return typeof control.source.runtimeId === "string"
+    && control.source.runtimeId.length > 0
+    && evidence.runtimeId === control.source.runtimeId;
+}
+
+function validKey(key: string): boolean {
+  return typeof key === "string" && /^(?:F12|Enter|Escape|Tab)$/iu.test(key);
+}
+
+function validHotkey(keys: readonly string[]): boolean {
+  if (!Array.isArray(keys) || keys.length < 2 || keys.length > 3 || new Set(keys).size !== keys.length) return false;
+  const normalized = keys.map(key => key.toLocaleLowerCase());
+  return (normalized.length === 2 && normalized[0] === "ctrl" && normalized[1] === "s")
+    || (normalized.length === 3 && normalized[0] === "ctrl" && normalized[1] === "shift" && normalized[2] === "s");
 }
 
 function ancestryPath(element: WindowsWindowElement, byIndex: ReadonlyMap<string, WindowsWindowElement>): string {
@@ -664,6 +823,29 @@ function normalizeText(value: string, max: number): string {
 
 function windowKey(target: WindowsWindowTarget): string {
   return `hwnd:${target.pid}:${target.hwnd.toString()}`;
+}
+
+function sameWindow(left: WindowsWindowTarget, right: WindowsWindowTarget): boolean {
+  return left.pid === right.pid && left.hwnd === right.hwnd;
+}
+
+function isOwnedDialogEvidence(dialog: WindowsOwnedDialog, target: WindowsWindowTarget): boolean {
+  return !!dialog
+    && !!dialog.target
+    && sameWindow(dialog.target, target)
+    && typeof dialog.hwnd === "bigint"
+    && dialog.hwnd > 0n
+    && dialog.hwnd !== target.hwnd
+    && dialog.pid === target.pid
+    && typeof dialog.ownerHwnd === "bigint"
+    && dialog.ownerHwnd > 0n
+    && Array.isArray(dialog.ownerChain)
+    && dialog.ownerChain.length > 0
+    && dialog.ownerChain[0] === dialog.ownerHwnd
+    && dialog.ownerChain[dialog.ownerChain.length - 1] === target.hwnd
+    && !!dialog.bounds
+    && dialog.bounds.width > 0
+    && dialog.bounds.height > 0;
 }
 
 function scopeForAuthorization(authorization: {

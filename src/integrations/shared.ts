@@ -1,4 +1,4 @@
-import type { ToolEndpoint } from "../tools.js";
+import { createDeskTools, type DesktopToolSession, type ToolEndpoint } from "../tools.js";
 
 /**
  * How an integration should expose a frame image returned by `observe`.
@@ -116,4 +116,22 @@ const publicToolErrors = new Set(["closed", "invalid_view", "invalid_observe", "
 
 export function errorText(error: unknown): string {
   return error instanceof Error && publicToolErrors.has(error.message) ? error.message : "desktop_tool_failed";
+}
+
+/** A host-owned public tool surface, such as a workspace or one DeskSession. */
+export interface DeskToolHost {
+  readonly tools: readonly ToolEndpoint[];
+  close(): void | Promise<void>;
+}
+
+export type DeskToolSource = (DesktopToolSession & { close(): void | Promise<void> }) | DeskToolHost;
+
+/** Normalize legacy DeskSession hosts and workspace-style `{tools, close}` hosts once. */
+export function resolveDeskToolHost(source: DeskToolSource): DeskToolHost {
+  if (typeof source === "object" && source !== null && "tools" in source && Array.isArray(source.tools)) {
+    const host = source as DeskToolHost;
+    return { tools: normalizeEndpoints(host.tools), close: host.close.bind(host) };
+  }
+  const session = source as DesktopToolSession & { close(): void | Promise<void> };
+  return { tools: createDeskTools(session), close: session.close.bind(session) };
 }

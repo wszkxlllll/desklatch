@@ -165,6 +165,21 @@ export class CuaWindowsTransport implements WindowsTransport {
         args.amount = step.amount;
         return this.runAction("scroll", args, target.foreground, options.signal);
       }
+      case "keypress": {
+        if (!target.foreground || !validKey(step.key)) return { status: "refused", code: "cua_keyboard_target_unavailable" };
+        // CUA receives the exact enrolled window target above. The backend
+        // activates and re-verifies that HWND/PID before this call, so the
+        // key cannot land in a neighboring process or modal.
+        delete args.delivery_mode;
+        args.key = step.key;
+        return this.runAction("press_key", args, true, options.signal, true);
+      }
+      case "hotkey": {
+        if (!target.foreground || !validHotkey(step.keys)) return { status: "refused", code: "cua_hotkey_target_unavailable" };
+        delete args.delivery_mode;
+        args.keys = [...step.keys];
+        return this.runAction("hotkey", args, true, options.signal, true);
+      }
       default:
         return { status: "refused", code: "windows_action_not_supported" };
     }
@@ -229,7 +244,7 @@ export class CuaWindowsTransport implements WindowsTransport {
     }
   }
 
-  private actionResult(result: WindowsToolResult, foreground: boolean): WindowsTransportDelivery {
+  private actionResult(result: WindowsToolResult, foreground: boolean, allowKeyboardMode = false): WindowsTransportDelivery {
     const action = actionRecord(result);
     const code = result.errorCode ?? stringField(action, "code", "error_code") ?? stringField(action?.error, "code");
     if (result.isError) {
@@ -244,7 +259,8 @@ export class CuaWindowsTransport implements WindowsTransport {
     if (effect === "partial") return { status: "partial", ...(code ? { code } : {}) };
     if (effect === "refused") return { status: "refused", code: code ?? "driver_refused" };
     if (effect === "suspected_noop") return { status: "unknown", code: code ?? "driver_suspected_noop" };
-    if (mode !== undefined && mode !== (foreground ? "foreground" : "background")) {
+    if (mode !== undefined && mode !== (foreground ? "foreground" : "background")
+      && !(allowKeyboardMode && (mode === "not_applicable" || mode === "background"))) {
       return { status: "unknown", code: code ?? "delivery_mode_mismatch" };
     }
     if (!foreground && route === "global_input") return { status: "unknown", code: code ?? "background_used_global_input" };
@@ -254,9 +270,9 @@ export class CuaWindowsTransport implements WindowsTransport {
     return { status: "unknown", code: code ?? "driver_outcome_unknown" };
   }
 
-  private async runAction(name: string, args: Record<string, unknown>, foreground: boolean, signal?: AbortSignal): Promise<WindowsTransportDelivery> {
+  private async runAction(name: string, args: Record<string, unknown>, foreground: boolean, signal?: AbortSignal, allowKeyboardMode = false): Promise<WindowsTransportDelivery> {
     try {
-      return this.actionResult(await this.call(name, args, signal), foreground);
+      return this.actionResult(await this.call(name, args, signal), foreground, allowKeyboardMode);
     } catch (error) {
       return classifyActionError(error);
     }
@@ -321,6 +337,7 @@ function parseElement(value: unknown): WindowsWindowElement | undefined {
     ...(typeof item.in_web_content === "boolean" ? { inWebContent: item.in_web_content } : typeof item.inWebContent === "boolean" ? { inWebContent: item.inWebContent } : {}),
     actions: Object.freeze(actions),
     ...(integerString(item.parent_index ?? item.parentIndex) !== undefined ? { parentIndex: integerString(item.parent_index ?? item.parentIndex) } : {}),
+    ...(runtimeIdField(item) ? { runtimeId: runtimeIdField(item) } : {}),
     ...(frame ? { rect: frame } : screenshotFrame ? { rect: screenshotFrame, rectIsWindowLocal: true } : {}),
     ...(stringField(item, "element_token", "elementToken") ? { token: stringField(item, "element_token", "elementToken") } : {}),
   };
@@ -412,6 +429,18 @@ function stringField(value: unknown, ...keys: string[]): string | undefined {
   return undefined;
 }
 
+function runtimeIdField(value: unknown): string | undefined {
+  const item = record(value);
+  if (!item) return undefined;
+  const raw = item.runtime_id ?? item.runtimeId ?? item.runtime_identity ?? item.runtimeIdentity;
+  if (typeof raw === "string" && raw.length > 0 && raw.length <= 1024) return raw;
+  if (typeof raw === "number" && Number.isSafeInteger(raw)) return String(raw);
+  if (Array.isArray(raw) && raw.length > 0 && raw.length <= 64 && raw.every(entry => Number.isSafeInteger(entry))) {
+    return raw.join(".");
+  }
+  return undefined;
+}
+
 function positiveInteger(value: unknown): number | undefined {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : typeof value === "string" && /^\d+$/u.test(value) && Number(value) > 0 && Number.isSafeInteger(Number(value)) ? Number(value) : undefined;
 }
@@ -466,4 +495,15 @@ function classifyActionError(error: unknown): WindowsTransportDelivery {
 
 function hasControlCharacters(value: string): boolean {
   return /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/u.test(value);
+}
+
+function validKey(key: string): boolean {
+  return /^(?:F12|Enter|Escape|Tab)$/iu.test(key);
+}
+
+function validHotkey(keys: readonly string[]): boolean {
+  if (!Array.isArray(keys) || keys.length < 2 || keys.length > 3 || new Set(keys).size !== keys.length) return false;
+  const normalized = keys.map(key => key.toLocaleLowerCase());
+  return (normalized.length === 2 && normalized[0] === "ctrl" && normalized[1] === "s")
+    || (normalized.length === 3 && normalized[0] === "ctrl" && normalized[1] === "shift" && normalized[2] === "s");
 }

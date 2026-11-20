@@ -225,6 +225,8 @@ function ElementRecord(
     } catch { }
     $rect = Bounds $element
     if ($null -ne $rect) { $record.frame = $rect }
+    $runtimeId = ElementIdentity $element
+    if (-not [string]::IsNullOrEmpty($runtimeId)) { $record.runtime_id = $runtimeId }
     $token = TokenFor $processId $hwnd $rootIdentity (ElementIdentity $element) $role
     if ($null -ne $token) { $record.element_token = $token }
   }
@@ -311,6 +313,59 @@ function Observe([object] $request) {
   $rect = Bounds $root
   if ($null -ne $rect) { $reply.window_bounds = $rect }
   return [pscustomobject]$reply
+}
+
+function Focus([object] $request) {
+  $processId = RequestPid $request
+  $hwnd = RequestHwnd $request
+  $root = RootFor $processId $hwnd
+  $rootIdentity = ElementIdentity $root
+  if ([string]::IsNullOrEmpty($rootIdentity)) { throw "native_uia_identity_unavailable" }
+  $reply = [ordered]@{
+    ok = $true
+    pid = $processId
+    window_id = $hwnd.ToInt64().ToString([Globalization.CultureInfo]::InvariantCulture)
+    root_identity = $rootIdentity
+    focused = $false
+    focused_within_target = $false
+  }
+  $focused = $null
+  try { $focused = [System.Windows.Automation.AutomationElement]::FocusedElement } catch { $focused = $null }
+  if ($null -eq $focused) { return [pscustomobject]$reply }
+  try {
+    if ([int]$focused.Current.ProcessId -ne $processId) { return [pscustomobject]$reply }
+  } catch { return [pscustomobject]$reply }
+  if (-not (FocusedWithinTarget $root $hwnd $focused $rootIdentity)) { return [pscustomobject]$reply }
+  $runtimeId = ElementIdentity $focused
+  if ([string]::IsNullOrEmpty($runtimeId)) { return [pscustomobject]$reply }
+  $reply.focused = $true
+  $reply.focused_within_target = $true
+  $reply.focused_runtime_id = $runtimeId
+  try {
+    $reply.focused_role = RoleName $focused
+    $focusedBounds = Bounds $focused
+    if ($null -ne $focusedBounds) { $reply.focused_bounds = $focusedBounds }
+  } catch { }
+  return [pscustomobject]$reply
+}
+
+function FocusedWithinTarget(
+  [System.Windows.Automation.AutomationElement] $root,
+  [IntPtr] $hwnd,
+  [System.Windows.Automation.AutomationElement] $focused,
+  [string] $rootIdentity
+) {
+  $walker = [System.Windows.Automation.TreeWalker]::RawViewWalker
+  $current = $focused
+  for ($depth = 0; $depth -lt 64 -and $null -ne $current; $depth += 1) {
+    try {
+      $native = [Int64]$current.Current.NativeWindowHandle
+      if ($native -ne 0 -and [NativeWindowScope]::GetAncestor([IntPtr]$native, 2).ToInt64() -eq $hwnd.ToInt64()) { return $true }
+      if ((ElementIdentity $current) -eq $rootIdentity) { return $true }
+      $current = $walker.GetParent($current)
+    } catch { return $false }
+  }
+  return $false
 }
 
 function DecodeToken([string] $token) {
@@ -515,6 +570,8 @@ public static class NativeWindowScope {
       $reply = ErrorReply "native_uia_invalid_request"
     } elseif ([string]$request.op -eq "observe") {
       $reply = Observe $request
+    } elseif ([string]$request.op -eq "focus") {
+      $reply = Focus $request
     } elseif ([string]$request.op -eq "dispatch") {
       $reply = Dispatch $request
     } else {

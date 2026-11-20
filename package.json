@@ -57,6 +57,10 @@
       "types": "./dist/reuse.d.ts",
       "import": "./dist/reuse.js"
     },
+    "./workspace": {
+      "types": "./dist/workspace.d.ts",
+      "import": "./dist/workspace.js"
+    },
     "./schema": "./schema/act-input.schema.json"
   },
   "files": [

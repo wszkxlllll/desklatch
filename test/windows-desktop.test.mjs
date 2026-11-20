@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createDeskSession } from '../dist/index.js';
-import { createWindowsDesktopBackend, CuaWindowsTransport } from '../dist/backends/windows/index.js';
+import { createWindowsDesktopBackend, CuaWindowsTransport, createWindowsForegroundActivator } from '../dist/backends/windows/index.js';
 
 const targetA = { pid: 41001, hwnd: 0x100000000001n, title: 'Fixture A' };
 const targetB = { pid: 41002, hwnd: 0x100000000002n, title: 'Fixture B' };
@@ -314,4 +314,155 @@ test('CUA suspected-noop receipts are never reported as dispatched', async () =>
   }, {});
   assert.deepEqual(result, { status: 'unknown', code: 'driver_suspected_noop' });
   await transport.close();
+});
+
+test('CUA transport dispatches bounded Word keyboard commands to the exact foreground window', async () => {
+  const calls = [];
+  const target = { pid: 41001, hwnd: 0x100000000001n };
+  const driver = {
+    async metadata() { return { driverVersion: '0.54.0' }; },
+    async startSession() { return { active: true }; },
+    async endSession() { return { active: false }; },
+    async callTool(name, json) {
+      calls.push({ name, args: JSON.parse(json) });
+      return { isError: false, action: { effect: 'confirmed', route: 'global_input', delivery: { mode: 'foreground' } } };
+    },
+  };
+  const transport = await CuaWindowsTransport.open(driver, 'keyboard-session');
+  const recipient = { window: target, foreground: true };
+  assert.deepEqual(await transport.dispatch({ kind: 'keypress', target: { ref: 'focused' }, key: 'F12' }, recipient, {}), { status: 'dispatched' });
+  assert.deepEqual(await transport.dispatch({ kind: 'hotkey', target: { ref: 'focused' }, keys: ['ctrl', 's'] }, recipient, {}), { status: 'dispatched' });
+  assert.deepEqual(await transport.dispatch({ kind: 'hotkey', target: { ref: 'focused' }, keys: ['ctrl', 'shift', 's'] }, recipient, {}), { status: 'dispatched' });
+  assert.deepEqual(calls.map(call => call.name), ['press_key', 'hotkey', 'hotkey']);
+  assert.equal(calls[0].args.key, 'F12');
+  assert.deepEqual(calls[1].args.keys, ['ctrl', 's']);
+  assert.deepEqual(calls[2].args.keys, ['ctrl', 'shift', 's']);
+  assert.deepEqual(calls.map(call => call.args.target), [
+    { kind: 'window', pid: target.pid, window_id: calls[0].args.target.window_id },
+    { kind: 'window', pid: target.pid, window_id: calls[1].args.target.window_id },
+    { kind: 'window', pid: target.pid, window_id: calls[2].args.target.window_id },
+  ]);
+  assert.equal(String(calls[0].args.target.window_id), String(target.hwnd));
+  assert.equal(String(calls[1].args.target.window_id), String(target.hwnd));
+  assert.equal(String(calls[2].args.target.window_id), String(target.hwnd));
+  assert.equal(calls.every(call => call.args.session === 'keyboard-session'), true);
+  assert.equal(calls.every(call => call.args.delivery_mode === undefined), true);
+  await transport.close();
+});
+
+test('foreground keyboard dispatch requires observed focus and verifies HWND plus PID', async () => {
+  const calls = [];
+  let foreground = { hwnd: targetB.hwnd, pid: targetB.pid };
+  const focusedSnapshot = {
+    target: targetA,
+    title: 'Word',
+    bounds: { x: 20, y: 30, width: 420, height: 280 },
+    complete: true,
+    elements: [
+      { index: '0', depth: 0, role: 'Window', label: 'Word', actions: [], rect: { x: 20, y: 30, width: 420, height: 280 } },
+      { index: '1', depth: 1, role: 'Document', label: 'Document', actions: ['text'], focused: true, editable: true, runtimeId: 'doc-runtime-1', token: 'focused-document', rect: { x: 40, y: 70, width: 300, height: 180 }, parentIndex: '0' },
+    ],
+  };
+  const transport = {
+    source: 'cua-uia-0.54',
+    activations: 0,
+    async observeWindow() { return focusedSnapshot; },
+    async bringToFront(target) {
+      calls.push({ kind: 'bringToFront', target });
+      this.activations += 1;
+      foreground = { hwnd: target.hwnd, pid: target.pid };
+      return { status: 'dispatched' };
+    },
+    async dispatch(step, target) {
+      calls.push({ kind: 'dispatch', step, target });
+      return { status: 'dispatched' };
+    },
+  };
+  const inspector = {
+    async read(target) {
+      return { target, visible: true, minimized: false, bounds: { x: 20, y: 30, width: 420, height: 280 }, foregroundHwnd: foreground.hwnd, foregroundPid: foreground.pid };
+    },
+    async readFocused(target) {
+      return { target, focused: true, pid: target.pid, hwnd: target.hwnd, runtimeId: 'doc-runtime-1', role: 'Document' };
+    },
+  };
+  const backend = await createWindowsDesktopBackend({
+    authorization: { targets: [targetA], allowForegroundInput: true },
+    transport,
+    inspector,
+  });
+  const frame = await backend.observe({ view: 'controls' });
+  const document = frame.controls.find(control => control.role === 'Document');
+  assert.ok(document?.actions.includes('keypress'));
+  assert.ok(document?.actions.includes('hotkey'));
+  const result = await backend.dispatch({
+    frame,
+    target: document,
+    step: { kind: 'hotkey', target: { ref: document.id }, keys: ['ctrl', 'shift', 's'] },
+  });
+  assert.deepEqual(result, { status: 'dispatched' });
+  assert.deepEqual(calls.map(call => call.kind), ['bringToFront', 'dispatch']);
+  assert.equal(transport.activations, 1);
+  assert.equal(calls[1].target.foreground, true);
+  assert.equal(calls[1].target.window.hwnd, targetA.hwnd);
+  assert.equal(calls[1].target.window.pid, targetA.pid);
+  await backend.close();
+});
+
+test('foreground activation rechecks native RuntimeId focus and rejects a replaced control', async () => {
+  const calls = [];
+  let foreground = { hwnd: targetB.hwnd, pid: targetB.pid };
+  let focusRuntimeId = 'doc-runtime-1';
+  const snapshot = {
+    target: targetA,
+    title: 'Word',
+    bounds: { x: 20, y: 30, width: 420, height: 280 },
+    complete: true,
+    elements: [{ index: '1', depth: 0, role: 'Document', label: 'Document', actions: ['text'], runtimeId: 'doc-runtime-1', token: 'focused-document', rect: { x: 40, y: 70, width: 300, height: 180 } }],
+  };
+  const transport = {
+    source: 'cua-uia-0.54',
+    async observeWindow() { return snapshot; },
+    async bringToFront(target) {
+      calls.push({ kind: 'bringToFront', target });
+      foreground = { hwnd: target.hwnd, pid: target.pid };
+      focusRuntimeId = 'replacement-runtime';
+      return { status: 'dispatched' };
+    },
+    async dispatch(step, target) {
+      calls.push({ kind: 'dispatch', step, target });
+      return { status: 'dispatched' };
+    },
+  };
+  const inspector = {
+    async read(target) {
+      return { target, visible: true, minimized: false, bounds: { x: 20, y: 30, width: 420, height: 280 }, foregroundHwnd: foreground.hwnd, foregroundPid: foreground.pid };
+    },
+    async readFocused(target) {
+      return { target, focused: true, pid: target.pid, hwnd: target.hwnd, runtimeId: focusRuntimeId, role: 'Document' };
+    },
+  };
+  const backend = await createWindowsDesktopBackend({ authorization: { targets: [targetA], allowForegroundInput: true }, transport, inspector });
+  const frame = await backend.observe({ view: 'controls' });
+  const document = frame.controls.find(control => control.role === 'Document');
+  assert.ok(document?.actions.includes('hotkey'));
+  const result = await backend.dispatch({ frame, target: document, step: { kind: 'hotkey', target: { ref: document.id }, keys: ['ctrl', 's'] } });
+  assert.deepEqual(result, { status: 'refused', code: 'keyboard_focus_not_confirmed' });
+  assert.deepEqual(calls.map(call => call.kind), ['bringToFront']);
+  await backend.close();
+});
+
+test('host foreground activator refuses an HWND whose foreground PID does not match', async () => {
+  let observed = { hwnd: targetB.hwnd, pid: targetB.pid };
+  const activation = createWindowsForegroundActivator({
+    async bringToFront() { return { status: 'dispatched' }; },
+  }, {
+    async read(target) {
+      return { target, visible: true, minimized: false, foregroundHwnd: observed.hwnd, foregroundPid: observed.pid };
+    },
+  });
+  const refused = await activation(targetA, {});
+  assert.deepEqual(refused, { status: 'refused', code: 'foreground_not_confirmed' });
+  observed = { hwnd: targetA.hwnd, pid: targetA.pid };
+  assert.deepEqual(await activation(targetA, {}), { status: 'dispatched' });
 });

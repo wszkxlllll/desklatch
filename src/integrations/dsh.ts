@@ -2,14 +2,10 @@ import type { Context, Plugin } from "@deepseek-ai/cordis";
 import { createMcpToolDefinition } from "@deepseek-ai/dsh-mcp-client";
 import type { ToolExecution, ToolDefinition } from "@deepseek-ai/dsh-tools";
 
-import type { DesktopToolSession, ToolEndpoint } from "../tools.js";
-import { createDeskTools } from "../tools.js";
-import { errorText, toDesktopContent } from "./shared.js";
+import type { ToolEndpoint } from "../tools.js";
+import { errorText, resolveDeskToolHost, toDesktopContent, type DeskToolHost, type DeskToolSource } from "./shared.js";
 
-export type DeskDshSession = DesktopToolSession & {
-  /** Host-owned close hook; invoked exactly once on plugin unmount. */
-  close(): void | Promise<void>;
-};
+export type DeskDshSession = DeskToolSource;
 
 export type DeskDshOpenSession = (
   ctx: Context,
@@ -47,7 +43,7 @@ export function createDeskDshPlugin(openSession: DeskDshOpenSession) {
     apply(ctx: Context) {
       const controller = new AbortController();
       let disposed = false;
-      let session: DeskDshSession | undefined;
+      let session: DeskToolHost | undefined;
       let closed = false;
       const disposers: Array<() => void> = [];
 
@@ -63,9 +59,9 @@ export function createDeskDshPlugin(openSession: DeskDshOpenSession) {
       const activation = Promise.resolve()
         .then(() => openSession(ctx, controller.signal))
         .then((opened) => {
-          session = opened;
+          session = resolveDeskToolHost(opened);
           if (disposed || controller.signal.aborted) return closeOnce();
-          for (const endpoint of createDeskTools(opened)) {
+          for (const endpoint of session.tools) {
             if (disposed || controller.signal.aborted) break;
             disposers.push(ctx.tools.register(makeDefinition(ctx, endpoint)));
           }

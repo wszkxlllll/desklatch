@@ -1,6 +1,6 @@
 # DeskLatch 首版验收记录
 
-11 月 19 日的首轮模型实验采用测试程序创建的表单。11 月 20 日又使用真实博物馆网站、桌面 Office 和 E2B 云电脑，分别记录模型选择、实际派发和结果回读。本轮在 Windows x64、Node.js 24.22.3 和本机 Chrome 上运行了 132 项自动化测试，131 项通过，1 项 Linux 专用测试跳过。
+11 月 19 日的首轮模型实验采用测试程序创建的表单。11 月 20 日又使用真实博物馆网站、桌面 Office 和 E2B 云电脑，记录模型选择、实际派发和结果回读。开发环境为 Windows x64、Node.js 24.22.3 和本机 Chrome。
 
 ## 外部框架和真实模型
 
@@ -19,6 +19,12 @@
 开发时遇到过两种失败。一次调用混用了 `type.text` 和 `setValue.value`，另一次只展开了界面，旧示例收到该批成功回执就过早结束。工具说明现已给出每种输入动作的完整形状，示例也分别处理单批完成和整项任务完成。在一次早期复跑中，LangGraph 到第三次模型请求才提交有效参数。上表是一轮实测值，成功率和费用降幅需要独立样本及对照。
 
 ## 真实馆藏检索与步骤复用
+
+在 Windows 实机上，智谱从空白的 Chrome 打开用户给出的上博东馆参观指南，查到普通周二闭馆和 17:00 停止入场，再自行切换到 Word，把说明及官网链接写入本次已打开的空白 DOCX 并保存。一次委托用了 8 次模型请求，传图 0 张，正文写入和保存各一次。宿主从磁盘解析 DOCX，确认全文与模型提交的正文一致，两项事实和链接均正确。早期测试曾在一次成功保存后又写入相同的段落，因此复跑在落盘内容匹配时结束，并在轨迹中记录 `delivery.verified`。[实机验收入口](../examples/local-workspace-acceptance.mjs)
+
+复跑时为 `ZHIPU_API_KEY` 配置智谱密钥，`DESKLATCH_RESULTS_DIR` 指向输出目录，`DESKLATCH_LOCAL_WORD_TEMPLATE_PATH` 指向由 Word 或 LibreOffice 保存的空白 DOCX。设置 `DESKLATCH_LOCAL_FOCUSED=1` 后运行 `node examples/local-workspace-acceptance.mjs`。程序为本次任务复制空白文档、启动独立应用，之后网页导航、切换、输入和保存均由模型发起。结果目录包含操作记录和最终文档。
+
+工作区另测了从空白页开始的参观查询。LangGraph 向智谱 `glm-5.3-flash` 注册了 `observe` 和 `act`。用户只给了上博官网域名。模型主动打开官网，进入常设展览、青铜馆详情和东馆参观指南，并说明普通周二无法参观，建议改在周三下午 14:30 到东馆。独立核对确认了馆区、闭馆日、17:00 停止入场和四个实际查看的官网页面。本次有 15 次模型请求，使用了 6 次带截图的观察。这项验收的终点是给用户的答复。[可复跑的网页任务](../examples/workspace-website.mjs) · [上博东馆参观指南](https://www.shanghaimuseum.cn/mu/frontend/pg/service/visit-east) · [青铜馆详情](https://www.shanghaimuseum.cn/mu/frontend/pg/article/id/RI00004029)
 
 本机另做了一次自由选工具的参观查询。智谱从上博中文官网首页开始，通过 DeskLatch 读取页面，回答了“周二下午去哪里看青铜器，最晚几点能进，能否换一天”。这阶段实际调用模型 6 次，共 40,419 token，图片传输为 0。轨迹记录到两次成功的观察，其中一次返回了 12 段正文，另一次返回了匹配控件。模型给出了东馆、普通周二闭馆、开放日 17:00 停止入场，并引用实际读过的首页。独立验收又核对了馆方参观指南。这里记录的是查询阶段，文件是否写入另行检查。[上博官网](https://www.shanghaimuseum.cn/mu/frontend/pg/index) · [东馆参观指南](https://www.shanghaimuseum.cn/mu/frontend/pg/service/visit-east)
 
