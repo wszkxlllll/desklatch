@@ -1,0 +1,5 @@
+# DeskLatch's native DSH bundle. The profile loader applies this layer when
+# the bundle is selected; users do not need to edit cordis.patch.yml by hand.
+- insert:
+    - id: desklatch
+      name: desklatch-dsh

@@ -7,10 +7,11 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 
 /** The command-line argument is a trusted operator-owned module, outside the model's tool surface. */
 async function main() {
-  if (process.argv.length !== 3) throw Error("usage: desklatch-mcp <trusted-host-module.mjs>");
-  const host = await import(pathToFileURL(resolve(process.argv[2])).href);
-  if (typeof host.openDeskSession !== "function") throw Error("host must export openDeskSession()");
-  const opened = await host.openDeskSession();
+  if (process.argv.length !== 3) throw Error("usage: desklatch-mcp --demo | <trusted-host-module.mjs>");
+  const input = process.argv[2];
+  const opened = input === "--demo"
+    ? await (await import("../demo.js")).createDemoDeskSession()
+    : await openHost(input);
   const toolHost = resolveDeskToolHost(opened);
   let closed: Promise<void> | undefined;
   const close = () => (closed ??= Promise.resolve().then(() => toolHost.close()));
@@ -27,8 +28,17 @@ async function main() {
     throw error;
   }
 }
+
+async function openHost(input: string) {
+  const host = await import(pathToFileURL(resolve(input)).href);
+  if (typeof host.openDeskSession !== "function") throw Error("host must export openDeskSession()");
+  return host.openDeskSession();
+}
+
 main().catch(() => {
   // stdout is reserved for MCP. Host exceptions may contain credentials or paths.
-  console.error(process.argv.length !== 3 ? "usage: desklatch-mcp <trusted-host-module.mjs>" : "DeskLatch MCP host could not start");
+  if (process.argv.length !== 3) console.error("usage: desklatch-mcp --demo | <trusted-host-module.mjs>");
+  else if (process.argv[2] === "--demo") console.error("DeskLatch demo could not start. Run desklatch-setup mcp to check Playwright and Chromium.");
+  else console.error("DeskLatch MCP host could not start");
   process.exitCode = 1;
 });

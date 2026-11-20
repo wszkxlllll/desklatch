@@ -1,90 +1,49 @@
-# DeskLatch
+<h1 align="center">DeskLatch</h1>
 
-A host-controlled computer-use runtime for AI agents.
+<p align="center"><strong>为已有 AI Agent 提供桌面操作与用户审批。</strong></p>
 
-DeskLatch 把桌面观察和操作接入已有 Agent。模型只得到 `observe` 和按授权开放的 `act`。宿主拥有桌面连接、任务循环、模型和用户审批渠道。核心包可独立加载，框架和驱动使用各自的子路径。
+<p align="center">
+  <a href="https://github.com/wszkxlllll/desklatch/releases/download/v0.1.0-dev.0/DeskLatch-Windows-Setup.zip">下载 Windows 预览</a> ·
+  <a href="docs/integrations.md">接入指南</a> ·
+  <a href="docs/verification.md">实测记录</a>
+</p>
 
-## 将桌面工具接入已有框架
+DeskLatch 让 Agent 读取浏览器和桌面界面、执行一组操作，并在需要时等待用户确认。你可以把它装进 DeepSeek Harness，也可以接到支持本地 MCP 的客户端或自己的 Agent 应用。
 
-以下代码由宿主运行。`page` 是宿主已打开且授权的 Playwright Page，`allowedOrigin` 是该页面允许操作的来源。
+## 快速安装
 
-```ts
-import { createDeskSession, createDeskTools, desktopToolInstructions } from "desklatch";
-import { createBrowserBackend } from "desklatch/browser";
-import { createLangChainTools } from "desklatch/langchain";
-import { ToolNode } from "@langchain/langgraph/prebuilt";
+1. 从 [GitHub Release](https://github.com/wszkxlllll/desklatch/releases/tag/v0.1.0-dev.0) 下载 `DeskLatch-Windows-Setup.zip`，解压后双击 `install.cmd`。
+2. 选择安装目录和接入方式。使用 DSH 桌面版时选 **DeepSeek Harness 插件**，先完成 DSH 的首次启动，再从系统托盘退出后安装。其他支持本地 MCP 的客户端选择 **MCP**，安装完成后复制生成的配置。
+3. 启动客户端，让 Agent 用 DeskLatch 在试用表单填写 `Title`。在 DSH 里可以再让它点击 `Send message`，体验审批卡上的批准和拒绝。
 
-const session = createDeskSession(createBrowserBackend(page, {
-  authorizedOrigins: [allowedOrigin],
-}));
-const endpoints = createDeskTools(session);
-const node = new ToolNode(createLangChainTools(endpoints));
-// Add node to the host graph. desktopToolInstructions can be appended to its instructions.
-// At host teardown: await session.close().
-```
+预览包在独立浏览器的测试表单上运行。`Send message` 只增加表单计数。OCR 和 E2B 各自默认跳过，可以独立安装或使用已有配置。GitHub 下载对有仓库访问权限的用户开放，同一个 ZIP 也可以直接分享。 [安装说明](distribution/windows/README.md) · [OCR 与 E2B 配置](docs/setup-optional.md)
 
-多个应用共用一个模型会话时，宿主用 `createWorkspace({ applications })` 注册获准的应用，将 `workspace.tools` 交给同一个框架。条目可以绑定已打开的会话，也可以提供宿主的 `open` 函数。模型选中该应用时，宿主才接入已有窗口或启动应用。[工作区接口](docs/architecture.md#多个应用共用的工作区)
+## 接入方式
 
-宿主可以通过 `canAutomate` 接入用户的应用或窗口排除设置。DSH、LangGraph 和 MCP 共用同一工作区规则。[应用和窗口排除设置](docs/architecture.md#应用和窗口排除设置)
+| 你在用什么 | 怎么接入 | 如何审批 |
+| --- | --- | --- |
+| DeepSeek Harness | 安装原生插件，在 DSH 内注册 `desklatch_observe` 与 `desklatch_act` | 在 DSH 的会话卡上批准或拒绝 |
+| 支持本地 stdio MCP 的客户端 | 导入向导生成的配置，由客户端启动 DeskLatch 服务，通过 MCP 调用 `observe` 与 `act` | 需要宿主提供确认界面并回传决定 |
+| LangGraph、OpenAI Agents SDK 或自研应用 | 用 TypeScript SDK 将两个工具注册到现有 Agent | 通过宿主的审批回调与业务规则处理 |
 
-本机设置预览可直接点选示例应用和窗口，保存后通过工作区验证是否允许接入。运行下面两条命令后，打开终端给出的完整地址。
+三条路径共用同一套执行器。模型、对话历史和桌面会话由接入的宿主管理。[框架集成与接口](docs/integrations.md)
 
-~~~sh
-npm run build
-node examples/automation-settings/server.mjs
-~~~
+## 能做什么
 
-预览可独立运行，站点验证使用本机 Chromium。设置持久化路径可由 `DESKLATCH_AUTOMATION_SETTINGS_STATE` 指定。[浏览器范围](docs/architecture.md#浏览器访问范围)
+- **按需读取界面。** 读取控件或网页正文，按关键词查找长页面。获准时再取图。
+- **一次调用做多步。** 在每步执行前核对目标和权限，按指定条件读回结果，并返回逐步回执。
+- **让用户做关键决定。** 需要确认时暂停动作。用户同意后仍会检查操作对象是否变化。
+- **复用已核验的步骤。** 宿主可记录合适的字段填写、标签切换和展开操作。再次使用时按当前页面核对。
+- **接入本机或云桌面。** 已验证受管 Chromium、Windows UIA 和 E2B Desktop 路径。实际可用动作取决于宿主授权及所选后端。[支持范围和验证](docs/verification.md)
 
-| 工具 | 模型怎么用 |
-| --- | --- |
-| `observe` | 用 `{workspace:true}` 查看可选择的应用，也可以读取当前界面的控件、网页正文或获准的截图。网页正文支持关键词查找和续读。 |
-| `act` | 用 `{activate:"editor"}` 切换到已登记的编辑器，用 `{navigate:url}` 在获准的浏览器打开网址，用 `{steps:[...]}` 操作当前界面。 |
-
-| 宿主 | 接入方式 |
-| --- | --- |
-| LangChain / LangGraph JS | `createLangChainTools(endpoints)` 返回框架工具。宿主自己绑定模型或创建 `ToolNode`。[可运行的 ToolNode 示例](examples/frameworks/langgraph.mjs) |
-| OpenAI Agents SDK for TypeScript | 从 `desklatch/openai-agents` 导入 `createOpenAIAgentsTools(endpoints)`，把结果传给已有 `Agent` 的 `tools`。模型及 API 端点由宿主选择。[智谱实例](examples/zhipu-acceptance.mjs) |
-| MCP 客户端 | 从 `desklatch/mcp` 导入 `createDeskMcpServer(endpoints)`，连接宿主的 MCP transport。stdio 启动器可加载宿主提供的本地模块，模块导出 `openDeskSession()`。[宿主示例](examples/frameworks/browser-host.mjs) |
-| DeepSeek Harness（DSH） | 从 `desklatch/dsh` 导入 `createDeskDshPlugin`，用 `ctx.plugin(createDeskDshPlugin(openSession))` 加载进现有 Cordis 应用。它在本进程注册 `desklatch_observe` 和已授权的 `desklatch_act`。也可使用官方 MCP 插件经 stdio 对接，此时工具名带 `mcp__desklatch__` 前缀。[DSH 官方 MCP 配置](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/mcp/mcp-client/README.md) |
-
-对使用智谱 Chat Completions 的 LangGraph 宿主，调用 `model.invoke(prepareDeskChatCompletionsMessages(messages))` 即可把模型主动索取的截图发回去。此函数从 `desklatch/langchain` 导出。原工具回复保留控件文字和调用编号，截图跟在该批工具回复之后，标注为桌面观察。图状态仍保存原始工具回复。
-
-构建完成后，MCP 客户端可将启动命令配置为 `node`，参数依次为 `dist/bin/mcp.js` 和宿主模块的绝对路径。此仓库内可试用 `node dist/bin/mcp.js examples/frameworks/browser-host.mjs`。它打开新建的无头浏览器测试表单，stdio 专用于 MCP。
-
-## 一次调用多步
-
-目标明确时直接传名称。执行器在各步派发之前查找实际控件、检查风险，并在有 `expect` 时读取动作后的真实状态。
-
-```json
-{
-  "steps": [
-    {"kind":"type","target":{"name":"Title"},"text":"Review"},
-    {"kind":"type","target":{"name":"Notes"},"text":"Approved draft",
-     "expect":{"target":{"name":"Notes"},"valueEquals":"Approved draft"}}
-  ]
-}
-```
-
-纯条件请求可以首调。使用控件引用、截图坐标或拖拽端点时需带上 `observationId`。每个后端公布自己的动作与参数组合。期望值只适用于已获准读取的公开字段。应用可用 `onApprovalRequested` 接收确认请求，再通过仅宿主可调用的 `resolveApproval` 处理用户决定。[运行时及宿主责任](docs/architecture.md) · [act 输入契约](schema/act-input.schema.json)
-
-网页正文需要宿主在浏览器后端启用 `allowDocumentText`，并给会话启用 `allowModelDocumentText`。`observe({read:"document"})` 读正文首批文字，`observe({read:{query:"停止入场"}})` 查找正文中含该词的位置。任一结果带有 `document.nextCursor` 时，将它传给 `observe({read:{cursor: ...}})` 可继续读。同一页的关键词查找覆盖本次授权范围内的已渲染正文，包括首批未返回的部分。结果附带来源，每次仍按现有文本预算返回。
-
-宿主可加载 `desklatch/reuse` 自动记录能核验的字段写入、页内标签切换和展开操作。`observe` 给出当前界面的相关候选，Agent 选中以后用同一个 `act` 执行。[步骤复用设计](docs/architecture.md#可选的步骤复用)
-
-## 构建和验证
+## 开发与发布
 
 使用 Node.js 22.19 或更新版本。
 
 ```sh
 npm ci
 npm test
+npm run pack:install -- ./distribution/out
 ```
 
-要从另一个项目接入，可在本仓库构建后运行 `npm pack`，将生成的 `.tgz` 路径交给宿主项目的 `npm install`。宿主按接入方式安装对应的框架或驱动，例如 `playwright-core` 和 `@langchain/core`。核心包的直接运行依赖只有 Ajv。
-
-真实浏览器用例使用隔离的 Chromium 实例。可用 `DESKLATCH_CHROMIUM` 指定已安装的浏览器路径。`npm run verify:zhipu` 使用 `ZHIPU_API_KEY` 调用智谱 `glm-5.3-flash`，在合成表单上独立回读最终值。另可显式运行 `node examples/reuse-comparison.mjs`，在真实馆藏检索页比较逐步执行、批量执行和字段复用。两组均记录模型调用，普通 `npm test` 不需要模型密钥。
-
-同时配置 `E2B_API_KEY` 后，`npm run verify:zhipu -- e2b` 会创建一台临时 E2B Desktop，复跑关闭取图和开局提供一张图的两个用例。`npm run verify:zhipu -- e2b-choice` 则开放文字控件与截图，由模型自行选择。每次命令共用一台沙箱，限制为 8 分钟，结束时释放并查询确认。
-
-[首版验收记录](docs/verification.md)
+产品设定、安装与发布分别见 [执行架构](docs/architecture.md)、[开发与接入](docs/integrations.md) 和 [DSH 插件市场](docs/dsh-market.md)。

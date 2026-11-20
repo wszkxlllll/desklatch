@@ -101,6 +101,43 @@ test("native Cordis plugin registers exact capability-filtered names and execute
   assert.equal(fixture.closes, 1);
 });
 
+test("native DSH image results use an authorized durable attachment projection", async () => {
+  const fixture = fixtureSession();
+  const runtime = await createDshContext();
+  const disposeLlm = runtime.ctx.provide("llm", { resolveModelInfo: async () => ({ inputModalities: ["image"] }) });
+  const disposeAttachments = runtime.ctx.provide("attachments", {
+    async saveImages() {
+      return [{ attachmentId: "image-1", mediaType: "image/png", bytes: 3, width: 1, height: 1 }];
+    },
+  });
+  const fiber = runtime.ctx.plugin(createDeskDshPlugin(async () => fixture.session));
+  await fiber.await();
+  try {
+    const observe = runtime.ctx.tools.get("desklatch_observe");
+    assert.ok(observe);
+    const agent = {
+      options: { provider: "image-fixture", model: "image-model" },
+      session: { requestHeader: () => ({ config: { provider: "image-fixture", model: "image-model" } }) },
+    };
+    const execution = { signal: new AbortController().signal, agent };
+    const value = await observe.execute({ view: "both" }, execution);
+    assert.equal(value.content[1].type, "image");
+    const fallback = observe.output.render({}, value);
+    assert.equal(JSON.stringify(fallback).includes("AQID"), false);
+    const projected = observe.projectContent(execution, { isError: false, value, content: fallback });
+    assert.equal(projected?.[1]?.type, "image");
+    assert.deepEqual(projected?.[1]?.attachment, { attachmentId: "image-1", mediaType: "image/png", bytes: 3, width: 1, height: 1 });
+  } finally {
+    await fiber.dispose();
+    disposeAttachments();
+    disposeLlm();
+    await runtime.executor.dispose();
+    await runtime.tools.dispose();
+    await runtime.prompt.dispose();
+  }
+  assert.equal(fixture.closes, 1);
+});
+
 test("read-only host capabilities register observe only", async () => {
   const fixture = fixtureSession({ capabilities: [] });
   const runtime = await createDshContext();

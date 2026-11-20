@@ -52,6 +52,29 @@
 
 在同一真实页面上另测了一图多步。宿主开场提供一张屏幕截图及同帧控件，让智谱自行选择查找 `pathlib` 的操作。首轮填好了查询词，但控件清单漏掉了原生搜索按钮的名字，提交停在审批。补全原生按钮的可见名称，并核对简单搜索表单的去向和实际提交字段后，同题复跑使用 2 次模型请求、1 张截图，只传图 1 次。模型一次 `act` 提交了填词和点击搜索两步。独立检查在结果页读到正确的查询参数及 3 条指向 `pathlib` 文档的结果链接。[实际搜索结果页](https://docs.python.org/3/search.html?q=pathlib)
 
+## 下一轮成本对照计划
+
+主对照统一使用智谱 `glm-5.3-flash` 和同一个 Agent 循环。每道题在同一后端、同一份起始资料和相同权限下交替运行三组。三组都可自行选择截图、控件和正文。
+
+| 组别 | 执行方式 | 用于比较 |
+| --- | --- | --- |
+| 普通单步 | 每轮模型决策最多派发一个动作 | 单步基线 |
+| 普通多步 | 一次可提交多个动作，关闭步骤复用 | 多步执行带来的差异 |
+| 多步加步骤复用 | 保留多步执行，模型可从观察中选择已核验的复用候选 | 步骤复用在多步基础上的增量 |
+
+| 环境 | 题目 | 独立判分 |
+| --- | --- | --- |
+| 受管浏览器 · Python 文档 | 以指定模块或类名搜索，找到官方说明页并返回链接 | 查询词、结果标题和最终链接 |
+| 受管浏览器 · Rijksmuseum 馆藏 | 用不同主题词查找馆藏，选出符合条件的作品 | 查询词、作品名称和馆藏页来源 |
+| 受管浏览器 · 上海博物馆 | 在官网的不同馆区页面查找入馆时间和参观要求 | 现场网页原文与所引页面 |
+| Windows · Word | 在试验用模板副本填入标题、日期和正文并保存 | 落盘文件的指定内容和原模板完整性 |
+| Windows · Excel | 补齐试验表格指定单元格，保留既有公式，再保存结果 | 落盘单元格、公式和其他区域 |
+| 跨应用 · 浏览器到文字处理器 | 从官网查资料，再切到 Word 或 Writer 写入简报和来源 | 网站事实、应用切换轨迹和落盘文档 |
+
+首轮先校准每道题的应用能力和判分条件，再跑每题三组各一次，共 18 次主对照。将复用组建立第一条记录的开销、换参数后的复用开销一并记录。应用改版、未命中或中途停止时保留实际结果。选两道可纯画面完成的题额外比较截图和混合观察，两组使用相同的动作批量限制。在 E2B 复跑时，单独记录云端后端和环境耗时。
+
+逐题记录独立核验结果、模型请求数、输入及输出 token、接口提供的输入缓存命中量、实际传图数、工具耗时和端到端耗时。按同一计费口径汇总 API 费用，失败和重试一并计入，给出每个已核验任务的费用。先复跑结果波动或失败原因不明的题，再决定扩样。
+
 ## 宿主审批与独立安装
 
 - 本机设置页实测了应用关闭、单窗口关闭、恢复应用后保留单窗口的设置，以及刷新后读回已保存的选择。验证按钮通过真实工作区检查示例窗口。站点验证调用临时 Chromium，依次验证了公开模式允许访问、指定模式名单外被拒绝、加入名单后允许访问。
@@ -63,9 +86,12 @@
 - 本机 Chromium 的合成页面接入智谱 `glm-5.3-flash` 做文字风险复核。写草稿由本地规则放行，“紧凑布局”经复核后实际切换，“Continue”后果不明，保持未执行且没有产生审批单。随后点击“Send summary”才产生唯一一张审批单，宿主拒绝后页面未发送。这个用例的两次复核共 357 token，截图数为 0。复跑入口为 `npm run verify:zhipu -- review`，需要宿主提供智谱密钥。
 - 官方 MCP 客户端分别通过内存传输和 stdio 访问工具。另一个真实浏览器用例先写入草稿，再点击模拟发送。MCP 在发送前拿到停顿回执，页面计数保持为 0。宿主对同一个请求并发回传两次同意后，页面计数为 1，草稿步骤也只执行一次。
 - 在带收件人的表单上，宿主收到目标站点和脱敏地址。等待期间改变收件人，回传原批准后的派发次数为 0。
-- 安装试验将实际打包的 `.tgz` 离线装进空目录。只安装核心的生产依赖，以独立宿主提供的后端调用 `act`，写入并回读一个字段。这个试验能发现源码目录中可读、实际安装包中缺失的契约或运行资产。
+- 安装试验将实际打包的核心 `.tgz` 装进空目录，先仅安装基础依赖，验证 `observe`、`act` 和字段复用。随后选择 MCP，按向导生成的配置启动独立 Chromium，并执行、回读字段写入。此时目录里没有 E2B SDK。带 `--with-e2b` 可以继续验证选装 E2B，检查 SDK 和测试 Key 文件，全程不创建沙箱。
+- `npm run pack:install -- <outputDir>` 还会生成 `desklatch-dsh-<version>.tgz`。其中的 `dsh.bundle.patch` 通过 DSH 官方插件机制挂载 DeskLatch。验收把插件包复制到临时目录，只安装该包，检查包声明的可移植性并加载入口。插件使用 DSH 宿主提供的工具注册和审批服务。
+- Windows 安装向导使用系统 PowerShell 5.1。分别在独立目录验证了 MCP 基础安装和 E2B 选装、便携 Python 加载 OCR 模型，以及通过 DSH 0.2.2-rc.5 的官方命令安装和启动独立 profile。OCR 验证先新装，再用已有配置复检。安装检查没有创建 E2B 云电脑。[Windows 安装入口](../distribution/windows/README.md)
 - 在独立临时目录载入官方 `@deepseek-ai/dsh-mcp-client@0.2.2-rc.5`、Cordis 和 DSH 的 ToolsService。官方探测接口从 DeskLatch 的 stdio 服务列出 `observe` 和 `act`。随后实际挂载插件，在 DSH 工具注册表取得带 `mcp__desklatch__` 前缀的两个工具。测试程序经注册的 `act` 写入本机隔离 Chromium 的 Title 字段，得到 `verified`，再经注册的 `observe` 独立读回相同值。这是 DSH 工具调用试验，托管 E2B 的真实模型试验使用 LangGraph。DSH 的模型看图还取决于路由的模型能力及其附件功能。[DSH 官方 MCP 客户端](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/mcp/mcp-client/README.md)
 - 另用 DSH 的原生插件方式，在同一个 Cordis 宿主分别挂载系统提示词、工具注册表、官方原生执行器和 DeskLatch 插件。官方 testkit 将测试参数作为工具调用送入实际执行器。调用 `desklatch_act` 写入并核验真实 Chromium 字段，`desklatch_observe` 读回控件。模拟发送停在审批处，宿主拒绝后页面发送次数为 0。卸载后工具被移除，会话关闭一次。此路径直接调用宿主进程里的 DeskLatch 会话。[DSH 原生执行器](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/core/tool-executor-native/README.md)
+- 使用 DSH 官方 `AgentLoop` 完成一次真实模型验收。给 Agent 一条填写测试表单的文字任务，由智谱 `glm-5.3-flash` 自行调用 `desklatch_observe` 和 `desklatch_act`。共三次模型请求、一次浏览器动作。DSH 会话中记录了工具调用和结果，从隔离 Chromium 独立读取的字段值与目标一致。离线回归用确定性模型覆盖同一原生循环与插件连接。[DSH 官方循环](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/core/agent-loop/README.md)
 
 ## 本地取证
 
@@ -118,6 +144,6 @@ Windows 原生测试可通过 PowerShell 设置 `$env:DESKLATCH_WINDOWS_LIVE='1'
 
 ## 复跑
 
-仓库根目录下运行 `npm ci` 和 `npm test`。`npm run verify:package` 使用已缓存的依赖离线验证打包产物。真实模型试验需在宿主进程配置 `ZHIPU_API_KEY` 后运行 `npm run verify:zhipu`。`DESKLATCH_CHROMIUM` 可指向已安装的 Chromium。每次模型试验独立输出请求次数、图片数、实际工具轨迹、各步回执及页面核验结果。[真实模型试验](../examples/zhipu-acceptance.mjs)
+仓库根目录下运行 `npm ci` 和 `npm test`。`npm run verify:package` 使用已缓存的依赖离线验证打包产物。`npm run verify:package -- --with-e2b` 另外验证 E2B SDK 的选装，需要能访问 npm 源。真实模型试验需在宿主进程配置 `ZHIPU_API_KEY` 后运行 `npm run verify:zhipu`。`DESKLATCH_CHROMIUM` 可指向已安装的 Chromium。每次模型试验独立输出请求次数、图片数、实际工具轨迹、各步回执及页面核验结果。[真实模型试验](../examples/zhipu-acceptance.mjs)
 
 托管云测还需 `E2B_API_KEY`。`npm run verify:zhipu -- e2b` 复跑固定图片条件，`npm run verify:zhipu -- e2b-choice` 复跑自主选择条件，也可追加 `choice-named`、`choice-discovery`、`choice-visible` 或 `choice-visual` 单测一项。每条命令创建一台沙箱，各题使用独立浏览器会话，最后释放沙箱并复查运行记录。

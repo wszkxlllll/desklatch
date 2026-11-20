@@ -122,6 +122,8 @@ export function errorText(error: unknown): string {
 export interface DeskToolHost {
   readonly tools: readonly ToolEndpoint[];
   close(): void | Promise<void>;
+  resolveApproval?(requestId: string, decision: "approve" | "deny"): Promise<unknown>;
+  cancel?(reason?: string): void;
 }
 
 export type DeskToolSource = (DesktopToolSession & { close(): void | Promise<void> }) | DeskToolHost;
@@ -130,8 +132,22 @@ export type DeskToolSource = (DesktopToolSession & { close(): void | Promise<voi
 export function resolveDeskToolHost(source: DeskToolSource): DeskToolHost {
   if (typeof source === "object" && source !== null && "tools" in source && Array.isArray(source.tools)) {
     const host = source as DeskToolHost;
-    return { tools: normalizeEndpoints(host.tools), close: host.close.bind(host) };
+    return {
+      tools: normalizeEndpoints(host.tools),
+      close: host.close.bind(host),
+      ...(host.resolveApproval ? { resolveApproval: host.resolveApproval.bind(host) } : {}),
+      ...(host.cancel ? { cancel: host.cancel.bind(host) } : {}),
+    };
   }
-  const session = source as DesktopToolSession & { close(): void | Promise<void> };
-  return { tools: createDeskTools(session), close: session.close.bind(session) };
+  const session = source as DesktopToolSession & {
+    close(): void | Promise<void>;
+    resolveApproval?: (requestId: string, decision: "approve" | "deny") => Promise<unknown>;
+    cancel?: (reason?: string) => void;
+  };
+  return {
+    tools: createDeskTools(session),
+    close: session.close.bind(session),
+    ...(session.resolveApproval ? { resolveApproval: session.resolveApproval.bind(session) } : {}),
+    ...(session.cancel ? { cancel: session.cancel.bind(session) } : {}),
+  };
 }

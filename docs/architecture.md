@@ -11,7 +11,9 @@
 
 定位使用当前界面。Plan、跨任务 Memory、Skill 和模型客户端由调用方管理。核心导入路径独立于 LangGraph、Agents SDK、MCP、Playwright、E2B 和本机 CUA。各框架适配器把同一对工具转换为该框架的原生工具。MCP 是跨进程协议，LangGraph 和 Agents SDK 分别保留各自的运行循环。
 
-DSH 有两条接入路径。直接加载 Cordis 插件时，宿主通过 `openSession` 提供一份专属于此次挂载的已授权会话，工具在同一进程注册和执行，卸载时释放会话。这个适配器复用 DSH 官方的工具结果及附件转换函数。使用 MCP 时，由 DSH 官方客户端通过 stdio 连接 DeskLatch 服务。两种路径都由宿主管理配对、模型和人工批准决定，E2B 云电脑只提供执行环境。
+DSH 有两条接入路径。直接加载 Cordis 插件时，宿主通过 `openSession` 提供一份专属于此次挂载的已授权会话，工具在同一进程注册和执行，卸载时释放会话。这个适配器复用 DSH 官方的工具结果及附件转换函数，Agent 循环、模型和审批卡仍由 DSH 拥有。使用 MCP 时，由 DSH 官方客户端通过 stdio 连接 DeskLatch 服务，适合需要进程隔离或已有 MCP 编排的宿主。两种路径都由宿主管理配对、模型和人工批准决定，E2B 云电脑只提供执行环境。
+
+发布物也按这两个边界区分。普通 `desklatch-<version>.tgz` 是不带框架的核心包，宿主自行选择 MCP、原生 DSH 或其他框架并提供对应 peer。`desklatch-dsh-<version>.tgz` 是官方 DSH bundle：它通过 `dsh.bundle.patch` 挂载 `createDeskDshPlugin`，同时携带自己的 DeskLatch 核心、固定的 `playwright-core` 和正常运行时依赖；Cordis 保留为 peer 以避免重复上下文。使用 `dsh plugin --profile <name> add <bundle.tgz>` 即可让 DSH 读取 patch，不需要手写或修改 profile 的 `cordis.patch.yml`。基础 demo 只创建隔离的 headless Chromium 会话，不启用 E2B 或 OCR，也不下载浏览器。
 
 ## 多个应用共用的工作区
 
