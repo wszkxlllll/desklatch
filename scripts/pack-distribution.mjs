@@ -75,7 +75,10 @@ async function copyBundleSource(stage) {
 }
 
 async function copyWindowsSetup(destination) {
-  for (const name of ["install.cmd", "install.ps1", "node-runtime.ps1", "python-runtime.ps1", "README.md"]) {
+  for (const name of [
+    "install.cmd", "install.ps1", "setup-common.ps1", "node-runtime.ps1", "python-runtime.ps1",
+    "DeskLatch-Uninstall.cmd", "DeskLatch-Uninstall.ps1", "README.md",
+  ]) {
     const source = (await readFile(join(sourceWindows, name), "utf8")).replace(/^\uFEFF/u, "");
     if (name.endsWith(".cmd")) {
       assert.match(source, /^[\u0000-\u007F]*$/u, `${name} must load on cmd.exe without a code-page change`);

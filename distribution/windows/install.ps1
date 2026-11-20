@@ -23,6 +23,7 @@ $script:LogSink = $null
 $script:LogBox = $null
 $script:ProgressBar = $null
 
+. (Join-Path $PSScriptRoot "setup-common.ps1")
 . (Join-Path $PSScriptRoot "node-runtime.ps1")
 if (Test-Path -LiteralPath (Join-Path $PSScriptRoot "python-runtime.ps1") -PathType Leaf) {
   . (Join-Path $PSScriptRoot "python-runtime.ps1")
@@ -33,22 +34,6 @@ function Get-DefaultInstallRoot {
     return [IO.Path]::GetFullPath($env:DESKLATCH_INSTALL_ROOT)
   }
   return (Join-Path $script:DistributionRoot "installed")
-}
-
-function Resolve-TargetPath([string]$Path) {
-  if ([string]::IsNullOrWhiteSpace($Path)) { throw "An install root is required." }
-  if ($Path.IndexOf([char]0) -ge 0) { throw "The install root contains an invalid character." }
-  return [IO.Path]::GetFullPath($Path)
-}
-
-function Redact-Output([string]$Text) {
-  if ($null -eq $Text) { return "" }
-  return [regex]::Replace($Text, '(?im)(E2B_API_KEY|OPENAI_API_KEY|DEEPSEEK_API_KEY|[A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD)[A-Z0-9_]*)\s*[=:]\s*[^\s;]+', '$1=<redacted>')
-}
-
-function Write-InstallLog([string]$Message) {
-  $safe = Redact-Output $Message
-  if ($script:LogSink) { & $script:LogSink $safe } else { Write-Host $safe }
 }
 
 function Get-Artifact([bool]$Dsh) {
@@ -63,70 +48,9 @@ function Get-Artifact([bool]$Dsh) {
   return $files | Where-Object { $_.Name -like "desklatch-*.tgz" -and $_.Name -notlike "desklatch-dsh-*.tgz" } | Sort-Object Name | Select-Object -Last 1
 }
 
-function Resolve-DshExecutable([string]$Requested) {
-  if ($Requested -and (Test-Path -LiteralPath $Requested -PathType Leaf)) { return [IO.Path]::GetFullPath($Requested) }
-  if ($env:DESKLATCH_DSH_CMD -and (Test-Path -LiteralPath $env:DESKLATCH_DSH_CMD -PathType Leaf)) { return [IO.Path]::GetFullPath($env:DESKLATCH_DSH_CMD) }
-  $command = Get-Command dsh.cmd -ErrorAction SilentlyContinue
-  if ($command) { return $command.Source }
-  foreach ($base in @($env:LOCALAPPDATA, $env:ProgramFiles, ${env:ProgramFiles(x86)}) | Where-Object { $_ }) {
-    $candidate = Join-Path $base "DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd"
-    if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
-  }
-  return $null
-}
-
-function Assert-DshClosed {
-  $running = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -in @("DeepSeek Harness", "DeepSeekHarness", "DeepSeekHarnessDesktop") })
-  if ($running.Count -gt 0) { throw "请从系统托盘完全退出 DeepSeek Harness，再管理 DeskLatch 插件。" }
-}
-
-function Quote-WindowsArgument([string]$Value) {
-  if ($null -eq $Value -or $Value.Length -eq 0) { return '""' }
-  $escaped = [regex]::Replace($Value, '(\\*)"', '$1$1\"')
-  $escaped = [regex]::Replace($escaped, '(\\+)$', '$1$1')
-  return '"' + $escaped + '"'
-}
-
-function Invoke-External {
-  param([Parameter(Mandatory = $true)][string]$File, [Parameter(Mandatory = $true)][string[]]$Arguments,
-    [Parameter(Mandatory = $true)][string]$WorkingDirectory, [hashtable]$Environment = @{}, [string]$Label = "command")
-  $actualFile = $File
-  $actualArguments = @($Arguments)
-  $commandLine = $null
-  if ([IO.Path]::GetExtension($File).ToLowerInvariant() -eq ".cmd") {
-    $commandText = "call " + (Quote-WindowsArgument $File) + " " + (($Arguments | ForEach-Object { Quote-WindowsArgument ([string]$_) }) -join " ")
-    $actualFile = $env:ComSpec
-    $commandLine = "/d /s /c " + $commandText
-  }
-  Write-InstallLog ("Running " + $Label + ": " + $File + " " + (($Arguments | ForEach-Object { Quote-WindowsArgument ([string]$_) }) -join " "))
-  $start = New-Object Diagnostics.ProcessStartInfo
-  $start.FileName = $actualFile
-  $start.Arguments = if ($commandLine) { $commandLine } else { ($actualArguments | ForEach-Object { Quote-WindowsArgument ([string]$_) }) -join " " }
-  $start.WorkingDirectory = $WorkingDirectory
-  $start.UseShellExecute = $false
-  $start.CreateNoWindow = $true
-  $start.RedirectStandardOutput = $true
-  $start.RedirectStandardError = $true
-  $start.StandardOutputEncoding = [Text.UTF8Encoding]::new($false)
-  $start.StandardErrorEncoding = [Text.UTF8Encoding]::new($false)
-  foreach ($key in $Environment.Keys) { $start.EnvironmentVariables[$key] = [string]$Environment[$key] }
-  $process = New-Object Diagnostics.Process
-  $process.StartInfo = $start
-  if (-not $process.Start()) { throw ("Could not start " + $Label + ".") }
-  $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-  $stderrTask = $process.StandardError.ReadToEndAsync()
-  $process.WaitForExit()
-  $stdout = $stdoutTask.Result
-  $stderr = $stderrTask.Result
-  if ($stdout) { Write-InstallLog $stdout.TrimEnd() }
-  if ($stderr) { Write-InstallLog $stderr.TrimEnd() }
-  if ($process.ExitCode -ne 0) { throw ("The " + $Label + " failed with exit code " + $process.ExitCode + ".") }
-  return $stdout
-}
-
 function New-ScopedEnvironment([string]$Root, [string]$DshHome, [pscustomobject]$NodePair) {
   $cache = Join-Path $Root ".desklatch\cache"
-  New-Item -ItemType Directory -Path $cache, (Join-Path $cache "npm"), (Join-Path $cache "pnpm"), (Join-Path $cache "pip"), (Join-Path $cache "tmp") -Force | Out-Null
+  New-Item -ItemType Directory -Path $cache, (Join-Path $cache "npm"), (Join-Path $cache "pip"), (Join-Path $cache "tmp") -Force | Out-Null
   $environment = @{
     PATH = (Split-Path -Parent $NodePair.Node) + [IO.Path]::PathSeparator + $env:PATH
     TEMP = (Join-Path $cache "tmp")
@@ -136,7 +60,6 @@ function New-ScopedEnvironment([string]$Root, [string]$DshHome, [pscustomobject]
     npm_config_fund = "false"
     npm_config_audit = "false"
     npm_config_update_notifier = "false"
-    PNPM_HOME = (Join-Path $cache "pnpm-home")
     PIP_CACHE_DIR = (Join-Path $cache "pip")
   }
   if ($DshHome) { $environment.DSH_HOME = $DshHome }
@@ -168,6 +91,31 @@ function Write-SecretEnvFile([string]$Path, [string]$ApiKey) {
   }
 }
 
+function Install-DshUninstaller([string]$Root, [string]$DshCommand, $Profile) {
+  foreach ($name in @("DeskLatch-Uninstall.cmd", "DeskLatch-Uninstall.ps1", "setup-common.ps1")) {
+    $source = Join-Path $PSScriptRoot $name
+    $destination = Join-Path $Root $name
+    if ($source -ine $destination) { Copy-Item -LiteralPath $source -Destination $destination -Force }
+  }
+  $receipt = Join-Path $Root ".desklatch\windows\dsh-install.json"
+  $settings = @{
+    version = 1
+    dshCommand = $DshCommand
+    dshHome = $Profile.Home
+    dshProfile = $Profile.Name
+  } | ConvertTo-Json
+  $utf8 = [Text.UTF8Encoding]::new($false, $true)
+  $temporary = $receipt + "." + [guid]::NewGuid().ToString("N") + ".tmp"
+  try {
+    [IO.File]::WriteAllText($temporary, $settings, $utf8)
+    $readBack = [IO.File]::ReadAllText($temporary, $utf8)
+    if ($readBack -cne $settings -or $readBack -match '[\uFFFD]|\?{3,}') { throw "无法保存 DSH 安装记录。" }
+    Move-Item -LiteralPath $temporary -Destination $receipt -Force
+  } finally {
+    if (Test-Path -LiteralPath $temporary -PathType Leaf) { Remove-Item -LiteralPath $temporary -Force }
+  }
+}
+
 function Invoke-SetupFlow {
   param([Parameter(Mandatory = $true)][hashtable]$Options)
   $root = Resolve-TargetPath $Options.InstallRoot
@@ -177,12 +125,13 @@ function Invoke-SetupFlow {
   if (-not $core) { throw "No desklatch-<version>.tgz was found beside the Windows installer. Run the distribution pack step first." }
   $dsh = $null
   $dshCommand = $null
+  $dshProfile = $null
   if ($Options.Route -eq "dsh") {
     $dsh = Get-Artifact $true
     if (-not $dsh) { throw "No desklatch-dsh-<version>.tgz was found beside the Windows installer." }
     $dshCommand = Resolve-DshExecutable $Options.DshCommand
     if (-not $dshCommand) { throw "未找到 DeepSeek Harness。请先安装并启动一次，或在向导中选择 dsh.cmd。" }
-    if ([string]::IsNullOrWhiteSpace($Options.DshProfile)) { throw "请选择 DSH 配置。" }
+    $dshProfile = Resolve-DshProfile $Options.DshHome $Options.DshProfile
     Assert-DshClosed
   }
   New-Item -ItemType Directory -Path $root -Force | Out-Null
@@ -211,7 +160,7 @@ function Invoke-SetupFlow {
   if (($Options.OcrChoice -eq "Install") -and [string]::IsNullOrWhiteSpace($ocrPython) -and (Get-Command Resolve-DeskLatchPython -ErrorAction SilentlyContinue)) {
     $ocrPython = Resolve-DeskLatchPython -InstallRoot $root -Status $status
   }
-  $dshHome = if ($Options.DshHome) { Resolve-TargetPath $Options.DshHome } elseif ($env:DSH_HOME) { $env:DSH_HOME } else { $null }
+  $dshHome = if ($dshProfile) { $dshProfile.Home } else { $null }
   $environment = New-ScopedEnvironment $root $dshHome $nodePair
   $npmArguments = @("install", "--save-exact", "--ignore-scripts", "--no-audit", "--no-fund", $core.FullName)
   Invoke-External -File $nodePair.Node -Arguments (@($nodePair.Npm) + $npmArguments) -WorkingDirectory $root -Environment $environment -Label "npm package installation" | Out-Null
@@ -240,46 +189,18 @@ function Invoke-SetupFlow {
   if ($Options.Route -eq "dsh") {
     Assert-DshClosed
     Write-InstallLog "DSH Desktop must be fully closed before the official profile command runs."
-    $storeDirectory = Join-Path $root ".desklatch\cache\pnpm"
+    $storeDirectory = Get-DshStoreDirectory $dshProfile
+    Install-DshUninstaller $root $dshCommand $dshProfile
     # The bundle uses checked platform binaries and does not need dependency build scripts.
-    Invoke-External -File $dshCommand -Arguments @("plugin", "--profile", $Options.DshProfile, "add", "--ignore-scripts", "--store-dir", $storeDirectory, $dsh.FullName) -WorkingDirectory $root -Environment $environment -Label "official DSH bundle installation" | Out-Null
+    Invoke-External -File $dshCommand -Arguments @("plugin", "--profile", $dshProfile.Name, "add", "--ignore-scripts", "--store-dir", $storeDirectory, $dsh.FullName) -WorkingDirectory $root -Environment $environment -Label "official DSH bundle installation" | Out-Null
     $registerArguments = @($setupScript, "dsh", "--windows", "--register-windows-location", "--bundle", $dsh.FullName)
     Invoke-External -File $nodePair.Node -Arguments $registerArguments -WorkingDirectory $root -Environment $environment -Label "Windows authorization registration" | Out-Null
-    Write-InstallLog ("DSH bundle installed for profile " + $Options.DshProfile + ". Restart DSH to load the native tools.")
+    Write-InstallLog ("DSH bundle installed for profile " + $dshProfile.Name + ". Restart DSH to load the native tools.")
+    Write-InstallLog "需要卸载时，双击安装目录中的 DeskLatch-Uninstall.cmd。"
   } else {
     Write-InstallLog ("MCP configuration written to " + (Join-Path $root "desklatch.mcp.json") + ". Add this server entry to your MCP client; no DSH profile was changed.")
   }
   return $root
-}
-
-function Invoke-DshPluginRemoval([string]$Root, [string]$RequestedCommand, [string]$RequestedHome, [string]$Profile) {
-  Assert-DshClosed
-  if ([string]::IsNullOrWhiteSpace($Profile) -or $Profile -in @(".", "..") -or $Profile -match '[/\\:]') {
-    throw "请选择有效的 DSH 配置名称。"
-  }
-  $homePath = if ($RequestedHome) { Resolve-TargetPath $RequestedHome } elseif ($env:DSH_HOME) { Resolve-TargetPath $env:DSH_HOME } else { Join-Path ([Environment]::GetFolderPath("UserProfile")) ".dsh" }
-  $manifestPath = Join-Path $homePath ("profiles\" + $Profile + "\package.json")
-  if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
-    $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
-    $dependencies = $manifest.PSObject.Properties["dependencies"]
-    if ($dependencies -and $dependencies.Value -and $dependencies.Value.PSObject.Properties["desklatch-dsh"]) {
-      $command = Resolve-DshExecutable $RequestedCommand
-      if (-not $command) { throw "请选择 DeepSeek Harness 的 dsh.cmd。" }
-      $store = Join-Path $Root ".desklatch\cache\pnpm"
-      $arguments = @("plugin", "--profile", $Profile, "remove")
-      if (Test-Path -LiteralPath $store -PathType Container) { $arguments += @("--store-dir", $store) }
-      $arguments += "desklatch-dsh"
-      Invoke-External -File $command -Arguments $arguments -WorkingDirectory $PSScriptRoot -Environment @{ DSH_HOME = $homePath } -Label "DSH DeskLatch plugin removal" | Out-Null
-      $updated = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
-      $remaining = $updated.PSObject.Properties["dependencies"]
-      if ($remaining -and $remaining.Value -and $remaining.Value.PSObject.Properties["desklatch-dsh"]) {
-        throw "DSH 配置中仍登记着 DeskLatch 插件。"
-      }
-      Write-InstallLog "DeskLatch 插件已卸载。"
-      return
-    }
-  }
-  Write-InstallLog "此 DSH 配置中没有 DeskLatch 插件。"
 }
 
 function Show-Plan {
@@ -287,10 +208,14 @@ function Show-Plan {
   Write-Output "DeskLatch Windows installer plan"
   Write-Output ("Install root: " + $root)
   Write-Output ("Default route: " + $(if ($Route) { $Route } else { "mcp or dsh in the GUI" }))
-  Write-Output ("DSH_HOME: " + $(if ($DshHome) { (Resolve-TargetPath $DshHome) } elseif ($env:DSH_HOME) { $env:DSH_HOME } else { "existing DSH default" }))
+  if ($Route -eq "dsh") {
+    $profile = Resolve-DshProfile $DshHome $DshProfile
+    Write-Output ("DSH_HOME: " + $profile.Home)
+    Write-Output ("DSH pnpm store: " + (Get-DshStoreDirectory $profile))
+  }
   Write-Output "Optional E2B: Skip by default; choose Install or Existing in the GUI."
   Write-Output "Optional OCR: Skip by default; choose Install or Existing in the GUI."
-  Write-Output "Project, npm/pip/pnpm cache, and temp writes are scoped to the install root. DSH uses its existing DSH_HOME unless -DshHome is supplied."
+  Write-Output "DeskLatch and its npm/pip cache use the install root. DSH reuses the profile's pnpm store."
   Write-Output "No command was run and no existing DSH profile was changed."
   $core = Get-Artifact $false
   $dsh = Get-Artifact $true
@@ -413,10 +338,6 @@ function Start-Gui {
   $copyButton = New-Object Windows.Forms.Button
   $copyButton.Text = "复制 MCP 配置"; $copyButton.Location = New-Object Drawing.Point(20, 552); $copyButton.Size = New-Object Drawing.Size(135, 30); $copyButton.Visible = $false
   $form.Controls.Add($copyButton)
-  $removeButton = New-Object Windows.Forms.Button
-  $removeButton.Text = "卸载插件"; $removeButton.Location = New-Object Drawing.Point(165, 552); $removeButton.Size = New-Object Drawing.Size(110, 30)
-  $form.Controls.Add($removeButton)
-
   $updateState = {
     $isDsh = $dshRadio.Checked
     foreach ($control in @($dshPathLabel, $dshPathBox, $dshPathBrowse)) { $control.Visible = $isDsh -and -not $detectedDsh }
@@ -430,7 +351,7 @@ function Start-Gui {
   $dshRadio.Add_CheckedChanged($updateState); $mcpRadio.Add_CheckedChanged($updateState); $e2bCombo.Add_SelectedIndexChanged($updateState); $ocrCombo.Add_SelectedIndexChanged($updateState); & $updateState
 
   $script:LogSink = { param([string]$Message) if ($script:LogBox -and -not $script:LogBox.IsDisposed) { $script:LogBox.AppendText($Message + [Environment]::NewLine) } }
-  $state = @{ Process = $null; OutputTask = $null; ErrorTask = $null; Operation = $null; Route = $null; McpConfig = $null; InstalledRoot = $null }
+  $state = @{ Process = $null; OutputTask = $null; ErrorTask = $null; Route = $null; McpConfig = $null; InstalledRoot = $null }
   $copyButton.Add_Click({
     try { [Windows.Forms.Clipboard]::SetText([IO.File]::ReadAllText($state.McpConfig, [Text.Encoding]::UTF8)); $copyButton.Text = "配置已复制" }
     catch { [Windows.Forms.MessageBox]::Show($form, "复制失败。可在安装目录打开 desklatch.mcp.json。", "DeskLatch 安装") | Out-Null }
@@ -451,15 +372,7 @@ function Start-Gui {
       $script:ProgressBar.Visible = $false
       $startButton.Enabled = $true
       $closeButton.Enabled = $true
-      $removeButton.Enabled = $true
-      if ($state.Operation -eq "remove") {
-        if ($state.Process.ExitCode -eq 0) {
-          $message = if ($stdout -match 'DeskLatch 插件已卸载') { "DeskLatch 插件已卸载。" } else { "此 DSH 配置中没有 DeskLatch 插件。" }
-          [Windows.Forms.MessageBox]::Show($form, $message, "DeskLatch 插件卸载", [Windows.Forms.MessageBoxButtons]::OK, [Windows.Forms.MessageBoxIcon]::Information) | Out-Null
-        } else {
-          [Windows.Forms.MessageBox]::Show($form, "卸载失败。请查看向导日志。", "DeskLatch 插件卸载", [Windows.Forms.MessageBoxButtons]::OK, [Windows.Forms.MessageBoxIcon]::Error) | Out-Null
-        }
-      } elseif ($state.Process.ExitCode -eq 0) {
+      if ($state.Process.ExitCode -eq 0) {
         $authorizeButton.Enabled = Test-Path -LiteralPath (Join-Path $state.InstalledRoot "DeskLatch-Authorize.cmd") -PathType Leaf
         $nextStep = if ($state.Route -eq "dsh") { "打开授权页选择应用，再重新打开 DeepSeek Harness。关键动作会在 DSH 会话中请求确认。" } else { "打开授权页选择应用，再复制 MCP 配置到你的客户端。关键动作会弹出 Windows 审批窗口。" }
         if ($stdout -match 'OCR \(ready\)') { $nextStep += " 使用本地 OCR 时，请在授权页开启截图权限。" }
@@ -476,7 +389,7 @@ function Start-Gui {
   })
   $form.Add_FormClosing({ param($sender, $eventArgs) if ($state.Process) { $eventArgs.Cancel = $true; [Windows.Forms.MessageBox]::Show($form, "操作仍在进行，请等待完成后再关闭窗口。", "DeskLatch 向导", [Windows.Forms.MessageBoxButtons]::OK, [Windows.Forms.MessageBoxIcon]::Information) | Out-Null } })
 
-  function Start-SetupWorker([string[]]$ChildArgs, [string]$WorkingDirectory, [string]$Operation) {
+  function Start-SetupWorker([string[]]$ChildArgs, [string]$WorkingDirectory) {
     $start = New-Object Diagnostics.ProcessStartInfo
     $start.FileName = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
     $start.Arguments = ($ChildArgs | ForEach-Object { Quote-WindowsArgument ([string]$_) }) -join " "
@@ -491,36 +404,14 @@ function Start-Gui {
     $worker.StartInfo = $start
     if (-not $worker.Start()) { throw "无法启动 DeskLatch 向导进程。" }
     $state.Process = $worker
-    $state.Operation = $Operation
     $state.OutputTask = $worker.StandardOutput.ReadToEndAsync()
     $state.ErrorTask = $worker.StandardError.ReadToEndAsync()
     $startButton.Enabled = $false
     $closeButton.Enabled = $false
-    $removeButton.Enabled = $false
     $script:ProgressBar.Visible = $true
     $timer.Start()
   }
 
-  $removeButton.Add_Click({
-    if ($state.Process) { return }
-    try {
-      Assert-DshClosed
-      $command = Resolve-DshExecutable $dshPathBox.Text
-      if (-not $command) {
-        $dialog = New-Object Windows.Forms.OpenFileDialog
-        $dialog.Title = "选择 DeepSeek Harness 的 dsh.cmd"
-        $dialog.Filter = "DSH 启动文件 (dsh.cmd)|dsh.cmd"
-        if ($dialog.ShowDialog($form) -ne [Windows.Forms.DialogResult]::OK) { return }
-        $command = $dialog.FileName
-      }
-      $confirm = [Windows.Forms.MessageBox]::Show($form, "从 DSH 的 $DshProfile 配置卸载 DeskLatch 插件？", "卸载插件", [Windows.Forms.MessageBoxButtons]::YesNo, [Windows.Forms.MessageBoxIcon]::Question)
-      if ($confirm -ne [Windows.Forms.DialogResult]::Yes) { return }
-      $childArgs = @("-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $PSCommandPath, "-NoGui", "-RemoveDshPlugin", "-InstallRoot", (Resolve-TargetPath $rootBox.Text), "-DshCommand", $command, "-DshProfile", $DshProfile)
-      if ($DshHome) { $childArgs += @("-DshHome", $DshHome) }
-      Start-SetupWorker $childArgs $PSScriptRoot "remove"
-      $script:LogBox.AppendText("正在卸载 DeskLatch 插件。`r`n")
-    } catch { [Windows.Forms.MessageBox]::Show($form, $_.Exception.Message, "DeskLatch 插件卸载", [Windows.Forms.MessageBoxButtons]::OK, [Windows.Forms.MessageBoxIcon]::Warning) | Out-Null }
-  })
   $startButton.Add_Click({
     if ($state.Process) { return }
     try {
@@ -535,7 +426,7 @@ function Start-Gui {
       $state.Route = $options.Route
       $state.InstalledRoot = Resolve-TargetPath $options.InstallRoot
       $state.McpConfig = Join-Path $state.InstalledRoot "desklatch.mcp.json"
-      Start-SetupWorker $childArgs $state.InstalledRoot "install"
+      Start-SetupWorker $childArgs $state.InstalledRoot
       $authorizeButton.Enabled = $false
       $copyButton.Visible = $false
       $script:LogBox.AppendText("开始安装，请稍候。`r`n")
@@ -547,8 +438,8 @@ function Start-Gui {
 if ($Plan) { Show-Plan; exit 0 }
 if ($RemoveDshPlugin) {
   $root = if ($InstallRoot) { Resolve-TargetPath $InstallRoot } else { Get-DefaultInstallRoot }
-  Invoke-DshPluginRemoval $root $DshCommand $DshHome $DshProfile
-  exit 0
+  & (Join-Path $PSScriptRoot "DeskLatch-Uninstall.ps1") -NoGui -InstallRoot $root -DshCommand $DshCommand -DshHome $DshHome -DshProfile $DshProfile
+  exit $LASTEXITCODE
 }
 if (-not $NoGui -and [Environment]::UserInteractive) { Start-Gui; exit 0 }
 if (-not $Route) { throw "A route is required in non-GUI mode. Use -Route mcp or -Route dsh." }
