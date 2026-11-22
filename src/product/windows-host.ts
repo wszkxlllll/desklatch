@@ -23,6 +23,9 @@ import {
   type WindowsBackgroundSource,
   type WindowsCuaDriver,
   type WindowsDesktopAuthorization,
+  type WindowsGridCommitPolicyEvidence,
+  type WindowsGridEditContext,
+  type WindowsGridEditQuery,
   type WindowsForegroundActivator,
   type WindowsPhysicalInspector,
   type WindowsTransport,
@@ -106,6 +109,7 @@ export async function createWindowsProductHost(options: WindowsProductHostOption
       name: app.name,
       get capabilities() { return productCapabilities(currentGrants); },
       get allowModelImages() { return currentGrants.allowDesktopCapture; },
+       allowObservationProjection: true,
       open: (signal?: AbortSignal) => openGrantedApplication(options, app, signal),
     }));
     entryById.set(app.id, entry);
@@ -274,6 +278,7 @@ async function openProductRuntime(
       ...(useLocalOcr && options.ocr ? { ocr: createWindowsOcrProvider({
         rapidOcr: options.ocr,
         transport: guardedCaptureTransport,
+        captureDesktop: guardedTransport.observeDesktopImage,
         regionForInput: windowsOcrRegion,
         targetForInput: input => selectOcrTarget(options, windows, inspector!, input),
         ...(options.test?.ocrRunner === undefined ? {} : { runner: options.test.ocrRunner }),
@@ -364,6 +369,44 @@ function createGrantGuardedTransport(
       if (!(await verifyTarget(target.window))) return { status: "refused", code: "window_scope_changed" };
       return transport.dispatch(step, target, callOptions);
     },
+    authorizeForegroundHotkey: transport.authorizeForegroundHotkey ? async (target, callOptions) => {
+      // This is intentionally a separate late checkpoint from dispatch: the
+      // native inspector's SendInput route runs outside the CUA transport, so
+      // product grants and exact app-window enrollment must be revalidated
+      // immediately before it is allowed to run.
+      const code = await authorizationLive(true);
+      if (code) return code;
+      if (!(await verifyTarget(target))) return "window_scope_changed";
+      return transport.authorizeForegroundHotkey!(target, callOptions);
+    } : undefined,
+    authorizeWindowPoint: async (target, callOptions) => {
+      const code = await authorizationLive(true, "desktop");
+      if (code) return code;
+      if (!(await verifyTarget(target))) return "window_scope_changed";
+      return transport.authorizeWindowPoint?.(target, callOptions);
+    },
+    authorizeForegroundGridEnter: async (
+      target: WindowsWindowTarget,
+      query: WindowsGridEditQuery & { readonly expected: WindowsGridEditContext },
+      callOptions: { readonly signal?: AbortSignal },
+    ) => {
+      // This late checkpoint is the product-level opt-in for the scoped native
+      // grid Enter path. It repeats the live foreground grant and exact
+      // enrolled-root check after session approval and before the worker's
+      // atomic selection/caret recheck plus one-shot key send.
+      const code = await authorizationLive(true);
+      if (code) return code;
+      if (!(await verifyTarget(target))) return "window_scope_changed";
+      const expected = query.expected;
+      if (!expected.focus.focused || expected.focus.pid !== target.pid || expected.focus.hwnd !== target.hwnd
+        || !expected.selectedItem.selected || !expected.selectedItem.runtimeId
+        || expected.editor.runtimeId !== expected.focus.runtimeId || expected.editor.hwnd === target.hwnd
+        || !Number.isFinite(query.point.x) || !Number.isFinite(query.point.y)) return "grid_commit_proof_invalid";
+      if (transport.authorizeForegroundGridEnter) {
+        return transport.authorizeForegroundGridEnter(target, query, callOptions);
+      }
+      return undefined;
+    },
     bringToFront: transport.bringToFront ? async (target, callOptions) => {
       const code = await authorizationLive(true);
       if (code) return { status: "refused", code };
@@ -401,7 +444,8 @@ function createGrantGuardedBackend(
       if (!authorization.ok) throw productError(authorization.code);
       return backend.observe(request);
     },
-    hitTest: backend.hitTest ? (frame, point, signal) => backend.hitTest!(frame, point, signal) : undefined,
+    hitTest: backend.hitTest ? (frame, point, signal, kind) => backend.hitTest!(frame, point, signal, kind) : undefined,
+    clearExecutionState: backend.clearExecutionState ? signal => backend.clearExecutionState!(signal) : undefined,
     dispatch: async (request: Dispatch): Promise<Delivery> => {
       const authorization = await authorizationLive();
       if (!authorization.ok) return { status: "refused", code: authorization.code };
@@ -431,14 +475,19 @@ function wrapProductSession(
     get capabilities() { return getSession().capabilities; },
     get allowModelImages() { return getSession().allowModelImages; },
     get allowModelDocumentText() { return getSession().allowModelDocumentText; },
+    get supportsObservationProjection() { return getSession().supportsObservationProjection; },
     get limits() { return getSession().limits; },
     observe: async (input?: DeskObserveOptions): Promise<DeskObservation> => {
-      if (!(await grantLive())) throw productError("application_automation_blocked");
+      if (!(await grantLive())) {
+        getSession().invalidateObservationSnapshots?.();
+        throw productError("application_automation_blocked");
+      }
       await beforeOperation?.(input?.signal);
       return getSession().observe(input);
     },
     act: async (input: unknown, signal?: AbortSignal, actOptions?: DeskSessionActOptions): Promise<ActResult> => {
       if (!(await grantLive())) {
+        getSession().invalidateObservationSnapshots?.();
         for (const requestId of pendingApprovals.keys()) await denyPendingApproval(requestId);
         return { status: "stopped", code: "application_automation_blocked", steps: stepsForInput(input) };
       }
@@ -462,6 +511,7 @@ function wrapProductSession(
     },
     correct: (reason?: string) => getSession().correct(reason),
     cancel: (reason?: string) => getSession().cancel(reason),
+    invalidateObservationSnapshots: () => getSession().invalidateObservationSnapshots?.(),
     close: closeProduct,
   };
 
@@ -488,14 +538,62 @@ function allowsLocalWindowEvidence(grants: WindowsProductGrants): boolean {
   return grants.allowLocalWindowEvidence ?? grants.allowDesktopCapture;
 }
 
-function officeSaveApproval({ step, target }: RiskInput): { match: true; code: string } | false {
+function officeSaveApproval(input: RiskInput): { match: true; code: string } | false {
+  const { step, target } = input;
   const caption = target.name?.trim() ?? "";
   const saveButton = step.kind === "click" && /^(?:button|menuitem|menu item)$/iu.test(target.role)
     && /^(?:save|save as|保存|另存为)(?:\s*…|\s*\.\.\.)?$/iu.test(caption);
   const saveShortcut = step.kind === "hotkey" && target.states.includes("focused")
     && /^(?:document|edit|textbox|pane|dataitem|cell)$/iu.test(target.role)
     && /^(?:ctrl\+s|ctrl\+s\+shift)$/u.test(step.keys.map(key => key.toLowerCase().replace(/^control$/u, "ctrl")).sort().join("+"));
-  return saveButton || saveShortcut ? { match: true, code: "office_document_save" } : false;
+  const gridCommit = isVerifiedGridCommitEvidence(input);
+  return saveButton || saveShortcut || gridCommit
+    ? { match: true, code: gridCommit ? "office_grid_commit" : "office_document_save" }
+    : false;
+}
+
+function isVerifiedGridCommitEvidence(input: RiskInput): boolean {
+  const envelope = input.hostEvidence as Record<string, unknown> | undefined;
+  const evidence = envelope?.proof as WindowsGridCommitPolicyEvidence | undefined;
+  const step = input.step;
+  const target = input.target;
+  if (!envelope || envelope.kind !== "focus_handoff" || !evidence || evidence.kind !== "windows_grid_commit"
+    || step.kind !== "keypress" || step.key !== "Enter"
+    || !("focusFromStep" in step.target) || step.target.focusFromStep !== envelope.sourceStep
+    || !Number.isSafeInteger(envelope.sourceStep) || (envelope.sourceStep as number) < 1
+    || !Number.isSafeInteger(envelope.commitStep) || (envelope.commitStep as number) <= (envelope.sourceStep as number)
+    || envelope.binding !== evidence.binding
+    || envelope.sourceControlId !== evidence.sourceControlId
+    || envelope.focusControlId !== evidence.focusControlId
+    || envelope.windowScope !== evidence.windowScope
+    || !target.states.includes("focused") || target.enterMaySubmit === true
+    || !evidence.binding || evidence.binding.length > 128
+    || !evidence.sourceControlId || !evidence.focusControlId || evidence.focusControlId !== target.id
+    || !evidence.windowScope || evidence.windowScope !== target.windowScope
+    || !Number.isFinite(evidence.point?.x) || !Number.isFinite(evidence.point?.y)) return false;
+  if (!/^hwnd:\d+:\d+$/u.test(evidence.windowScope)) return false;
+  const scope = /^hwnd:(\d+):(\d+)$/u.exec(evidence.windowScope);
+  if (!scope || Number(scope[1]) !== evidence.context.focus.pid
+    || BigInt(scope[2]) !== evidence.context.focus.hwnd
+    || evidence.context.focus.target.pid !== evidence.context.focus.pid
+    || evidence.context.focus.target.hwnd !== evidence.context.focus.hwnd) return false;
+  const selected = evidence.anchor.selectedItem;
+  const observed = evidence.context.selectedItem;
+  return evidence.selectedItem.runtimeId === selected.runtimeId
+    && evidence.selectedItem.runtimeId === observed.runtimeId
+    && evidence.selectedItem.role === selected.role
+    && evidence.selectedItem.name === selected.name
+    && observed.selected === true
+    && evidence.anchor.gridPath.length >= 2
+    && evidence.anchor.gridPath.at(-1) === evidence.anchor.gridRuntimeId
+    && evidence.anchor.row >= 0 && Number.isSafeInteger(evidence.anchor.row)
+    && evidence.anchor.column >= 0 && Number.isSafeInteger(evidence.anchor.column)
+    && evidence.context.editor.runtimeId === evidence.context.focus.runtimeId
+    && evidence.context.editor.hwnd !== evidence.context.focus.hwnd
+    && evidence.context.focus.runtimeId !== undefined
+    && evidence.point.x >= selected.bounds.x && evidence.point.y >= selected.bounds.y
+    && evidence.point.x < selected.bounds.x + selected.bounds.width
+    && evidence.point.y < selected.bounds.y + selected.bounds.height;
 }
 
 async function readGrants(options: WindowsProductHostOptions, file: string): Promise<WindowsProductGrants> {
@@ -555,6 +653,7 @@ async function selectOcrTarget(
     try {
       if (!(await verify(window))) continue;
       const target = toWindowTarget(window);
+      if (input.target.windowScope && input.target.windowScope !== `hwnd:${target.pid}:${target.hwnd}`) continue;
       const evidence = await inspector.read(target, centerRect(region), input.signal);
       if (!evidence?.visible || evidence.minimized || evidence.bounds === undefined) continue;
       if (!containsRect(evidence.bounds, region)) continue;

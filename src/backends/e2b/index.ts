@@ -232,13 +232,17 @@ export async function createE2BBrowserBackend(guest: E2BGuest, options: E2BBrows
   try {
     // Playwright actionability and delivery span multiple round trips to the guest.
     const scoped = createBrowserBackend(managed.page, { ...options.browser,
+      skipPostNavigationFocusRefresh: options.browser?.skipPostNavigationFocusRefresh ?? true,
+      preferMouseNavigationClick: options.browser?.preferMouseNavigationClick ?? true,
       actionTimeoutMs: options.browser?.actionTimeoutMs ?? 15_000 });
     // Preserve method receivers; the caller owns the enclosing sandbox.
     return {
       allowDocumentText: scoped.allowDocumentText,
+      supportsScopedRefRefresh: scoped.supportsScopedRefRefresh,
+      hitTestSnapshot: scoped.hitTestSnapshot,
       capabilities: scoped.capabilities,
       observe: o => scoped.observe(o),
-      ...(scoped.hitTest ? { hitTest: (f, p, s) => scoped.hitTest!(f, p, s) } : {}),
+      ...(scoped.hitTest ? { hitTest: scoped.hitTest.bind(scoped) } : {}),
       dispatch: r => scoped.dispatch(r),
       close: async () => { try { await scoped.close(); } finally { await managed.close(); } },
     };
@@ -249,6 +253,7 @@ export {
   createE2BDesktopBackend,
   E2BAtSpiCommandWorker,
   E2BX11RecipientProcess,
+  E2B_X11_SCROLL_MAX_AMOUNT,
 } from "./desktop.js";
 export type {
   E2BAtSpiWorker,

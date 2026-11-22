@@ -18,7 +18,10 @@ test("E2B product workspace resolves its pinned SDK without allocating until act
 
     const product = createE2BProductWorkspace({ installationRoot: root, apiKey: "credential-must-not-escape" });
     assert.deepEqual(product.applications.map(application => application.id), ["e2b-writer", "e2b-browser"]);
-    assert.equal(product.applications.find(application => application.id === "e2b-writer").capabilities.some(capability => capability.kind === "type"), true);
+    const writer = product.applications.find(application => application.id === "e2b-writer");
+    assert.equal(writer.capabilities.some(capability => capability.kind === "type"), true);
+    assert.equal(writer.capabilities.some(capability => capability.kind === "click" && capability.targets.includes("point")), true);
+    assert.equal(writer.capabilities.some(capability => capability.kind === "type" && capability.targets.includes("focus")), true);
     assert.equal(product.applications.find(application => application.id === "e2b-browser").allowNavigation, true);
     await product.close();
 

@@ -173,6 +173,10 @@ export class NativeUiAutomationWindowsTransport implements WindowsTransport {
   async dispatch(step: Step, target: WindowsDispatchTarget, options: { readonly signal?: AbortSignal }): Promise<WindowsTransportDelivery> {
     this.assertOpen();
     options.signal?.throwIfAborted();
+    // Native UIA has only token-bound Invoke/ValuePattern routes. A point
+    // target must never be silently rewritten into selector Invoke; callers
+    // need the CUA coordinate lane (with its fresh capture/physical checks).
+    if (target.coordinate === true) return { status: "refused", code: "native_uia_coordinate_unsupported" };
     if (target.foreground) return { status: "refused", code: "native_uia_foreground_unsupported" };
     const control = target.control;
     if (!control || !control.token) return { status: "refused", code: "native_uia_target_unavailable" };

@@ -1,5 +1,7 @@
 $ErrorActionPreference = "Stop"
 $SelectorMatchLimit = 8
+$script:PointerLinkAttributeChecked = $false
+$script:PointerLinkAttributeValue = $null
 
 # This helper is a fixed, packaged worker. It accepts one bounded UTF-8 JSON
 # request and emits one bounded UTF-8 JSON reply. It never receives captions,
@@ -24,40 +26,26 @@ function CaptureDesktop([object] $request) {
   if ($width -lt 1 -or $height -lt 1 -or [long]$width * $height -gt 40000000) {
     return ErrorReply "desktop_capture_invalid_size"
   }
-  # The parent works in the logical coordinate space returned by user32.
-  # Sample the actual display pixels here, then scale the entire primary
-  # display to that same logical grid before exposing the screenshot.
+  # The parent and pointer inspector both use primary-display physical pixels.
   $prior = [NativeWindowScope]::SetThreadDpiAwarenessContext([IntPtr](-4))
   if ($prior -eq [IntPtr]::Zero) { return ErrorReply "desktop_capture_dpi_unavailable" }
   $pixels = $null
   $reader = $null
-  $scaled = $null
-  $writer = $null
   $stream = $null
   try {
     $pixelWidth = [NativeWindowScope]::GetSystemMetrics(0)
     $pixelHeight = [NativeWindowScope]::GetSystemMetrics(1)
-    if ($pixelWidth -lt 1 -or $pixelHeight -lt 1 -or [long]$pixelWidth * $pixelHeight -gt 40000000) {
-      return ErrorReply "desktop_capture_invalid_size"
+    if ($pixelWidth -ne $width -or $pixelHeight -ne $height) {
+      return ErrorReply "desktop_capture_geometry_changed"
     }
     $pixels = [Drawing.Bitmap]::new($pixelWidth, $pixelHeight)
     $reader = [Drawing.Graphics]::FromImage($pixels)
     $reader.CopyFromScreen(0, 0, 0, 0, [Drawing.Size]::new($pixelWidth, $pixelHeight))
     $stream = [IO.MemoryStream]::new()
-    if ($pixelWidth -eq $width -and $pixelHeight -eq $height) {
-      $pixels.Save($stream, [Drawing.Imaging.ImageFormat]::Jpeg)
-    } else {
-      $scaled = [Drawing.Bitmap]::new($width, $height)
-      $writer = [Drawing.Graphics]::FromImage($scaled)
-      $writer.InterpolationMode = [Drawing.Drawing2D.InterpolationMode]::HighQualityBilinear
-      $writer.DrawImage($pixels, 0, 0, $width, $height)
-      $scaled.Save($stream, [Drawing.Imaging.ImageFormat]::Jpeg)
-    }
+    $pixels.Save($stream, [Drawing.Imaging.ImageFormat]::Jpeg)
     return [ordered]@{ ok = $true; width = $width; height = $height; data = [Convert]::ToBase64String($stream.ToArray()) }
   } finally {
     if ($stream) { $stream.Dispose() }
-    if ($writer) { $writer.Dispose() }
-    if ($scaled) { $scaled.Dispose() }
     if ($reader) { $reader.Dispose() }
     if ($pixels) { $pixels.Dispose() }
     [void][NativeWindowScope]::SetThreadDpiAwarenessContext($prior)
@@ -646,6 +634,902 @@ function Dispatch([object] $request) {
   return ErrorReply "native_uia_action_not_supported"
 }
 
+function GridNumber([object] $value) {
+  if ($null -eq $value -or $value -is [bool]) { throw "native_grid_request_invalid" }
+  $number = 0.0
+  if (-not [double]::TryParse([string]$value, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$number)) {
+    throw "native_grid_request_invalid"
+  }
+  if ([double]::IsNaN($number) -or [double]::IsInfinity($number)) { throw "native_grid_request_invalid" }
+  return $number
+}
+
+function GridPoint([object] $request) {
+  if ($null -eq $request.point) { throw "native_grid_request_invalid" }
+  $xValue = GridNumber $request.point.x
+  $yValue = GridNumber $request.point.y
+  if ($xValue -lt [int]::MinValue -or $xValue -gt [int]::MaxValue -or $yValue -lt [int]::MinValue -or $yValue -gt [int]::MaxValue) {
+    throw "native_grid_request_invalid"
+  }
+  return [pscustomobject]@{
+    x = [int][Math]::Round($xValue, [MidpointRounding]::AwayFromZero)
+    y = [int][Math]::Round($yValue, [MidpointRounding]::AwayFromZero)
+  }
+}
+
+function GridRect([object] $value) {
+  if ($null -eq $value) { throw "native_grid_request_invalid" }
+  $x = GridNumber $value.x
+  $y = GridNumber $value.y
+  $width = GridNumber $value.width
+  $height = GridNumber $value.height
+  if ($width -le 0 -or $height -le 0 -or $width -gt 1000000 -or $height -gt 1000000) { throw "native_grid_request_invalid" }
+  return [pscustomobject]@{ x = $x; y = $y; width = $width; height = $height }
+}
+
+function GridItemRequest([object] $value, [bool] $requireRuntimeId) {
+  if ($null -eq $value) { throw "native_grid_request_invalid" }
+  $role = [string]$value.role
+  $normalizedRole = NormalizeGridRole $role
+  if ($normalizedRole -notin @("dataitem", "cell", "gridcell")) { throw "native_grid_item_role_invalid" }
+  $name = $null
+  if ($null -ne $value.PSObject.Properties["name"]) {
+    $name = [string]$value.name
+    if ($name.Length -gt 4096) { throw "native_grid_request_invalid" }
+  }
+  $runtimeId = ""
+  if ($null -ne $value.PSObject.Properties["runtime_id"]) { $runtimeId = [string]$value.runtime_id }
+  elseif ($null -ne $value.PSObject.Properties["runtimeId"]) { $runtimeId = [string]$value.runtimeId }
+  if ($runtimeId.Length -gt 1024 -or ($requireRuntimeId -and $runtimeId.Length -eq 0)) { throw "native_grid_request_invalid" }
+  return [pscustomobject]@{
+    role = $role
+    normalized_role = $normalizedRole
+    name = $name
+    runtime_id = $runtimeId
+    bounds = (GridRect $value.bounds)
+  }
+}
+
+function NormalizeGridRole([string] $role) {
+  if ($null -eq $role) { return "" }
+  $normalized = $role.Trim()
+  if ($normalized.StartsWith("ControlType.", [StringComparison]::OrdinalIgnoreCase)) { $normalized = $normalized.Substring(12) }
+  return ($normalized.ToLowerInvariant() -replace "[ _-]", "")
+}
+
+function GridRoleMatches([string] $actual, [object] $requested) {
+  return (NormalizeGridRole $actual) -ceq [string]$requested.normalized_role
+}
+
+function GridPhysicalPoint([object] $point) {
+  $native = New-Object 'NativeWindowScope+NativeWindowPoint'
+  $native.X = [int]$point.x
+  $native.Y = [int]$point.y
+  $hit = [NativeWindowScope]::WindowFromPoint($native)
+  if ($hit.ToInt64() -eq 0) { throw "native_grid_point_unavailable" }
+  return $hit
+}
+
+function GridTarget([int] $processId, [IntPtr] $hwnd, [object] $point, [bool] $requireForeground = $true) {
+  if (-not [NativeWindowScope]::IsWindow($hwnd)) { throw "native_grid_target_unavailable" }
+  if (-not [NativeWindowScope]::IsWindowVisible($hwnd) -or [NativeWindowScope]::IsIconic($hwnd)) { throw "native_grid_target_not_visible" }
+  if ([NativeWindowScope]::GetAncestor($hwnd, 2).ToInt64() -ne $hwnd.ToInt64()) { throw "native_grid_target_not_top_level" }
+  $root = RootFor $processId $hwnd
+  $rootIdentity = ElementIdentity $root
+  if ([string]::IsNullOrEmpty($rootIdentity)) { throw "native_grid_identity_unavailable" }
+  $targetRect = New-Object 'NativeWindowScope+NativeWindowRect'
+  if (-not [NativeWindowScope]::GetWindowRect($hwnd, [ref]$targetRect)) { throw "native_grid_target_unavailable" }
+  $x = [int]$point.x
+  $y = [int]$point.y
+  if (($targetRect.Right -le $targetRect.Left -or $targetRect.Bottom -le $targetRect.Top -or
+    $x -lt $targetRect.Left -or $x -ge $targetRect.Right -or $y -lt $targetRect.Top -or $y -ge $targetRect.Bottom)) {
+    throw "native_grid_point_outside_target"
+  }
+  if ($requireForeground) {
+    $foreground = [NativeWindowScope]::GetForegroundWindow()
+    if ($foreground.ToInt64() -ne $hwnd.ToInt64()) { throw "native_grid_foreground_changed" }
+  }
+  $hitHwnd = GridPhysicalPoint $point
+  if ([NativeWindowScope]::GetAncestor($hitHwnd, 2).ToInt64() -ne $hwnd.ToInt64()) { throw "native_grid_target_occluded" }
+  $uiRect = $root.Current.BoundingRectangle
+  if ($uiRect.Width -le 0 -or $uiRect.Height -le 0) { throw "native_grid_physical_evidence_unavailable" }
+  $scaleX = ($targetRect.Right - $targetRect.Left) / [double]$uiRect.Width
+  $scaleY = ($targetRect.Bottom - $targetRect.Top) / [double]$uiRect.Height
+  if ($scaleX -le 0 -or $scaleY -le 0 -or $scaleX -gt 10 -or $scaleY -gt 10) { throw "native_grid_physical_evidence_unavailable" }
+  return [pscustomobject]@{
+    pid = $processId
+    hwnd = $hwnd
+    root = $root
+    root_identity = $rootIdentity
+    target_rect = $targetRect
+    ui_rect = $uiRect
+    scale_x = $scaleX
+    scale_y = $scaleY
+    point = $point
+    hit_hwnd = $hitHwnd
+  }
+}
+
+function GridPointInRect([double] $x, [double] $y, [object] $rect) {
+  return $x -ge [double]$rect.x -and $y -ge [double]$rect.y -and $x -lt ([double]$rect.x + [double]$rect.width) -and $y -lt ([double]$rect.y + [double]$rect.height)
+}
+
+function GridRectsMatch([object] $left, [object] $right, [double] $tolerance = 2.0) {
+  if ($null -eq $left -or $null -eq $right) { return $false }
+  return ([Math]::Abs([double]$left.x - [double]$right.x) -le $tolerance -and
+    [Math]::Abs([double]$left.y - [double]$right.y) -le $tolerance -and
+    [Math]::Abs([double]$left.width - [double]$right.width) -le ($tolerance * 2) -and
+    [Math]::Abs([double]$left.height - [double]$right.height) -le ($tolerance * 2))
+}
+
+function GridUiPoint([object] $context) {
+  $targetRect = $context.target_rect
+  $uiRect = $context.ui_rect
+  return [System.Windows.Point]::new(
+    [double]$uiRect.X + (([double]$context.point.x - [double]$targetRect.Left) / [double]$context.scale_x),
+    [double]$uiRect.Y + (([double]$context.point.y - [double]$targetRect.Top) / [double]$context.scale_y)
+  )
+}
+
+function GridPhysicalBounds([object] $context, [System.Windows.Automation.AutomationElement] $element) {
+  try {
+    $rect = $element.Current.BoundingRectangle
+    if ($rect.Width -le 0 -or $rect.Height -le 0) { return $null }
+    $x = [double]$context.target_rect.Left + (([double]$rect.X - [double]$context.ui_rect.X) * [double]$context.scale_x)
+    $y = [double]$context.target_rect.Top + (([double]$rect.Y - [double]$context.ui_rect.Y) * [double]$context.scale_y)
+    return [pscustomobject]@{
+      x = $x
+      y = $y
+      width = [double]$rect.Width * [double]$context.scale_x
+      height = [double]$rect.Height * [double]$context.scale_y
+    }
+  } catch {
+    return $null
+  }
+}
+
+function PointerIdentity([System.Windows.Automation.AutomationElement] $element, [object] $context) {
+  if ($null -eq $element -or -not (GridElementIsOwned $element $context.pid $context.hwnd)) { return $null }
+  $runtimeId = ElementIdentity $element
+  $role = RoleName $element
+  $bounds = GridPhysicalBounds $context $element
+  $inside = $null -ne $bounds -and (GridPointInRect ([double]$context.point.x) ([double]$context.point.y) $bounds)
+  if ([string]::IsNullOrEmpty($runtimeId) -or [string]::IsNullOrEmpty($role) -or $null -eq $bounds -or -not $inside) { return $null }
+  $name = ""
+  try { $name = [string]$element.Current.Name } catch { }
+  $result = [ordered]@{ runtime_id = $runtimeId; role = $role; bounds = $bounds }
+  if (-not [string]::IsNullOrEmpty($name)) { $result.name = $name }
+  return [pscustomobject]$result
+}
+
+function PointerTextPattern([System.Windows.Automation.AutomationElement] $element) {
+  $pattern = $null
+  try {
+    if (-not $element.TryGetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern, [ref]$pattern)) { return $null }
+    return [System.Windows.Automation.TextPattern]$pattern
+  } catch { return $null }
+}
+
+function PointerPlainTextRole([string] $role) {
+  return (NormalizeGridRole $role) -in @("edit", "custom", "document", "text")
+}
+
+function PointerActionable([System.Windows.Automation.AutomationElement] $element) {
+  if ($null -eq $element) { return $true }
+  $normalized = NormalizeGridRole (RoleName $element)
+  if ($normalized -in @("hyperlink", "link", "button", "checkbox", "radiobutton", "combobox", "listitem", "menuitem", "tab", "treeitem", "slider", "scrollbar", "spinner", "splitbutton", "image")) { return $true }
+  $invoke = Supports $element ([System.Windows.Automation.InvokePattern]::Pattern)
+  $selection = Supports $element ([System.Windows.Automation.SelectionItemPattern]::Pattern)
+  $toggle = Supports $element ([System.Windows.Automation.TogglePattern]::Pattern)
+  $expand = Supports $element ([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
+  return $invoke -or $selection -or $toggle -or $expand
+}
+
+function PointerRangeIsPlainText(
+  [System.Windows.Automation.TextPattern] $pattern,
+  [System.Windows.Point] $point,
+  [object] $context,
+  [string] $allowedEnclosingRuntimeId
+) {
+  try {
+    $range = $pattern.RangeFromPoint($point)
+    if ($null -eq $range) { return $false }
+    return -not (PointerRangeHasLink $range $context $allowedEnclosingRuntimeId)
+  } catch { return $false }
+}
+
+function PointerLinkAttribute() {
+  if ($script:PointerLinkAttributeChecked) { return $script:PointerLinkAttributeValue }
+  $script:PointerLinkAttributeChecked = $true
+  try {
+    $flags = [System.Reflection.BindingFlags]::Public -bor [System.Reflection.BindingFlags]::Static
+    foreach ($member in [System.Windows.Automation.TextPattern].GetMember("LinkAttribute", $flags)) {
+      if ($member -is [System.Reflection.PropertyInfo]) {
+        $script:PointerLinkAttributeValue = $member.GetValue($null, $null)
+        break
+      }
+      if ($member -is [System.Reflection.FieldInfo]) {
+        $script:PointerLinkAttributeValue = $member.GetValue($null)
+        break
+      }
+    }
+  } catch {
+    $script:PointerLinkAttributeValue = $null
+  }
+  return $script:PointerLinkAttributeValue
+}
+
+function PointerRangeHasLink(
+  [System.Windows.Automation.Text.TextPatternRange] $range,
+  [object] $context,
+  [string] $allowedEnclosingRuntimeId
+) {
+  try {
+    $enclosing = $range.GetEnclosingElement()
+    if ($null -eq $enclosing -or -not (GridElementIsOwned $enclosing $context.pid $context.hwnd)) { return $true }
+    $enclosingRuntimeId = ElementIdentity $enclosing
+    $enclosingRole = NormalizeGridRole (RoleName $enclosing)
+    if ((PointerActionable $enclosing) -and ($enclosingRuntimeId -ne $allowedEnclosingRuntimeId)) { return $true }
+    $linkAttribute = PointerLinkAttribute
+    if ($null -ne $linkAttribute) {
+      try {
+        $link = $range.GetAttributeValue($linkAttribute)
+        if ($null -ne $link -and $link -ne [System.Windows.Automation.AutomationElement]::NotSupported) { return $true }
+      } catch {
+        # The property exists but this provider could not answer it; fail
+        # closed for this proof rather than treating an unknown link as text.
+        return $true
+      }
+    }
+    if ($enclosingRole -in @("hyperlink", "link")) { return $true }
+    foreach ($child in @($range.GetChildren())) {
+      if ($null -eq $child) { continue }
+      $owned = GridElementIsOwned $child $context.pid $context.hwnd
+      if (-not $owned) { return $true }
+      $role = NormalizeGridRole (RoleName $child)
+      $childRuntimeId = ElementIdentity $child
+      if ($childRuntimeId -eq $allowedEnclosingRuntimeId) { continue }
+      if ($role -in @("hyperlink", "link")) { return $true }
+      if ((PointerActionable $child) -and $role -notin @("edit", "text", "document")) { return $true }
+    }
+    return $false
+  } catch { return $true }
+}
+
+function PointerPathHasLink(
+  [System.Collections.Generic.List[object]] $path,
+  [int] $lastIndex,
+  [System.Windows.Point] $uiPoint,
+  [object] $context,
+  [string] $allowedEnclosingRuntimeId
+) {
+  for ($index = 0; $index -le $lastIndex; $index += 1) {
+    $pattern = PointerTextPattern $path[$index]
+    if ($null -eq $pattern) { continue }
+    try { $range = $pattern.RangeFromPoint($uiPoint) } catch { return $true }
+    if ($null -eq $range -or (PointerRangeHasLink $range $context $allowedEnclosingRuntimeId)) { return $true }
+  }
+  return $false
+}
+
+function PointerAncestorPath([System.Windows.Automation.AutomationElement] $hit, [object] $context) {
+  $path = New-Object System.Collections.Generic.List[object]
+  $walker = [System.Windows.Automation.TreeWalker]::RawViewWalker
+  $current = $hit
+  for ($depth = 0; $depth -lt 32 -and $null -ne $current; $depth += 1) {
+    if (-not (GridElementIsOwned $current $context.pid $context.hwnd)) { return $null }
+    [void]$path.Add($current)
+    if ((ElementIdentity $current) -eq [string]$context.root_identity) { return $path }
+    try { $current = $walker.GetParent($current) } catch { return $null }
+  }
+  return $null
+}
+
+function PointerGridSurface([System.Windows.Automation.AutomationElement] $hit, [object] $context, [System.Windows.Point] $uiPoint) {
+  $hitRole = NormalizeGridRole (RoleName $hit)
+  if ((PointerActionable $hit) -and ($hitRole -notin @("dataitem", "cell", "gridcell", "edit", "text", "document"))) { return $null }
+  $path = PointerAncestorPath $hit $context
+  if ($null -eq $path) { return $null }
+  for ($pathIndex = 0; $pathIndex -lt $path.Count; $pathIndex += 1) {
+    $element = $path[$pathIndex]
+    if (PasswordValue $element) { return $null }
+    $role = NormalizeGridRole (RoleName $element)
+    if ($role -notin @("dataitem", "cell", "gridcell")) { continue }
+    # A hyperlink/button between a passive text leaf and the cell would make
+    # a coordinate click a command, even when the cell itself exposes the
+    # ordinary Invoke/SelectionItem patterns. Only the matched grid item may
+    # carry those patterns; all earlier ancestors must remain passive.
+    $ancestorActionable = $false
+    for ($ancestorIndex = 0; $ancestorIndex -lt $pathIndex; $ancestorIndex += 1) {
+      if (-not (PointerActionable $path[$ancestorIndex])) { continue }
+      $ancestorRole = NormalizeGridRole (RoleName $path[$ancestorIndex])
+      if ($ancestorRole -notin @("edit", "text", "document")) { $ancestorActionable = $true; break }
+    }
+    $gridItemPattern = $null
+    $selectionPattern = $null
+    try {
+      $hasGridItem = $element.TryGetCurrentPattern([System.Windows.Automation.GridItemPattern]::Pattern, [ref]$gridItemPattern)
+      $hasSelection = $element.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$selectionPattern)
+      if (-not $hasGridItem -or -not $hasSelection) { continue }
+      $grid = ([System.Windows.Automation.GridItemPattern]$gridItemPattern).Current.ContainingGrid
+      if ($null -eq $grid -or -not (GridElementIsOwned $grid $context.pid $context.hwnd)) { continue }
+      [void](GridPatternFor $grid)
+      [void](GridRawPath $grid $context)
+      $bounds = GridPhysicalBounds $context $element
+      if ($null -eq $bounds -or -not (GridPointInRect ([double]$context.point.x) ([double]$context.point.y) $bounds)) { continue }
+      $primary = PointerIdentity $element $context
+      if ($null -eq $primary) { continue }
+      if ($ancestorActionable -or (PointerPathHasLink $path $pathIndex $uiPoint $context $primary.runtime_id)) { continue }
+      $leaf = PointerIdentity $hit $context
+      $container = PointerIdentity $grid $context
+      if ($null -eq $leaf -or $null -eq $container) { continue }
+      return [ordered]@{ kind = "grid"; primary = $primary; leaf = $leaf; container = $container }
+    } catch { continue }
+  }
+  return $null
+}
+
+function PointerTextSurface([System.Windows.Automation.AutomationElement] $hit, [object] $context, [System.Windows.Point] $uiPoint) {
+  $hitRole = NormalizeGridRole (RoleName $hit)
+  if ($hitRole -notin @("edit", "custom", "document", "text")) { return $null }
+  $path = PointerAncestorPath $hit $context
+  if ($null -eq $path) { return $null }
+  $document = $null
+  $surface = $null
+  $surfacePattern = $null
+  foreach ($element in $path) {
+    if (PasswordValue $element) { return $null }
+    $role = NormalizeGridRole (RoleName $element)
+    if ($role -eq "pane") { continue }
+    $pattern = PointerTextPattern $element
+    if ($null -eq $pattern) { continue }
+    if ($null -eq $surface -and $role -in @("edit", "custom", "document", "text")) {
+      $surface = $element
+      $surfacePattern = $pattern
+    }
+    if ($role -eq "document" -and $null -eq $document) { $document = $element }
+  }
+  if ($null -eq $surface -or $null -eq $surfacePattern) { return $null }
+  $surfaceRuntimeId = ElementIdentity $surface
+  if ([string]::IsNullOrEmpty($surfaceRuntimeId)) { return $null }
+  foreach ($element in $path) {
+    if (PasswordValue $element) { return $null }
+    if (-not (PointerActionable $element)) { continue }
+    if ((ElementIdentity $element) -ne $surfaceRuntimeId) { return $null }
+  }
+  if (-not (PointerRangeIsPlainText $surfacePattern $uiPoint $context $surfaceRuntimeId)) { return $null }
+  $primary = PointerIdentity $surface $context
+  $leaf = PointerIdentity $hit $context
+  $container = $null
+  if ($null -ne $document) { $container = PointerIdentity $document $context }
+  if ($null -eq $primary -or $null -eq $leaf -or ($null -ne $document -and $null -eq $container)) { return $null }
+  $result = [ordered]@{ kind = "text"; primary = $primary; leaf = $leaf }
+  if ($null -ne $container) { $result.container = $container }
+  return $result
+}
+
+function PointerSurfaceRead([object] $request) {
+  $processId = RequestPid $request
+  $hwnd = RequestHwnd $request
+  $point = GridPoint $request
+  $prior = [IntPtr]::Zero
+  try {
+    $prior = [NativeWindowScope]::SetThreadDpiAwarenessContext([IntPtr](-4))
+    if ($prior -eq [IntPtr]::Zero) { return ErrorReply "native_pointer_surface_dpi_unavailable" }
+    $context = GridTarget $processId $hwnd $point $false
+    [uint32]$hitOwner = 0
+    if ([NativeWindowScope]::GetWindowThreadProcessId($context.hit_hwnd, [ref]$hitOwner) -eq 0 -or $hitOwner -ne [uint32]$processId) {
+      return ErrorReply "native_pointer_surface_owner_changed"
+    }
+    $uiPoint = GridUiPoint $context
+    $hit = [System.Windows.Automation.AutomationElement]::FromPoint($uiPoint)
+    $hitOwned = $null -ne $hit -and (GridElementIsOwned $hit $processId $hwnd)
+    if (-not $hitOwned) { return ErrorReply "native_pointer_surface_unavailable" }
+    $surface = PointerGridSurface $hit $context $uiPoint
+    if ($null -eq $surface) { $surface = PointerTextSurface $hit $context $uiPoint }
+    if ($null -eq $surface) { return ErrorReply "native_pointer_surface_unverified" }
+    $reply = [ordered]@{
+      ok = $true; pid = $processId; window_id = $hwnd.ToInt64().ToString([Globalization.CultureInfo]::InvariantCulture)
+      kind = $surface.kind; primary = $surface.primary; leaf = $surface.leaf
+    }
+    if ($surface.Contains("container")) { $reply.container = $surface.container }
+    return $reply
+  } finally {
+    if ($prior -ne [IntPtr]::Zero) { [void][NativeWindowScope]::SetThreadDpiAwarenessContext($prior) }
+  }
+}
+
+function GridElementIsOwned([System.Windows.Automation.AutomationElement] $element, [int] $processId, [IntPtr] $hwnd) {
+  try {
+    if ([int]$element.Current.ProcessId -ne $processId) { return $false }
+    $native = [Int64]$element.Current.NativeWindowHandle
+    if ($native -eq 0) { return $true }
+    return [NativeWindowScope]::GetAncestor([IntPtr]$native, 2).ToInt64() -eq $hwnd.ToInt64()
+  } catch {
+    return $false
+  }
+}
+
+function GridRawPath([System.Windows.Automation.AutomationElement] $grid, [object] $context) {
+  $walker = [System.Windows.Automation.TreeWalker]::RawViewWalker
+  $reverse = New-Object System.Collections.Generic.List[string]
+  $current = $grid
+  $reachedRoot = $false
+  for ($depth = 0; $depth -lt 32 -and $null -ne $current; $depth += 1) {
+    if (-not (GridElementIsOwned $current $context.pid $context.hwnd)) { throw "native_grid_owner_changed" }
+    $identity = ElementIdentity $current
+    if ([string]::IsNullOrEmpty($identity)) { throw "native_grid_identity_unavailable" }
+    [void]$reverse.Add($identity)
+    if ($identity -eq [string]$context.root_identity) { $reachedRoot = $true; break }
+    try { $current = $walker.GetParent($current) } catch { throw "native_grid_path_unavailable" }
+  }
+  if (-not $reachedRoot) { throw "native_grid_outside_target" }
+  $path = New-Object System.Collections.Generic.List[string]
+  for ($index = $reverse.Count - 1; $index -ge 0; $index -= 1) { [void]$path.Add($reverse[$index]) }
+  if ($path.Count -lt 2 -or $path.Count -gt 32) { throw "native_grid_path_unavailable" }
+  return [object[]]$path.ToArray()
+}
+
+function GridChildByIdentity(
+  [System.Windows.Automation.AutomationElement] $parent,
+  [string] $identity,
+  [object] $context
+) {
+  $walker = [System.Windows.Automation.TreeWalker]::RawViewWalker
+  $matches = New-Object System.Collections.Generic.List[object]
+  $child = $null
+  try { $child = $walker.GetFirstChild($parent) } catch { throw "native_grid_path_unavailable" }
+  $examined = 0
+  while ($null -ne $child) {
+    $examined++
+    if ($examined -gt 96) { throw "native_grid_path_unbounded" }
+    if (GridElementIsOwned $child $context.pid $context.hwnd) {
+      if ((ElementIdentity $child) -eq $identity) { [void]$matches.Add($child) }
+    }
+    try { $child = $walker.GetNextSibling($child) } catch { throw "native_grid_path_unavailable" }
+  }
+  if ($matches.Count -ne 1) { throw "native_grid_path_unavailable" }
+  return $matches[0]
+}
+
+function GridFindAnchoredGrid([object] $anchor, [object] $context) {
+  $pathValue = $anchor.grid_path
+  if ($null -eq $pathValue -or $pathValue -isnot [array] -or $pathValue.Count -lt 2 -or $pathValue.Count -gt 32) {
+    throw "native_grid_anchor_invalid"
+  }
+  $path = @($pathValue | ForEach-Object { [string]$_ })
+  if ($path[0] -ne [string]$context.root_identity -or $path[$path.Count - 1] -ne [string]$anchor.grid_runtime_id) {
+    throw "native_grid_anchor_mismatch"
+  }
+  foreach ($identity in $path) {
+    if ([string]::IsNullOrEmpty($identity) -or $identity.Length -gt 1024) { throw "native_grid_anchor_invalid" }
+  }
+  $current = $context.root
+  for ($index = 1; $index -lt $path.Count; $index += 1) {
+    $current = GridChildByIdentity $current $path[$index] $context
+  }
+  if ((ElementIdentity $current) -ne [string]$anchor.grid_runtime_id) { throw "native_grid_anchor_mismatch" }
+  return $current
+}
+
+function GridItemNamesMatch([System.Windows.Automation.AutomationElement] $element, [object] $requested) {
+  if ($null -ne $requested.name) {
+    try { return [string]$element.Current.Name -ceq [string]$requested.name } catch { return $false }
+  }
+  return $true
+}
+
+function GridItemMatches(
+  [System.Windows.Automation.AutomationElement] $element,
+  [object] $requested,
+  [object] $context
+) {
+  if ($null -eq $element -or -not (GridElementIsOwned $element $context.pid $context.hwnd)) { return $false }
+  if (-not (GridRoleMatches (RoleName $element) $requested)) { return $false }
+  $identity = ElementIdentity $element
+  if ([string]::IsNullOrEmpty($identity) -or ([string]$requested.runtime_id -ne "" -and $identity -ne [string]$requested.runtime_id)) { return $false }
+  if (-not (GridItemNamesMatch $element $requested)) { return $false }
+  try {
+    if (-not [bool]$element.Current.IsEnabled -or [bool]$element.GetCurrentPropertyValue([System.Windows.Automation.AutomationElement]::IsOffscreenProperty)) { return $false }
+  } catch { return $false }
+  $bounds = GridPhysicalBounds $context $element
+  if ($null -eq $bounds -or -not (GridPointInRect ([double]$context.point.x) ([double]$context.point.y) $bounds)) { return $false }
+  if (-not (GridRectsMatch $bounds $requested.bounds 3.0)) { return $false }
+  return $true
+}
+
+function GridItemPatternFor([System.Windows.Automation.AutomationElement] $element) {
+  $pattern = $null
+  if (-not $element.TryGetCurrentPattern([System.Windows.Automation.GridItemPattern]::Pattern, [ref]$pattern)) { throw "native_grid_item_pattern_unavailable" }
+  return [System.Windows.Automation.GridItemPattern]$pattern
+}
+
+function GridPatternFor([System.Windows.Automation.AutomationElement] $element) {
+  $pattern = $null
+  if (-not $element.TryGetCurrentPattern([System.Windows.Automation.GridPattern]::Pattern, [ref]$pattern)) { throw "native_grid_pattern_unavailable" }
+  return [System.Windows.Automation.GridPattern]$pattern
+}
+
+function GridAnchorRequest([object] $request) {
+  if ($null -eq $request.anchor) { throw "native_grid_anchor_invalid" }
+  $anchor = $request.anchor
+  $item = GridItemRequest $anchor.selected_item $true
+  $gridRuntimeId = [string]$anchor.grid_runtime_id
+  $row = 0
+  $column = 0
+  if (($gridRuntimeId.Length -eq 0 -or $gridRuntimeId.Length -gt 1024 -or
+    -not [int]::TryParse([string]$anchor.row, [Globalization.NumberStyles]::Integer, [Globalization.CultureInfo]::InvariantCulture, [ref]$row) -or
+    -not [int]::TryParse([string]$anchor.column, [Globalization.NumberStyles]::Integer, [Globalization.CultureInfo]::InvariantCulture, [ref]$column) -or
+    $row -lt 0 -or $column -lt 0)) {
+    throw "native_grid_anchor_invalid"
+  }
+  return [pscustomobject]@{ selected_item = $item; grid_runtime_id = $gridRuntimeId; grid_path = $anchor.grid_path; row = $row; column = $column }
+}
+
+function GridAnchorMatchesItem([object] $item, [object] $anchorItem) {
+  if (([string]$item.runtime_id -ne "" -and [string]$item.runtime_id -ne [string]$anchorItem.runtime_id) -or
+    [string]$item.normalized_role -cne [string]$anchorItem.normalized_role) { return $false }
+  if ($null -ne $anchorItem.name -and [string]$item.name -cne [string]$anchorItem.name) { return $false }
+  return GridRectsMatch $item.bounds $anchorItem.bounds 3.0
+}
+
+function GridItemOutput([System.Windows.Automation.AutomationElement] $element, [object] $context, [bool] $selected) {
+  $name = ""
+  try { $name = [string]$element.Current.Name } catch { }
+  $result = [ordered]@{
+    role = (RoleName $element)
+    runtime_id = (ElementIdentity $element)
+    bounds = (GridPhysicalBounds $context $element)
+  }
+  if (-not [string]::IsNullOrEmpty($name)) { $result.name = $name }
+  if ($selected) { $result.selected = $true }
+  return [pscustomobject]$result
+}
+
+function GridReadItemAnchor([object] $request) {
+  $processId = RequestPid $request
+  $hwnd = RequestHwnd $request
+  $point = GridPoint $request
+  $item = GridItemRequest $request.selected_item $false
+  $prior = [NativeWindowScope]::SetThreadDpiAwarenessContext([IntPtr](-4))
+  if ($prior -eq [IntPtr]::Zero) { return ErrorReply "native_grid_dpi_unavailable" }
+  try {
+    $context = GridTarget $processId $hwnd $point
+    $uiPoint = GridUiPoint $context
+    $hit = [System.Windows.Automation.AutomationElement]::FromPoint($uiPoint)
+    if ($null -eq $hit -or -not (GridItemMatches $hit $item $context)) { return ErrorReply "native_grid_item_mismatch" }
+    $gridItemPattern = GridItemPatternFor $hit
+    $grid = $gridItemPattern.Current.ContainingGrid
+    if ($null -eq $grid -or -not (GridElementIsOwned $grid $processId $hwnd)) { return ErrorReply "native_grid_owner_changed" }
+    $gridIdentity = ElementIdentity $grid
+    if ([string]::IsNullOrEmpty($gridIdentity)) { return ErrorReply "native_grid_identity_unavailable" }
+    [void](GridPatternFor $grid)
+    $row = [int]$gridItemPattern.Current.Row
+    $column = [int]$gridItemPattern.Current.Column
+    if ($row -lt 0 -or $column -lt 0 -or $row -gt 2147483646 -or $column -gt 2147483646) {
+      return ErrorReply "native_grid_index_invalid"
+    }
+    $path = GridRawPath $grid $context
+    $itemOutput = GridItemOutput $hit $context $false
+    return [ordered]@{
+      ok = $true
+      pid = $processId
+      window_id = $hwnd.ToInt64().ToString([Globalization.CultureInfo]::InvariantCulture)
+      selected_item = $itemOutput
+      anchor = [ordered]@{ grid_runtime_id = $gridIdentity; grid_path = $path; row = $row; column = $column }
+    }
+  } finally {
+    [void][NativeWindowScope]::SetThreadDpiAwarenessContext($prior)
+  }
+}
+
+function GridCaretWithin([object] $caret, [object] $rect) {
+  $caretRight = [double]$caret.x + [double]$caret.width
+  $caretBottom = [double]$caret.y + [double]$caret.height
+  return ([double]$caret.x -ge [double]$rect.x -and $caretRight -le ([double]$rect.x + [double]$rect.width) -and
+    [double]$caret.y -ge [double]$rect.y -and $caretBottom -le ([double]$rect.y + [double]$rect.height))
+}
+
+function GridCaretWithinEditor([object] $caret, [object] $rect) {
+  $left = [double]$rect.x
+  $top = [double]$rect.y
+  $right = $left + [double]$rect.width
+  $bottom = $top + [double]$rect.height
+  $caretRight = [double]$caret.x + [double]$caret.width
+  $caretBottom = [double]$caret.y + [double]$caret.height
+  $centerX = [double]$caret.x + ([double]$caret.width / 2.0)
+  $centerY = [double]$caret.y + ([double]$caret.height / 2.0)
+  return ([double]$caret.x -ge $left -and [double]$caret.x -lt $right -and
+    [double]$caret.y -ge $top -and [double]$caret.y -lt $bottom -and
+    $centerX -ge $left -and $centerX -lt $right -and
+    $centerY -ge $top -and $centerY -lt $bottom -and
+    $caretRight -le ($right + 1.0) -and $caretBottom -le ($bottom + 1.0))
+}
+
+function GridEditorProviderAllowed([string] $role, [string] $className, [bool] $editable, [bool] $password, [bool] $verifiedChild) {
+  if (-not $verifiedChild -or [string]::IsNullOrWhiteSpace($className) -or $password) { return $false }
+  if ($role -ceq "Pane") {
+    return [string]::Equals($className, "EXCEL6", [StringComparison]::OrdinalIgnoreCase)
+  }
+  if ($role -ceq "Edit") { return $editable }
+  return $false
+}
+
+function GridElementIsWritableEdit([System.Windows.Automation.AutomationElement] $element) {
+  if (PasswordValue $element) { return $false }
+  $pattern = $null
+  try {
+    if (-not $element.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$pattern)) { return $false }
+    return -not [bool]([System.Windows.Automation.ValuePattern]$pattern).Current.IsReadOnly
+  } catch {
+    return $false
+  }
+}
+
+function GridNativeClassName([IntPtr] $hwnd) {
+  if ($hwnd -eq [IntPtr]::Zero -or -not [NativeWindowScope]::IsWindow($hwnd)) { throw "native_grid_editor_class_unavailable" }
+  $name = New-Object System.Text.StringBuilder 256
+  $length = [NativeWindowScope]::GetClassName($hwnd, $name, $name.Capacity)
+  if ($length -le 0) { throw "native_grid_editor_class_unavailable" }
+  return $name.ToString()
+}
+
+function GridNativeFocus([object] $context, [IntPtr] $editorHwnd, [object] $cellBounds, [object] $editorBounds) {
+  [uint32]$owner = 0
+  $thread = [NativeWindowScope]::GetWindowThreadProcessId($context.hwnd, [ref]$owner)
+  if ($thread -eq 0 -or $owner -ne [uint32]$context.pid) { throw "native_grid_owner_changed" }
+  $state = New-Object 'NativeWindowScope+NativeGuiThreadInfo'
+  $state.cbSize = [uint32][Runtime.InteropServices.Marshal]::SizeOf($state)
+  if (-not [NativeWindowScope]::GetGUIThreadInfo($thread, [ref]$state)) { throw "native_grid_focus_unavailable" }
+  if ($state.hwndActive.ToInt64() -ne $context.hwnd.ToInt64() -or
+    $state.hwndFocus.ToInt64() -ne $editorHwnd.ToInt64() -or
+    $state.hwndCaret.ToInt64() -ne $editorHwnd.ToInt64() -or
+    (($state.flags -band 0x1e) -ne 0)) {
+    throw "native_grid_focus_mismatch"
+  }
+  $caretWidth = [int]$state.rcCaret.Right - [int]$state.rcCaret.Left
+  $caretHeight = [int]$state.rcCaret.Bottom - [int]$state.rcCaret.Top
+  if ($caretWidth -lt 0 -or $caretHeight -le 0 -or $caretWidth -gt 4096 -or $caretHeight -gt 4096) { throw "native_grid_caret_unavailable" }
+  $caretPoint = New-Object 'NativeWindowScope+NativeWindowPoint'
+  $caretPoint.X = [int]$state.rcCaret.Left
+  $caretPoint.Y = [int]$state.rcCaret.Top
+  if (-not [NativeWindowScope]::ClientToScreen($editorHwnd, [ref]$caretPoint)) { throw "native_grid_caret_unavailable" }
+  $caret = [pscustomobject]@{ x = [int]$caretPoint.X; y = [int]$caretPoint.Y; width = $caretWidth; height = $caretHeight }
+  if (-not (GridCaretWithin $caret $cellBounds) -or -not (GridCaretWithinEditor $caret $editorBounds)) {
+    throw "native_grid_caret_outside_edit_surface"
+  }
+  return [pscustomobject]@{
+    focused = $true
+    pid = $context.pid
+    window_id = $context.hwnd.ToInt64().ToString([Globalization.CultureInfo]::InvariantCulture)
+    runtime_id = ""
+    role = ""
+    caret = $caret
+  }
+}
+
+function GridEditContextCore([int] $processId, [IntPtr] $hwnd, [object] $point, [object] $requestedItem, [object] $anchor) {
+  $context = GridTarget $processId $hwnd $point
+  $gridRuntimeId = [string]$anchor.grid_runtime_id
+  if ([string]::IsNullOrEmpty($gridRuntimeId) -or $gridRuntimeId.Length -gt 1024) { throw "native_grid_anchor_invalid" }
+  if (-not (GridAnchorMatchesItem $requestedItem $anchor.selected_item)) { throw "native_grid_anchor_mismatch" }
+  if ($anchor.grid_path -isnot [array] -or $anchor.grid_path.Count -lt 2 -or $anchor.grid_path.Count -gt 32 -or
+    [string]$anchor.grid_path[0] -ne [string]$context.root_identity -or
+    [string]$anchor.grid_path[$anchor.grid_path.Count - 1] -ne [string]$anchor.grid_runtime_id) {
+    throw "native_grid_anchor_mismatch"
+  }
+  $grid = GridFindAnchoredGrid $anchor $context
+  $gridPattern = GridPatternFor $grid
+  $item = $null
+  try { $item = $gridPattern.GetItem([int]$anchor.row, [int]$anchor.column) } catch { throw "native_grid_item_unavailable" }
+  if ($null -eq $item -or -not (GridElementIsOwned $item $processId $hwnd)) { throw "native_grid_owner_changed" }
+  if (-not (GridItemMatches $item $anchor.selected_item $context)) { throw "native_grid_item_changed" }
+  $gridItemPattern = GridItemPatternFor $item
+  if ((ElementIdentity $gridItemPattern.Current.ContainingGrid) -ne [string]$anchor.grid_runtime_id) { throw "native_grid_anchor_mismatch" }
+  $selectionPattern = $null
+  if (-not $item.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$selectionPattern)) {
+    throw "native_grid_selection_unavailable"
+  }
+  if (-not [bool]([System.Windows.Automation.SelectionItemPattern]$selectionPattern).Current.IsSelected) {
+    throw "native_grid_selection_changed"
+  }
+  $cellBounds = GridPhysicalBounds $context $item
+  if ($null -eq $cellBounds -or -not (GridPointInRect ([double]$point.x) ([double]$point.y) $cellBounds)) { throw "native_grid_point_outside_cell" }
+  if (-not (GridRectsMatch $cellBounds $anchor.selected_item.bounds 3.0)) { throw "native_grid_bounds_changed" }
+
+  $uiPoint = GridUiPoint $context
+  $pointElement = [System.Windows.Automation.AutomationElement]::FromPoint($uiPoint)
+  $focused = [System.Windows.Automation.AutomationElement]::FocusedElement
+  if ($null -eq $pointElement -or $null -eq $focused -or
+    -not (GridElementIsOwned $pointElement $processId $hwnd) -or
+    -not (GridElementIsOwned $focused $processId $hwnd)) { throw "native_grid_focus_unavailable" }
+  $pointIdentity = ElementIdentity $pointElement
+  $focusIdentity = ElementIdentity $focused
+  if ([string]::IsNullOrEmpty($pointIdentity) -or $pointIdentity -ne $focusIdentity) { throw "native_grid_focus_mismatch" }
+  try {
+    if ([bool]$pointElement.GetCurrentPropertyValue([System.Windows.Automation.AutomationElement]::IsOffscreenProperty) -or
+      -not [bool]$pointElement.Current.IsEnabled) { throw "native_grid_editor_unavailable" }
+  } catch { throw "native_grid_editor_unavailable" }
+  $editorRole = RoleName $pointElement
+  if ($editorRole -eq "Unknown") { throw "native_grid_editor_unavailable" }
+  $editorBounds = GridPhysicalBounds $context $pointElement
+  if ($null -eq $editorBounds -or -not (GridPointInRect ([double]$point.x) ([double]$point.y) $editorBounds)) {
+    throw "native_grid_point_outside_editor"
+  }
+  $editorHwndValue = [Int64]$pointElement.Current.NativeWindowHandle
+  if ($editorHwndValue -eq 0 -or $editorHwndValue -eq $hwnd.ToInt64()) { throw "native_grid_child_window_unavailable" }
+  $editorHwnd = [IntPtr]$editorHwndValue
+  $editorRootHwnd = [NativeWindowScope]::GetAncestor($editorHwnd, 2)
+  if ($context.hit_hwnd.ToInt64() -ne $editorHwnd.ToInt64() -or
+    $editorRootHwnd.ToInt64() -ne $hwnd.ToInt64()) {
+    throw "native_grid_hit_window_mismatch"
+  }
+  [uint32]$editorOwner = 0
+  if ([NativeWindowScope]::GetWindowThreadProcessId($editorHwnd, [ref]$editorOwner) -eq 0 -or $editorOwner -ne [uint32]$processId) {
+    throw "native_grid_owner_changed"
+  }
+  $uiAEditorHwnd = [Int64]$pointElement.Current.NativeWindowHandle
+  if ($uiAEditorHwnd -ne $editorHwndValue) {
+    throw "native_grid_editor_hwnd_mismatch"
+  }
+  $verifiedEditorChild = [NativeWindowScope]::IsWindow($editorHwnd) -and
+    $editorHwndValue -ne $hwnd.ToInt64() -and
+    $editorRootHwnd.ToInt64() -eq $hwnd.ToInt64() -and
+    $editorOwner -eq [uint32]$processId -and
+    $context.hit_hwnd.ToInt64() -eq $editorHwnd.ToInt64() -and
+    $uiAEditorHwnd -eq $editorHwndValue
+  $editorClassName = GridNativeClassName $editorHwnd
+  $editorEditable = $editorRole -ceq "Edit" -and (GridElementIsWritableEdit $pointElement)
+  if (-not (GridEditorProviderAllowed $editorRole $editorClassName $editorEditable (PasswordValue $pointElement) $verifiedEditorChild)) {
+    throw "native_grid_editor_provider_unverified"
+  }
+  $nativeFocus = GridNativeFocus $context $editorHwnd $cellBounds $editorBounds
+  $focusBounds = GridPhysicalBounds $context $focused
+  return [pscustomobject]@{
+    context = $context
+    selected_item = (GridItemOutput $item $context $true)
+    editor = [pscustomobject]@{
+      role = $editorRole
+      runtime_id = $pointIdentity
+      class_name = $editorClassName
+      bounds = $editorBounds
+      hwnd = $editorHwnd.ToInt64().ToString([Globalization.CultureInfo]::InvariantCulture)
+      caret = $nativeFocus.caret
+    }
+    focus = [pscustomobject]@{
+      focused = $true
+      pid = $processId
+      window_id = $hwnd.ToInt64().ToString([Globalization.CultureInfo]::InvariantCulture)
+      runtime_id = $focusIdentity
+      role = (RoleName $focused)
+      bounds = $focusBounds
+    }
+  }
+}
+
+function GridReadEditContext([object] $request) {
+  $processId = RequestPid $request
+  $hwnd = RequestHwnd $request
+  $point = GridPoint $request
+  $item = GridItemRequest $request.selected_item $false
+  $anchor = GridAnchorRequest $request
+  $prior = [NativeWindowScope]::SetThreadDpiAwarenessContext([IntPtr](-4))
+  if ($prior -eq [IntPtr]::Zero) { return ErrorReply "native_grid_dpi_unavailable" }
+  try {
+    $fresh = GridEditContextCore $processId $hwnd $point $item $anchor
+    return [ordered]@{
+      ok = $true
+      pid = $processId
+      window_id = $hwnd.ToInt64().ToString([Globalization.CultureInfo]::InvariantCulture)
+      selected_item = $fresh.selected_item
+      editor = $fresh.editor
+      focus = $fresh.focus
+    }
+  } finally {
+    [void][NativeWindowScope]::SetThreadDpiAwarenessContext($prior)
+  }
+}
+
+function GridExpectedMatches([object] $expected, [object] $fresh, [int] $processId, [IntPtr] $hwnd) {
+  if ($null -eq $expected) { return $false }
+  $selected = $expected.selected_item
+  $editor = $expected.editor
+  $focus = $expected.focus
+  if ($null -eq $selected -or $null -eq $editor -or $null -eq $focus -or
+    $selected.selected -ne $true -or $focus.focused -ne $true) { return $false }
+  if ([string]$selected.runtime_id -cne [string]$fresh.selected_item.runtime_id -or
+    (NormalizeGridRole ([string]$selected.role)) -cne (NormalizeGridRole ([string]$fresh.selected_item.role))) { return $false }
+  if ($null -ne $selected.PSObject.Properties["name"] -and [string]$selected.name -cne [string]$fresh.selected_item.name) { return $false }
+  if (-not (GridRectsMatch (GridRect $selected.bounds) $fresh.selected_item.bounds 1.0)) { return $false }
+  if ([string]$editor.runtime_id -cne [string]$fresh.editor.runtime_id -or
+    [string]$editor.role -cne [string]$fresh.editor.role -or
+    [string]$focus.runtime_id -cne [string]$fresh.focus.runtime_id -or
+    [string]$focus.role -cne [string]$fresh.focus.role -or
+    [string]$focus.runtime_id -cne [string]$editor.runtime_id -or
+    [string]$focus.role -cne [string]$editor.role) { return $false }
+  $focusPid = 0
+  if (-not [int]::TryParse([string]$focus.pid, [Globalization.NumberStyles]::Integer, [Globalization.CultureInfo]::InvariantCulture, [ref]$focusPid) -or
+    $focusPid -ne $processId) { return $false }
+  $focusHwnd = 0L
+  if (-not [Int64]::TryParse([string]$focus.window_id, [Globalization.NumberStyles]::Integer, [Globalization.CultureInfo]::InvariantCulture, [ref]$focusHwnd) -or
+    $focusHwnd -ne $hwnd.ToInt64()) { return $false }
+  $expectedEditorHwnd = 0L
+  if (-not [Int64]::TryParse([string]$editor.hwnd, [Globalization.NumberStyles]::Integer, [Globalization.CultureInfo]::InvariantCulture, [ref]$expectedEditorHwnd) -or
+    $expectedEditorHwnd -le 0 -or $expectedEditorHwnd -ne [Int64]$fresh.editor.hwnd) { return $false }
+  if (-not (GridRectsMatch (GridRect $editor.bounds) $fresh.editor.bounds 1.0)) { return $false }
+  $expectedCaret = $editor.caret
+  if ($null -eq $expectedCaret) { return $false }
+  foreach ($field in @("x", "y", "width", "height")) {
+    try { $expectedValue = GridNumber $expectedCaret.$field } catch { return $false }
+    if ([double]$expectedValue -ne [double]$fresh.editor.caret.$field) { return $false }
+  }
+  if ([double]$expectedCaret.width -lt 0 -or [double]$expectedCaret.height -le 0) { return $false }
+  return $true
+}
+
+function GridCommitEnter([object] $request) {
+  $prior = [IntPtr]::Zero
+  $sendInvocationStarted = $false
+  try {
+    $processId = RequestPid $request
+    $hwnd = RequestHwnd $request
+    $point = GridPoint $request
+    $item = GridItemRequest $request.selected_item $false
+    $anchor = GridAnchorRequest $request
+    $prior = [NativeWindowScope]::SetThreadDpiAwarenessContext([IntPtr](-4))
+    if ($prior -eq [IntPtr]::Zero) { return [ordered]@{ status = "refused"; code = "native_grid_dpi_unavailable" } }
+    $fresh = GridEditContextCore $processId $hwnd $point $item $anchor
+    if (-not (GridExpectedMatches $request.expected $fresh $processId $hwnd)) {
+      return [ordered]@{ status = "refused"; code = "native_grid_commit_proof_mismatch" }
+    }
+    $cellBounds = $fresh.selected_item.bounds
+    $editorBounds = $fresh.editor.bounds
+    $caret = $fresh.editor.caret
+    $editorHwnd = [IntPtr][Int64]$fresh.editor.hwnd
+    $send = $null
+    try {
+      $sendInvocationStarted = $true
+      $send = [NativeWindowScope]::SendEnterIfGridStillFocused(
+        $processId,
+        $hwnd,
+        [int]$point.x,
+        [int]$point.y,
+        $editorHwnd,
+        [double]$cellBounds.x,
+        [double]$cellBounds.y,
+        ([double]$cellBounds.x + [double]$cellBounds.width),
+        ([double]$cellBounds.y + [double]$cellBounds.height),
+        [double]$editorBounds.x,
+        [double]$editorBounds.y,
+        ([double]$editorBounds.x + [double]$editorBounds.width),
+        ([double]$editorBounds.y + [double]$editorBounds.height),
+        [int]$caret.x,
+        [int]$caret.y,
+        [int]$caret.width,
+        [int]$caret.height
+      )
+    } catch {
+      return [ordered]@{ status = "unknown"; code = "native_grid_commit_delivery_unknown" }
+    }
+    if ([int]$send.attempted -eq 0) { return [ordered]@{ status = "refused"; code = [string]$send.code } }
+    if (-not [string]::IsNullOrEmpty([string]$send.code)) { return [ordered]@{ status = "unknown"; code = "native_grid_commit_delivery_unknown" } }
+    $delivered = [int]$send.delivered
+    if ($delivered -eq 0) { return [ordered]@{ status = "refused"; code = "native_grid_commit_not_queued" } }
+    if ($delivered -lt 2) { return [ordered]@{ status = "partial"; code = "native_grid_commit_partial" } }
+    if ($delivered -eq 2) { return [ordered]@{ status = "dispatched" } }
+    return [ordered]@{ status = "unknown"; code = "native_grid_commit_delivery_unknown" }
+  } catch {
+    if ($sendInvocationStarted) { return [ordered]@{ status = "unknown"; code = "native_grid_commit_delivery_unknown" } }
+    $code = [string]$_.Exception.Message
+    if ([string]::IsNullOrEmpty($code) -or $code.Length -gt 96 -or $code -notmatch "^[a-z0-9_]+$") { $code = "native_grid_commit_refused" }
+    return [ordered]@{ status = "refused"; code = $code }
+  } finally {
+    if ($prior -ne [IntPtr]::Zero) {
+      try { [void][NativeWindowScope]::SetThreadDpiAwarenessContext($prior) } catch { }
+    }
+  }
+}
+
 $reply = $null
 try {
   $raw = [Console]::In.ReadToEnd()
@@ -657,11 +1541,46 @@ try {
     Add-Type @"
 using System;
 using System.Runtime.InteropServices;
+using System.Text;
 public static class NativeWindowScope {
   [StructLayout(LayoutKind.Sequential)]
   public struct NativeWindowPoint { public int X; public int Y; }
   [StructLayout(LayoutKind.Sequential)]
   public struct NativeWindowRect { public int Left; public int Top; public int Right; public int Bottom; }
+  [StructLayout(LayoutKind.Sequential)]
+  public struct NativeGuiThreadInfo {
+    public uint cbSize;
+    public uint flags;
+    public IntPtr hwndActive;
+    public IntPtr hwndFocus;
+    public IntPtr hwndCapture;
+    public IntPtr hwndMenuOwner;
+    public IntPtr hwndMoveSize;
+    public IntPtr hwndCaret;
+    public NativeWindowRect rcCaret;
+  }
+  [StructLayout(LayoutKind.Sequential)]
+  public struct NativeKeyboardInput {
+    public ushort virtualKey;
+    public ushort scanCode;
+    public uint flags;
+    public uint time;
+    public UIntPtr extraInfo;
+  }
+  [StructLayout(LayoutKind.Explicit, Size = 32)]
+  public struct NativeInputUnion {
+    [FieldOffset(0)] public NativeKeyboardInput keyboard;
+  }
+  [StructLayout(LayoutKind.Sequential)]
+  public struct NativeInput {
+    public uint type;
+    public NativeInputUnion data;
+  }
+  public struct NativeSendResult {
+    public int attempted;
+    public uint delivered;
+    public string code;
+  }
   [DllImport("user32.dll")]
   public static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
   [DllImport("user32.dll")]
@@ -670,6 +1589,8 @@ public static class NativeWindowScope {
   public static extern bool IsWindowVisible(IntPtr hwnd);
   [DllImport("user32.dll")]
   public static extern bool IsIconic(IntPtr hwnd);
+  [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  public static extern int GetClassName(IntPtr hwnd, StringBuilder className, int maxCount);
   [DllImport("user32.dll")]
   public static extern bool GetWindowRect(IntPtr hwnd, out NativeWindowRect rect);
   [DllImport("user32.dll")]
@@ -678,6 +1599,129 @@ public static class NativeWindowScope {
   public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
   [DllImport("user32.dll")]
   public static extern int GetSystemMetrics(int index);
+  [DllImport("user32.dll")]
+  public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")]
+  public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
+  [DllImport("user32.dll")]
+  public static extern bool GetGUIThreadInfo(uint threadId, ref NativeGuiThreadInfo info);
+  [DllImport("user32.dll")]
+  public static extern bool ClientToScreen(IntPtr hwnd, ref NativeWindowPoint point);
+  [DllImport("user32.dll")]
+  public static extern short GetAsyncKeyState(int virtualKey);
+  [DllImport("user32.dll", SetLastError = true)]
+  public static extern uint SendInput(uint count, [In] NativeInput[] inputs, int inputSize);
+
+  private static bool Contains(double left, double top, double right, double bottom, int x, int y) {
+    return x >= left && y >= top && x < right && y < bottom;
+  }
+  private static bool SameCaret(IntPtr caretHwnd, NativeWindowRect caret, int x, int y, int width, int height) {
+    if (caretHwnd == IntPtr.Zero || caret.Bottom <= caret.Top || caret.Right < caret.Left) return false;
+    NativeWindowPoint origin = new NativeWindowPoint();
+    origin.X = caret.Left;
+    origin.Y = caret.Top;
+    if (!ClientToScreen(caretHwnd, ref origin)) return false;
+    return origin.X == x && origin.Y == y && (caret.Right - caret.Left) == width && (caret.Bottom - caret.Top) == height;
+  }
+  private static bool ModifiersHeld() {
+    int[] keys = new int[] { 0x10, 0x11, 0x12, 0x0d, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5 };
+    foreach (int key in keys) if (GetAsyncKeyState(key) < 0) return true;
+    return false;
+  }
+  private static bool NativeGridStateMatches(
+    int processId, IntPtr hwnd, NativeWindowPoint point, IntPtr editorHwnd,
+    double cellLeft, double cellTop, double cellRight, double cellBottom,
+    double editorLeft, double editorTop, double editorRight, double editorBottom,
+    int caretX, int caretY, int caretWidth, int caretHeight,
+    out string code
+  ) {
+    code = "native_grid_commit_focus_changed";
+    if (!IsWindow(hwnd) || !IsWindowVisible(hwnd) || IsIconic(hwnd) || GetAncestor(hwnd, 2).ToInt64() != hwnd.ToInt64()) {
+      code = "native_grid_commit_target_unavailable";
+      return false;
+    }
+    uint owner = 0;
+    uint thread = GetWindowThreadProcessId(hwnd, out owner);
+    NativeWindowRect targetRect;
+    if (thread == 0 || owner != (uint)processId || !GetWindowRect(hwnd, out targetRect)
+      || point.X < targetRect.Left || point.X >= targetRect.Right || point.Y < targetRect.Top || point.Y >= targetRect.Bottom
+      || GetForegroundWindow().ToInt64() != hwnd.ToInt64()) {
+      code = "native_grid_commit_target_changed";
+      return false;
+    }
+    IntPtr pointHwnd = WindowFromPoint(point);
+    uint editorOwner = 0;
+    if (pointHwnd == IntPtr.Zero || pointHwnd.ToInt64() != editorHwnd.ToInt64()
+      || editorHwnd == IntPtr.Zero || editorHwnd.ToInt64() == hwnd.ToInt64()
+      || GetAncestor(editorHwnd, 2).ToInt64() != hwnd.ToInt64()
+      || GetWindowThreadProcessId(editorHwnd, out editorOwner) == 0 || editorOwner != (uint)processId) {
+      code = "native_grid_commit_hit_changed";
+      return false;
+    }
+    if (!Contains(cellLeft, cellTop, cellRight, cellBottom, point.X, point.Y)
+      || !Contains(editorLeft, editorTop, editorRight, editorBottom, point.X, point.Y)) {
+      code = "native_grid_commit_point_changed";
+      return false;
+    }
+    NativeGuiThreadInfo info = new NativeGuiThreadInfo();
+    info.cbSize = (uint)Marshal.SizeOf(typeof(NativeGuiThreadInfo));
+    if (!GetGUIThreadInfo(thread, ref info)
+      || info.hwndActive.ToInt64() != hwnd.ToInt64()
+      || info.hwndFocus.ToInt64() != editorHwnd.ToInt64()
+      || info.hwndCaret.ToInt64() != editorHwnd.ToInt64()
+      || (info.flags & 0x1e) != 0
+      || !SameCaret(info.hwndCaret, info.rcCaret, caretX, caretY, caretWidth, caretHeight)) {
+      code = "native_grid_commit_caret_changed";
+      return false;
+    }
+    if (!ModifiersHeld()) return true;
+    code = "native_grid_commit_modifier_held";
+    return false;
+  }
+  public static NativeSendResult SendEnterIfGridStillFocused(
+    int processId, IntPtr hwnd, int pointX, int pointY, IntPtr editorHwnd,
+    double cellLeft, double cellTop, double cellRight, double cellBottom,
+    double editorLeft, double editorTop, double editorRight, double editorBottom,
+    int caretX, int caretY, int caretWidth, int caretHeight
+  ) {
+    NativeSendResult result = new NativeSendResult();
+    result.attempted = 0;
+    result.delivered = 0;
+    result.code = "native_grid_commit_focus_changed";
+    NativeWindowPoint point = new NativeWindowPoint();
+    point.X = pointX;
+    point.Y = pointY;
+    string code;
+    if (!NativeGridStateMatches(processId, hwnd, point, editorHwnd, cellLeft, cellTop, cellRight, cellBottom,
+      editorLeft, editorTop, editorRight, editorBottom, caretX, caretY, caretWidth, caretHeight, out code)) {
+      result.code = code;
+      return result;
+    }
+    NativeInput[] inputs = new NativeInput[2];
+    for (int index = 0; index < inputs.Length; index++) {
+      inputs[index].type = 1;
+      inputs[index].data.keyboard.virtualKey = 0x0d;
+      inputs[index].data.keyboard.scanCode = 0;
+      inputs[index].data.keyboard.flags = index == 0 ? 0u : 0x0002u;
+      inputs[index].data.keyboard.time = 0;
+      inputs[index].data.keyboard.extraInfo = UIntPtr.Zero;
+    }
+    // Repeat the synchronous foreground, point, caret, and modifier checks
+    // after the last managed/UIA comparison and immediately before SendInput.
+    if (!NativeGridStateMatches(processId, hwnd, point, editorHwnd, cellLeft, cellTop, cellRight, cellBottom,
+      editorLeft, editorTop, editorRight, editorBottom, caretX, caretY, caretWidth, caretHeight, out code)) {
+      result.code = code;
+      return result;
+    }
+    result.attempted = 1;
+    try {
+      result.delivered = SendInput(2, inputs, Marshal.SizeOf(typeof(NativeInput)));
+      result.code = "";
+    } catch {
+      result.code = "native_grid_commit_delivery_unknown";
+    }
+    return result;
+  }
 }
 "@
     $request = $raw | ConvertFrom-Json
@@ -687,6 +1731,14 @@ public static class NativeWindowScope {
       $reply = Observe $request
     } elseif ([string]$request.op -eq "focus") {
       $reply = Focus $request
+    } elseif ([string]$request.op -eq "grid_item_anchor") {
+      $reply = GridReadItemAnchor $request
+    } elseif ([string]$request.op -eq "grid_edit_context") {
+      $reply = GridReadEditContext $request
+    } elseif ([string]$request.op -eq "grid_commit_enter") {
+      $reply = GridCommitEnter $request
+    } elseif ([string]$request.op -eq "pointer_surface") {
+      $reply = PointerSurfaceRead $request
     } elseif ([string]$request.op -eq "desktop_image") {
       $reply = CaptureDesktop $request
     } elseif ([string]$request.op -eq "dispatch") {

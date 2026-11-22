@@ -67,6 +67,7 @@ export function createWindowsLocalBrowserApplication(options: LocalBrowserProduc
     allowModelImages: true,
     allowModelDocumentText: true,
     allowNavigation: true,
+    allowObservationProjection: true,
     open: signal => openLocalBrowser({ ...options, origins }, signal),
   });
 }

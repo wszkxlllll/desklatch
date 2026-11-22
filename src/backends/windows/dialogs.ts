@@ -8,6 +8,7 @@ const dynamicImport: DynamicImport = new Function("specifier", "return import(sp
 const GW_OWNER = 4;
 const GWL_STYLE = -16;
 const WS_CHILD = 0x40000000n;
+const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4n;
 
 /**
  * A top-level window enumerator and the read-only user32 facts needed to
@@ -27,6 +28,8 @@ export interface WindowsOwnedDialogNativeApi {
   readonly bounds: (hwnd: bigint) => Rect | undefined;
   /** Optional WS_CHILD check for defensive filtering of a malformed enumerator. */
   readonly style?: (hwnd: bigint) => bigint | number | undefined;
+  /** Enter/restore the physical Win32 coordinate context for bounds reads. */
+  readonly setThreadDpiAwarenessContext?: (context: bigint | number) => bigint | number | undefined;
 }
 
 export interface WindowsOwnedDialog {
@@ -48,7 +51,7 @@ export interface WindowsOwnedDialogInspector {
    */
   findOwnedDialogs(
     target: WindowsWindowTarget,
-    options?: { readonly signal?: AbortSignal },
+    options?: { readonly signal?: AbortSignal; readonly strict?: boolean },
   ): Promise<readonly WindowsOwnedDialog[]>;
 }
 
@@ -89,6 +92,7 @@ async function openWindowsOwnedDialogInspector(): Promise<WindowsOwnedDialogInsp
     const getWindow = user32.func("uintptr_t __stdcall GetWindow(uintptr_t hwnd, uint32_t command)");
     const getWindowRect = user32.func("int __stdcall GetWindowRect(uintptr_t hwnd, void *rect)");
     const getWindowLongPtr = user32.func("intptr_t __stdcall GetWindowLongPtrW(uintptr_t hwnd, int index)");
+    const setThreadDpiAwarenessContext = user32.func("intptr_t __stdcall SetThreadDpiAwarenessContext(intptr_t context)");
 
     return createWindowsOwnedDialogInspector({
       enumerateTopLevelWindows(visit) {
@@ -126,6 +130,9 @@ async function openWindowsOwnedDialogInspector(): Promise<WindowsOwnedDialogInsp
       style(hwnd) {
         return getWindowLongPtr(hwnd, GWL_STYLE);
       },
+      setThreadDpiAwarenessContext(context) {
+        return setThreadDpiAwarenessContext(context);
+      },
     });
   } catch {
     return undefined;
@@ -141,49 +148,58 @@ class User32OwnedDialogInspector implements WindowsOwnedDialogInspector {
 
   async findOwnedDialogs(
     target: WindowsWindowTarget,
-    options?: { readonly signal?: AbortSignal },
+    options?: { readonly signal?: AbortSignal; readonly strict?: boolean },
   ): Promise<readonly WindowsOwnedDialog[]> {
     const signal = options?.signal;
     signal?.throwIfAborted();
     try {
-      if (!isPositiveHandle(target.hwnd) || !this.#api.isWindow(target.hwnd)) return [];
-      if (this.#api.processId(target.hwnd) !== target.pid) return [];
-      const dialogs: WindowsOwnedDialog[] = [];
-      const seen = new Set<bigint>();
-      this.#api.enumerateTopLevelWindows((hwnd) => {
-        if (signal?.aborted) return false;
-        if (!isPositiveHandle(hwnd) || seen.has(hwnd)) return true;
-        seen.add(hwnd);
-        try {
-          if (hwnd === target.hwnd || !this.#api.isWindow(hwnd)) return true;
-          if (this.#api.processId(hwnd) !== target.pid) return true;
-          if (!this.#api.isWindowVisible(hwnd) || this.#api.isIconic(hwnd)) return true;
-          if (isChildWindow(this.#api.style?.(hwnd))) return true;
-          const bounds = this.#api.bounds(hwnd);
-          if (!bounds || bounds.width <= 0 || bounds.height <= 0) return true;
-          const ownerChain = findOwnerChain(this.#api, hwnd, target.hwnd);
-          if (!ownerChain) return true;
-          dialogs.push({
-            target,
-            hwnd,
-            pid: target.pid,
-            ownerHwnd: ownerChain[0],
-            ownerChain,
-            bounds,
-          });
-        } catch {
-          // Windows can disappear while EnumWindows is walking the z-order.
-          // A disappearing candidate is not evidence of an owned dialog.
-        }
-        return true;
-      });
-      signal?.throwIfAborted();
-      return Object.freeze(dialogs.map((dialog) => Object.freeze({
-        ...dialog,
-        ownerChain: Object.freeze([...dialog.ownerChain]),
-      })));
+      const previousDpi = beginPhysicalDpi(this.#api);
+      if (this.#api.setThreadDpiAwarenessContext && previousDpi === undefined) return [];
+      let result: readonly WindowsOwnedDialog[] = [];
+      try {
+        if (!isPositiveHandle(target.hwnd) || !this.#api.isWindow(target.hwnd)) return [];
+        if (this.#api.processId(target.hwnd) !== target.pid) return [];
+        const dialogs: WindowsOwnedDialog[] = [];
+        const seen = new Set<bigint>();
+        this.#api.enumerateTopLevelWindows((hwnd) => {
+          if (signal?.aborted) return false;
+          if (!isPositiveHandle(hwnd) || seen.has(hwnd)) return true;
+          seen.add(hwnd);
+          try {
+            if (hwnd === target.hwnd || !this.#api.isWindow(hwnd)) return true;
+            if (this.#api.processId(hwnd) !== target.pid) return true;
+            if (!this.#api.isWindowVisible(hwnd) || this.#api.isIconic(hwnd)) return true;
+            if (isChildWindow(this.#api.style?.(hwnd))) return true;
+            const bounds = this.#api.bounds(hwnd);
+            if (!bounds || bounds.width <= 0 || bounds.height <= 0) return true;
+            const ownerChain = findOwnerChain(this.#api, hwnd, target.hwnd);
+            if (!ownerChain) return true;
+            dialogs.push({
+              target,
+              hwnd,
+              pid: target.pid,
+              ownerHwnd: ownerChain[0],
+              ownerChain,
+              bounds,
+            });
+          } catch {
+            // Windows can disappear while EnumWindows is walking the z-order.
+            // A disappearing candidate is not evidence of an owned dialog.
+          }
+          return true;
+        });
+        signal?.throwIfAborted();
+        result = Object.freeze(dialogs.map((dialog) => Object.freeze({
+          ...dialog,
+          ownerChain: Object.freeze([...dialog.ownerChain]),
+        })));
+        return result;
+      } finally {
+        if (!restorePhysicalDpi(this.#api, previousDpi)) throw new Error("physical_dpi_restore_failed");
+      }
     } catch (error) {
       if (signal?.aborted) throw error;
+      if (options?.strict) throw error;
       return [];
     }
   }
@@ -221,6 +237,30 @@ function isChildWindow(style: bigint | number | undefined): boolean {
 
 function isPositiveHandle(value: bigint): boolean {
   return value > 0n && value <= 0xffffffffffffffffn;
+}
+
+function beginPhysicalDpi(api: WindowsOwnedDialogNativeApi): bigint | number | undefined {
+  if (!api.setThreadDpiAwarenessContext) return undefined;
+  try {
+    const previous = api.setThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    return validDpiContext(previous) ? previous : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function restorePhysicalDpi(api: WindowsOwnedDialogNativeApi, previous: bigint | number | undefined): boolean {
+  if (!api.setThreadDpiAwarenessContext || previous === undefined) return true;
+  try {
+    return validDpiContext(api.setThreadDpiAwarenessContext(previous));
+  } catch {
+    return false;
+  }
+}
+
+function validDpiContext(value: bigint | number | undefined): boolean {
+  if (typeof value === "bigint") return value !== 0n;
+  return typeof value === "number" && Number.isSafeInteger(value) && value !== 0;
 }
 
 function toBigInt(value: unknown): bigint | undefined {

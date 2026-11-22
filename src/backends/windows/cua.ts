@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { Point, Rect, Step } from "../../contracts.js";
+import type { Point, Rect, Selector, Step } from "../../contracts.js";
 import {
   backendError,
   type WindowsCuaDriver,
@@ -22,6 +22,7 @@ const REQUIRED_DRIVER_VERSION = "0.54.0";
  */
 export class CuaWindowsTransport implements WindowsTransport {
   readonly source = "cua-uia-0.54" as const;
+  readonly authorizeForegroundGridEnter?: WindowsTransport["authorizeForegroundGridEnter"];
   readonly #driver: WindowsCuaDriver;
   readonly #session: string;
   #opened = false;
@@ -30,6 +31,24 @@ export class CuaWindowsTransport implements WindowsTransport {
   private constructor(driver: WindowsCuaDriver, session: string) {
     this.#driver = driver;
     this.#session = session;
+    if (driver.authorizeForegroundGridEnter) {
+      this.authorizeForegroundGridEnter = async (target, query, options) => {
+        this.assertOpen();
+        options.signal?.throwIfAborted();
+        try {
+          windowAddress(target);
+          const context = query.expected;
+          if (!Number.isFinite(query.point?.x) || !Number.isFinite(query.point?.y)
+            || context.focus.focused !== true || context.focus.pid !== target.pid || context.focus.hwnd !== target.hwnd
+            || !context.selectedItem.selected || !context.selectedItem.runtimeId
+            || !context.editor.runtimeId || context.editor.runtimeId !== context.focus.runtimeId
+            || context.editor.hwnd === target.hwnd) return "grid_commit_proof_invalid";
+          return driver.authorizeForegroundGridEnter!(target, query, options);
+        } catch {
+          return "invalid_window_identity";
+        }
+      };
+    }
   }
 
   static async open(driver: WindowsCuaDriver, session = "desklatch-windows-" + randomUUID(), signal?: AbortSignal): Promise<CuaWindowsTransport> {
@@ -56,15 +75,17 @@ export class CuaWindowsTransport implements WindowsTransport {
     if (!this.#opened) await this.start(signal);
   }
 
-  async observeWindow(target: WindowsWindowTarget, options: { readonly signal?: AbortSignal }): Promise<WindowsWindowSnapshot> {
+  async observeWindow(target: WindowsWindowTarget, options: { readonly signal?: AbortSignal; readonly where?: Selector; readonly includeScreenshot?: boolean }): Promise<WindowsWindowSnapshot> {
     this.assertOpen();
     options.signal?.throwIfAborted();
+    const query = cuaQuery(options.where);
     const result = await this.call("get_window_state", {
       pid: target.pid,
       window_id: rawBigInt(target.hwnd),
       session: this.#session,
+      ...(query ? { query } : {}),
       include_accessibility_tree: true,
-      include_screenshot: false,
+      include_screenshot: options.includeScreenshot === true,
       tree_format: "elements",
       full_output: true,
       max_elements: 512,
@@ -87,12 +108,25 @@ export class CuaWindowsTransport implements WindowsTransport {
     const bounds = parseRect(raw.window_bounds ?? raw.windowBounds ?? raw.bounds);
     const complete = raw.elements_complete === true || raw.elementsComplete === true;
     const degraded = raw.degraded === true || result.degraded === true || raw.truncated === true;
+    const screenshotWidth = positiveInteger(raw.screenshot_width ?? raw.screenshotWidth);
+    const screenshotHeight = positiveInteger(raw.screenshot_height ?? raw.screenshotHeight);
+    const origins: Point[] = [];
+    if (screenshotWidth !== undefined && screenshotHeight !== undefined) {
+      for (const element of elements) {
+        if (!element.rect || !element.screenshotRect || element.rect.width !== element.screenshotRect.width || element.rect.height !== element.screenshotRect.height) continue;
+        const origin = { x: element.rect.x - element.screenshotRect.x, y: element.rect.y - element.screenshotRect.y };
+        if (!origins.some(candidate => candidate.x === origin.x && candidate.y === origin.y)) origins.push(origin);
+      }
+    }
     return {
       target,
       ...(stringField(raw, "window_title", "windowTitle", "title") ? { title: stringField(raw, "window_title", "windowTitle", "title") } : {}),
       ...(bounds ? { bounds } : {}),
       elements: Object.freeze(elements),
       complete: complete && !degraded,
+      ...(screenshotWidth !== undefined ? { screenshotWidth } : {}),
+      ...(screenshotHeight !== undefined ? { screenshotHeight } : {}),
+      ...(origins.length === 1 ? { screenshotOrigin: origins[0] } : {}),
       ...(degraded ? { degraded: true } : {}),
       ...(stringField(raw, "snapshot_id", "snapshotId") ? { snapshotId: stringField(raw, "snapshot_id", "snapshotId") } : {}),
     };
@@ -158,27 +192,74 @@ export class CuaWindowsTransport implements WindowsTransport {
   async dispatch(step: Step, target: WindowsDispatchTarget, options: { readonly signal?: AbortSignal }): Promise<WindowsTransportDelivery> {
     this.assertOpen();
     options.signal?.throwIfAborted();
+    // The delivery hint is intentionally explicit.  A transport caller must
+    // never turn `type(delivery:"foreground")` into a background token write
+    // merely because a point was not attached by its trusted backend.
+    if (step.kind === "type" && step.delivery === "foreground" && (!target.foreground || target.point === undefined)) {
+      return { status: "refused", code: "foreground_type_target_unavailable" };
+    }
     const args: Record<string, unknown> = {
       session: this.#session,
       target: windowAddress(target.window),
       delivery_mode: target.foreground ? "foreground" : "background",
     };
-    let localPoint = target.point === undefined ? undefined : localPointForTarget(target.point, target.windowBounds, target.control?.localRect);
-    if (target.foreground && target.point && (step.kind === "click" || step.kind === "scroll")) {
+    // `coordinate:false` marks the private center point used only for a
+    // selector/ref physical check. Every other supplied point is a genuine
+    // coordinate target and must remain the delivery position, even when a
+    // matching UIA token is also present. This keeps the last-mile recipient
+    // grounded to the point that was hit-tested.
+    const coordinateDispatch = target.point !== undefined && target.coordinate !== false;
+    if (coordinateDispatch && !target.foreground
+      && (step.kind === "click" || step.kind === "scroll" || step.kind === "type")) {
+      return { status: "refused", code: "foreground_input_required" };
+    }
+    let localPoint = coordinateDispatch && target.point !== undefined
+      ? localPointForTarget(target.point, target.windowBounds)
+      : undefined;
+    if (coordinateDispatch && target.foreground && target.point && (step.kind === "click" || step.kind === "scroll" || step.kind === "type")) {
       if (!target.windowBounds) return { status: "refused", code: "foreground_bounds_unavailable" };
       const capture = await this.foregroundCapture(target.window, target.windowBounds, options.signal);
       options.signal?.throwIfAborted();
       if (capture === null) return { status: "refused", code: "foreground_capture_stale" };
       if (capture === undefined) return { status: "refused", code: "foreground_capture_unavailable" };
-      localPoint = { x: Math.round(target.point.x - capture.origin.x), y: Math.round(target.point.y - capture.origin.y) };
+      // `type_text`/foreground click coordinates are pixels in the fresh
+      // window capture.  The UIA frame and user32 HWND evidence can use
+      // different DPI spaces (Excel commonly reports a 1280x745 capture for
+      // a 1920x1117 physical window), so map from the exact enrolled physical
+      // outer rect to the capture dimensions instead of subtracting the CUA
+      // logical screenshot origin directly from a physical desktop point.
+      const scaleX = target.windowBounds.width / capture.width;
+      const scaleY = target.windowBounds.height / capture.height;
+      if (!Number.isFinite(scaleX) || !Number.isFinite(scaleY) || scaleX <= 0 || scaleY <= 0
+        || Math.abs(scaleX - scaleY) > Math.max(0.02, Math.max(scaleX, scaleY) * 0.01)) {
+        return { status: "refused", code: "foreground_capture_geometry_unverified" };
+      }
+      localPoint = {
+        x: Math.round((target.point.x - target.windowBounds.x) / scaleX),
+        y: Math.round((target.point.y - target.windowBounds.y) / scaleY),
+      };
       if (localPoint.x < 0 || localPoint.y < 0 || localPoint.x >= capture.width || localPoint.y >= capture.height) {
         return { status: "refused", code: "point_outside_window_capture" };
       }
-      args.capture_id = capture.id;
+      if (target.control?.control.rect) {
+        const mappedPhysical = {
+          x: target.windowBounds.x + localPoint.x * scaleX,
+          y: target.windowBounds.y + localPoint.y * scaleY,
+        };
+        if (!contains(target.control.control.rect, mappedPhysical)) {
+          return { status: "refused", code: "foreground_point_recipient_changed" };
+        }
+      }
+      // Click accepts capture_id so the driver can bind the pixel to this
+      // immutable capture. Scroll has no capture_id field in the installed
+      // CUA schema; keep its fresh capture private as geometry/occlusion
+      // evidence while retaining the exact window-local coordinates.
+      if (step.kind === "click") args.capture_id = capture.id;
     }
     switch (step.kind) {
       case "click": {
-        if (target.control?.token && !target.foreground) args.element_token = target.control.token;
+        if (coordinateDispatch && !target.windowBounds) return { status: "refused", code: "point_geometry_unverified" };
+        if (!coordinateDispatch && target.control?.token) args.element_token = target.control.token;
         else if (localPoint) {
           args.x = localPoint.x;
           args.y = localPoint.y;
@@ -188,20 +269,39 @@ export class CuaWindowsTransport implements WindowsTransport {
         return this.runAction("click", args, target.foreground, options.signal);
       }
       case "type": {
-        if (!target.control?.token) return { status: "refused", code: "type_target_unavailable" };
         if (step.text.length === 0 || hasControlCharacters(step.text)) return { status: "refused", code: "invalid_text" };
-        args.element_token = target.control.token;
+        if (coordinateDispatch && localPoint) {
+          // Foreground point typing is an explicit, host-authorized pixel
+          // route. The CUA driver clicks this exact window-local point to
+          // establish renderer focus, then types; do not also send a stale
+          // UIA token from the pre-click snapshot.
+          args.x = localPoint.x;
+          args.y = localPoint.y;
+        } else if (!coordinateDispatch && target.control?.token) {
+          args.element_token = target.control.token;
+        } else return { status: "refused", code: "type_target_unavailable" };
         args.text = step.text;
         return this.runAction("type_text", args, target.foreground, options.signal);
       }
       case "setValue": {
         if (!target.control?.token) return { status: "refused", code: "set_value_target_unavailable" };
-        args.element_token = target.control.token;
-        args.value = step.value;
-        return this.runAction("set_value", args, target.foreground, options.signal);
+        if (!isEditableValuePatternRole(target.control.control.role)) return { status: "refused", code: "set_value_pattern_unavailable" };
+        if (hasControlCharacters(step.value)) return { status: "refused", code: "invalid_text" };
+        // CUA's set_value schema is intentionally narrower than the other
+        // action tools: it accepts the token/value/session/delivery fields
+        // (and an exact pid), but rejects the generic `target` envelope.
+        // Keep the window identity bound by the observed token and pid.
+        return this.runAction("set_value", {
+          session: this.#session,
+          pid: target.window.pid,
+          element_token: target.control.token,
+          delivery_mode: target.foreground ? "foreground" : "background",
+          value: step.value,
+        }, target.foreground, options.signal);
       }
       case "scroll": {
-        if (target.control?.token && !target.foreground) args.element_token = target.control.token;
+        if (coordinateDispatch && !target.windowBounds) return { status: "refused", code: "point_geometry_unverified" };
+        if (!coordinateDispatch && target.control?.token) args.element_token = target.control.token;
         else if (localPoint) {
           args.x = localPoint.x;
           args.y = localPoint.y;
@@ -218,7 +318,7 @@ export class CuaWindowsTransport implements WindowsTransport {
         // activates and re-verifies that HWND/PID before this call, so the
         // key cannot land in a neighboring process or modal.
         delete args.delivery_mode;
-        args.key = step.key;
+        args.key = nativeKey(step.key);
         return this.runAction("press_key", args, true, options.signal, true);
       }
       case "hotkey": {
@@ -229,6 +329,23 @@ export class CuaWindowsTransport implements WindowsTransport {
       }
       default:
         return { status: "refused", code: "windows_action_not_supported" };
+    }
+  }
+
+  /**
+   * Late checkpoint seam used by the Windows backend before its host-owned
+   * native SendInput chord. Product hosts wrap this method with their live
+   * grant and enrolled-window checks; the direct CUA transport already has
+   * the immutable exact-window identity supplied by the backend.
+   */
+  async authorizeForegroundHotkey(target: WindowsWindowTarget, options: { readonly signal?: AbortSignal }): Promise<string | undefined> {
+    this.assertOpen();
+    options.signal?.throwIfAborted();
+    try {
+      windowAddress(target);
+      return undefined;
+    } catch {
+      return "invalid_window_identity";
     }
   }
 
@@ -306,6 +423,18 @@ export class CuaWindowsTransport implements WindowsTransport {
     if (effect === "partial") return { status: "partial", ...(code ? { code } : {}) };
     if (effect === "refused") return { status: "refused", code: code ?? "driver_refused" };
     if (effect === "suspected_noop") return { status: "unknown", code: code ?? "driver_suspected_noop" };
+    // The installed Windows driver reports target-bound keyboard dispatch
+    // (notably Ctrl+A in Excel) as effect=unverifiable, route=synthetic_events,
+    // delivery.mode=unknown.  This is an acknowledged dispatch with no
+    // application-state proof: preserve that distinction for the caller, but
+    // never upgrade it to verified and never accept the same mode for pointer
+    // or background delivery.
+    const targetBoundKeyboardSend = purpose === "keyboard"
+      && foreground
+      && effect === "unverifiable"
+      && route === "synthetic_events"
+      && mode === "unknown";
+    if (targetBoundKeyboardSend) return { status: "dispatched", code: code ?? "effect_unverifiable" };
     const acceptsMode = (purpose !== undefined && mode === "not_applicable") || (purpose === "keyboard" && mode === "background");
     if (mode !== undefined && mode !== (foreground ? "foreground" : "background") && !acceptsMode) {
       return { status: "unknown", code: code ?? "delivery_mode_mismatch" };
@@ -348,20 +477,46 @@ export class CuaWindowsTransport implements WindowsTransport {
     if (!result || result.isError || !result.images?.[0]) return undefined;
     const raw = structuredRecord(result);
     if (!raw || positiveInteger(raw.pid) !== target.pid || parseBigInt(raw.window_id ?? raw.windowId) !== target.hwnd) return null;
-    if (raw.screenshot_frame_valid === false) return null;
+    // Some CUA builds mark the frame invalid when their reported
+    // `window_bounds` omits the native non-client inset. Keep the capture
+    // private and require the independent identity, bounded-inset, finite
+    // image, and unique frame/screenshot-origin proofs below instead of
+    // treating that metadata warning as a coordinate grant.
     const capturedBounds = parseRect(raw.window_bounds ?? raw.windowBounds ?? raw.bounds);
-    if (capturedBounds === undefined || !sameRect(capturedBounds, expectedBounds)) return null;
+    if (capturedBounds === undefined || !captureBoundsMatch(capturedBounds, expectedBounds)) return null;
     const image = result.images[0];
     const dimensions = imageDimensions(image.mimeType, image.dataBase64, raw);
     const id = stringField(raw, "capture_id", "captureId");
     if (!id || id.length > 256 || !dimensions) return undefined;
     const origin = inferScreenshotOrigin(raw, dimensions.width, dimensions.height);
-    return origin === undefined ? undefined : { id, origin, ...dimensions };
+    if (origin === undefined) return undefined;
+    const scaleX = expectedBounds.width / dimensions.width;
+    const scaleY = expectedBounds.height / dimensions.height;
+    if (!Number.isFinite(scaleX) || !Number.isFinite(scaleY) || scaleX <= 0 || scaleY <= 0
+      || Math.abs(scaleX - scaleY) > Math.max(0.02, Math.max(scaleX, scaleY) * 0.01)
+      || Math.abs(origin.x * scaleX - expectedBounds.x) > Math.max(2, scaleX * 1.5)
+      || Math.abs(origin.y * scaleY - expectedBounds.y) > Math.max(2, scaleY * 1.5)) return null;
+    return { id, origin, ...dimensions };
   }
 
   private assertOpen(): void {
     if (!this.#opened || this.#closed) throw backendError("session_closed");
   }
+}
+
+/**
+ * CUA's native query is a bounded, case-insensitive substring filter. Keep
+ * selector uniqueness and role checks in DeskLatch; forwarding only the
+ * observed name (or role when no name exists) reduces the native walk without
+ * turning a fuzzy CUA query into an authorization decision.
+ */
+function cuaQuery(where?: Selector): string | undefined {
+  if (typeof where?.name === "string" && where.name.trim().length > 0) return where.name.trim();
+  // Role-only catalogs need the top-level Window row for the target-scoped
+  // logical-to-physical geometry proof. CUA's substring projection keeps
+  // actionable ancestors but drops non-actionable Window roots, so leave
+  // role-only reads unprojected and filter them in DeskLatch.
+  return undefined;
 }
 
 function parseElement(value: unknown): WindowsWindowElement | undefined {
@@ -391,6 +546,7 @@ function parseElement(value: unknown): WindowsWindowElement | undefined {
     ...(integerString(item.parent_index ?? item.parentIndex) !== undefined ? { parentIndex: integerString(item.parent_index ?? item.parentIndex) } : {}),
     ...(runtimeIdField(item) ? { runtimeId: runtimeIdField(item) } : {}),
     ...(frame ? { rect: frame } : screenshotFrame ? { rect: screenshotFrame, rectIsWindowLocal: true } : {}),
+    ...(frame && screenshotFrame ? { screenshotRect: screenshotFrame } : {}),
     ...(stringField(item, "element_token", "elementToken") ? { token: stringField(item, "element_token", "elementToken") } : {}),
   };
 }
@@ -468,14 +624,42 @@ function sameRect(left: Rect, right: Rect): boolean {
   return left.x === right.x && left.y === right.y && left.width === right.width && left.height === right.height;
 }
 
-function localPointForTarget(point: Point, bounds: Rect | undefined, localRect: Rect | undefined): Point | undefined {
-  if (localRect) return center(localRect);
-  if (bounds) return { x: Math.round(point.x - bounds.x), y: Math.round(point.y - bounds.y) };
-  return undefined;
+/**
+ * CUA may report the client/content bounds inset by a small non-client frame
+ * while user32 reports the exact enrolled outer HWND bounds. Accept only a
+ * small contained inset with a near-one area/extent ratio; a materially
+ * smaller child or contradictory origin remains stale and fails closed.
+ */
+function captureBoundsMatch(captured: Rect, expected: Rect): boolean {
+  if (sameRect(captured, expected)) return true;
+  const maxInset = Math.max(16, Math.min(64, Math.ceil(Math.min(expected.width, expected.height) * 0.05)));
+  if (!containedRect(expected, captured, 0)) return false;
+  const insetLeft = captured.x - expected.x;
+  const insetTop = captured.y - expected.y;
+  const insetRight = expected.x + expected.width - (captured.x + captured.width);
+  const insetBottom = expected.y + expected.height - (captured.y + captured.height);
+  if ([insetLeft, insetTop, insetRight, insetBottom].some(value => value < 0 || value > maxInset)) return false;
+  const widthRatio = captured.width / expected.width;
+  const heightRatio = captured.height / expected.height;
+  return widthRatio >= 0.9 && heightRatio >= 0.9
+    && Math.abs(widthRatio - heightRatio) <= Math.max(0.02, Math.max(widthRatio, heightRatio) * 0.01);
 }
 
-function center(rect: Rect): Point {
-  return { x: Math.round(rect.x + rect.width / 2), y: Math.round(rect.y + rect.height / 2) };
+function containedRect(outer: Rect, inner: Rect, tolerance: number): boolean {
+  return inner.x >= outer.x - tolerance
+    && inner.y >= outer.y - tolerance
+    && inner.x + inner.width <= outer.x + outer.width + tolerance
+    && inner.y + inner.height <= outer.y + outer.height + tolerance;
+}
+
+function contains(rect: Rect, point: Point): boolean {
+  return point.x >= rect.x && point.y >= rect.y
+    && point.x < rect.x + rect.width && point.y < rect.y + rect.height;
+}
+
+function localPointForTarget(point: Point, bounds: Rect | undefined): Point | undefined {
+  if (bounds) return { x: Math.round(point.x - bounds.x), y: Math.round(point.y - bounds.y) };
+  return undefined;
 }
 
 function windowAddress(target: WindowsWindowTarget): Record<string, unknown> {
@@ -589,8 +773,12 @@ function errorCode(error: unknown): string | undefined {
   if (!error || typeof error !== "object") return undefined;
   const item = error as Record<string, unknown>;
   if (typeof item.code === "string") return item.code;
+  if (typeof item.errorCode === "string") return item.errorCode;
+  if (typeof item.error_code === "string") return item.error_code;
   const inner = record(item.inner);
-  return typeof inner?.errorCode === "string" ? inner.errorCode : undefined;
+  if (typeof inner?.code === "string") return inner.code;
+  if (typeof inner?.errorCode === "string") return inner.errorCode;
+  return typeof inner?.error_code === "string" ? inner.error_code : undefined;
 }
 
 function classifyActionError(error: unknown): WindowsTransportDelivery {
@@ -608,7 +796,24 @@ function hasControlCharacters(value: string): boolean {
 }
 
 function validKey(key: string): boolean {
-  return /^(?:F12|Enter|Escape|Tab)$/iu.test(key);
+  return /^(?:F12|Enter|Escape|Tab|(?:Arrow)?(?:Up|Down|Left|Right)|Home|End|Page(?:Up|Down))$/iu.test(key);
+}
+
+function nativeKey(key: string): string {
+  switch (key.toLocaleLowerCase()) {
+    case "arrowup": case "up": return "up";
+    case "arrowdown": case "down": return "down";
+    case "arrowleft": case "left": return "left";
+    case "arrowright": case "right": return "right";
+    case "pageup": return "pageup";
+    case "pagedown": return "pagedown";
+    default: return key;
+  }
+}
+
+function isEditableValuePatternRole(role: string | undefined): boolean {
+  return typeof role === "string"
+    && /^(?:edit|textbox|textfield|combobox|document|searchbox|spinner)$/iu.test(role.replace(/[ _-]/gu, "").toLocaleLowerCase());
 }
 
 function validHotkey(keys: readonly string[]): boolean {

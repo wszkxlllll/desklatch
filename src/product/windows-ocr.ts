@@ -13,6 +13,8 @@ const POINT_CROP_HEIGHT = 160;
 export interface WindowsOcrProviderOptions {
   readonly rapidOcr: RapidOcrCpuRunnerOptions;
   readonly transport: Pick<WindowsTransport, "observeWindowImage">;
+  /** The same grant-guarded physical desktop image used for visual points. */
+  readonly captureDesktop?: WindowsTransport["observeDesktopImage"];
   readonly regionForInput: (input: RiskInput) => Rect | undefined;
   readonly targetForInput: (input: RiskInput) => Promise<WindowsWindowTarget | undefined>;
   /** Test-only runner seam; production always creates the configured CPU runner. */
@@ -38,7 +40,9 @@ export function createWindowsOcrProvider(options: WindowsOcrProviderOptions): Lo
       }
       const target = await options.targetForInput(input);
       if (target === undefined) throw new Error("ocr_target_unavailable");
-      const image = await options.transport.observeWindowImage?.(target, { signal });
+      const image = input.target.windowPoint === true
+        ? await options.captureDesktop?.({ signal })
+        : await options.transport.observeWindowImage?.(target, { signal });
       if (image === undefined) throw new Error("desktop_image_unavailable");
       const origin = image.origin ?? { x: 0, y: 0 };
       const crop = { ...region, x: region.x - origin.x, y: region.y - origin.y };

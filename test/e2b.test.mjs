@@ -335,6 +335,7 @@ test("managed CDP preserves real page flow while coalescing queued writes", { sk
         await page.goto("data:text/html,<title>Coalesced CDP</title><main><button id='one'>One</button><button id='two'>Two</button><input aria-label='Field'></main>");
       },
     });
+    assert.equal(backend.hitTestSnapshot, true);
     const frame = await backend.observe({ view: "controls" });
     assert.equal(frame.controls.some((control) => control.name === "One"), true);
     assert.equal(frame.controls.some((control) => control.name === "Field"), true);
@@ -344,6 +345,85 @@ test("managed CDP preserves real page flow while coalescing queued writes", { sk
   } finally {
     if (backend) await backend.close();
     else await local.close();
+  }
+});
+
+test("E2B browser opt-in skips stale focus refresh after a cross-document link click", { skip: nodeMajor < 22 }, async (t) => {
+  const e2b = await import("../dist/backends/e2b/index.js");
+  const browserModule = await import("../dist/backends/browser/index.js");
+  const { chromium } = await import("playwright-core");
+  const executablePath = await findCachedChromium(chromium);
+  if (!executablePath) {
+    t.skip("No cached local Chromium was found; this test never downloads one.");
+    return;
+  }
+  const local = await makeLocalCdpGuest(chromium, executablePath);
+  let managed;
+  let backend;
+  try {
+    managed = await e2b.openE2BManagedPage(local.guest, { startupTimeoutMs: 10_000, processTimeoutMs: 30_000 });
+    await managed.page.route("https://allowed.example/pathlib.html", route => route.fulfill({
+      status: 200,
+      contentType: "text/html",
+      body: "<main>pathlib destination</main>",
+    }));
+    await managed.page.setContent('<a id="path" href="https://allowed.example/pathlib.html">pathlib — Object-oriented filesystem paths</a>');
+    let navigated = false;
+    managed.page.on("framenavigated", frame => { if (frame === managed.page.mainFrame()) navigated = true; });
+    const nativeEvaluate = managed.page.evaluate.bind(managed.page);
+    let rawScanCalls = 0;
+    let postNavigationRawScanCalls = 0;
+    managed.page.evaluate = async (...args) => {
+      if (typeof args[0] === "function" && /createTreeWalker|querySelectorAll/iu.test(String(args[0]))) {
+        rawScanCalls += 1;
+        if (navigated) postNavigationRawScanCalls += 1;
+      }
+      return nativeEvaluate(...args);
+    };
+    backend = browserModule.createBrowserBackend(managed.page, {
+      allowBlank: true,
+      authorizedOrigins: ["https://allowed.example"],
+      skipPostNavigationFocusRefresh: true,
+      preferMouseNavigationClick: true,
+      actionTimeoutMs: 1_000,
+    });
+    const nativeMouseClick = managed.page.mouse.click.bind(managed.page.mouse);
+    let mouseClicks = 0;
+    managed.page.mouse.click = async (...args) => {
+      mouseClicks += 1;
+      return nativeMouseClick(...args);
+    };
+    const frame = await backend.observe({ view: "controls" });
+    const link = frame.controls.find(control => control.name?.startsWith("pathlib"));
+    assert.ok(link);
+    const started = Date.now();
+    const result = await backend.dispatch({ frame, target: link, step: { kind: "click", target: { ref: "opaque-ref" } } });
+    assert.equal(result.status, "dispatched", JSON.stringify(result));
+    assert.equal(result.code, "navigation_started");
+    assert.equal(mouseClicks, 1, "cross-document link should use the E2B point-delivery path");
+    assert.equal(postNavigationRawScanCalls, 0, "cross-document click must not scan the new page before its receipt");
+    await managed.page.waitForTimeout(100);
+    assert.equal(await managed.page.url(), "https://allowed.example/pathlib.html");
+
+    // A prevented same-document/no-op link must retain the ordinary focus
+    // refresh; the E2B shortcut is only for an actually changed route.
+    await managed.page.setContent('<a id="blocked" href="https://allowed.example/pathlib.html#blocked" onclick="event.preventDefault()">blocked link</a>');
+    navigated = false;
+    const noOpFrame = await backend.observe({ view: "controls" });
+    const noOp = noOpFrame.controls.find(control => control.name === "blocked link");
+    assert.ok(noOp);
+    const noOpScanStart = rawScanCalls;
+    const noOpResult = await backend.dispatch({ frame: noOpFrame, target: noOp, step: { kind: "click", target: { ref: "opaque-noop-ref" } } });
+    assert.equal(noOpResult.status, "dispatched", JSON.stringify(noOpResult));
+    assert.notEqual(noOpResult.code, "navigation_started");
+    assert.ok(rawScanCalls > noOpScanStart, "same-route click must retain the focus refresh");
+    assert.equal(await managed.page.url(), "https://allowed.example/pathlib.html");
+  } finally {
+    try { await backend?.close(); }
+    finally {
+      if (managed) await managed.close();
+      else await local.close();
+    }
   }
 });
 

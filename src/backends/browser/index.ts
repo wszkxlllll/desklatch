@@ -16,7 +16,6 @@ import type {
   Target,
 } from "../../contracts.js";
 import {
-  area,
   boundedInteger,
   containsPoint,
   createDocumentTextScript,
@@ -41,6 +40,7 @@ import {
   type BrowserBackendOptions,
   type BrowserDelivery,
   type BrowserElementHandleLike,
+  type BrowserJavaScriptHandleLike,
   type BrowserLocatorLike,
   type BrowserPageLike,
   type FrameState,
@@ -64,7 +64,7 @@ import {
   MAX_DOCUMENT_CURSORS,
 } from "./types.js";
 
-export type { BrowserBackend, BrowserBackendOptions, BrowserDelivery, BrowserPageLike, BrowserRiskSignal } from "./types.js";
+export type { BrowserBackend, BrowserBackendOptions, BrowserDelivery, BrowserJavaScriptHandleLike, BrowserPageLike, BrowserRiskSignal } from "./types.js";
 export { BrowserBackendError } from "./types.js";
 export { createLocalBrowserBackend } from "./local.js";
 export {
@@ -90,6 +90,9 @@ export type {
 
 const MAX_TARGET_SCAN = 20_000;
 const MAX_TARGET_RESULTS = 128;
+const IDENTITY_COMPARISON_CONCURRENCY = 8;
+const HANDLE_RELEASE_CONCURRENCY = 8;
+const MAX_NAVIGATION_RECEIPT_WAIT_MS = 2_000;
 
 interface BrowserPrivateState {
   frames: WeakMap<Frame, FrameState>;
@@ -104,6 +107,17 @@ interface CandidateResult {
   pointOccluded?: boolean;
   handle?: BrowserElementHandleLike;
   bindingMissing?: boolean;
+}
+
+interface PointEvidence {
+  href: string;
+  viewportWidth: number;
+  viewportHeight: number;
+  scrollX: number;
+  scrollY: number;
+  mutationGeneration: number;
+  hitFingerprint: string;
+  image: FrameImage;
 }
 
 interface TargetScan {
@@ -212,7 +226,7 @@ async function snapshotLocatorHandles(locator: BrowserLocatorLike, signal?: Abor
   }
 }
 
-async function snapshotSelectors(
+async function snapshotSelectorsLegacy(
   page: BrowserPageLike,
   selectors: readonly string[],
   signal?: AbortSignal,
@@ -240,6 +254,106 @@ async function snapshotSelectors(
   return snapshots;
 }
 
+/**
+ * Snapshot all selectors through one native Playwright evaluateHandle call and
+ * one root getProperties call. The flattened property keys retain each
+ * querySelectorAll multiplicity and order; every ElementHandle therefore
+ * remains bound to the exact DOM node that was observed. Unsupported scoped
+ * adapters fall back to the locator path above.
+ */
+async function snapshotSelectorsBatched(
+  page: BrowserPageLike,
+  selectors: readonly string[],
+  signal?: AbortSignal,
+): Promise<Map<string, BrowserElementHandleLike[]> | undefined> {
+  if (typeof page.evaluateHandle !== "function") return undefined;
+  const unique = [...new Set(selectors)];
+  const snapshots = new Map<string, BrowserElementHandleLike[]>();
+  const elements: BrowserElementHandleLike[] = [];
+  const javascriptHandles: BrowserJavaScriptHandleLike[] = [];
+  const pendingProperties = new Set<BrowserJavaScriptHandleLike>();
+  let completed = false;
+  try {
+    if (unique.length === 0) {
+      completed = true;
+      return snapshots;
+    }
+    abortIfNeeded(signal);
+    const root = await page.evaluateHandle((values: readonly string[]) => {
+      const flattened: Record<string, Element> = Object.create(null) as Record<string, Element>;
+      values.forEach((selector, selectorIndex) => {
+        const matches = document.querySelectorAll(selector);
+        matches.forEach((element, matchIndex) => {
+          flattened[`${selectorIndex}:${matchIndex}`] = element;
+        });
+      });
+      return flattened;
+    }, unique);
+    javascriptHandles.push(root);
+    if (typeof root.getProperties !== "function") return undefined;
+    const properties = await root.getProperties();
+    for (const property of properties.values()) pendingProperties.add(property);
+    const flattened = [...properties.entries()]
+      .map(([key, property]) => {
+        const match = /^(\d+):(\d+)$/u.exec(key);
+        return match ? { selectorIndex: Number(match[1]), matchIndex: Number(match[2]), property } : undefined;
+      });
+    if (flattened.some(entry => entry === undefined)) {
+      await Promise.all([...properties.values()].map(async property => {
+        try { await property.dispose?.(); } catch { /* page closure already disposed it */ }
+      }));
+      pendingProperties.clear();
+      return undefined;
+    }
+    const entries = flattened as { selectorIndex: number; matchIndex: number; property: BrowserJavaScriptHandleLike }[];
+    entries.sort((left, right) => left.selectorIndex - right.selectorIndex || left.matchIndex - right.matchIndex);
+    for (let index = 0; index < unique.length; index += 1) snapshots.set(unique[index], []);
+    for (const entry of entries) {
+      abortIfNeeded(signal);
+      const expected = snapshots.get(unique[entry.selectorIndex]);
+      if (!expected || entry.matchIndex !== expected.length) {
+        await Promise.all([...properties.values()].map(async property => {
+          try { await property.dispose?.(); } catch { /* page closure already disposed it */ }
+        }));
+        pendingProperties.clear();
+        return undefined;
+      }
+      pendingProperties.delete(entry.property);
+      const element = entry.property.asElement?.();
+      if (!element) {
+        try { await entry.property.dispose?.(); } catch { /* page closure already disposed it */ }
+        return undefined;
+      }
+      expected.push(element);
+      elements.push(element);
+    }
+    abortIfNeeded(signal);
+    completed = true;
+    return snapshots;
+  } catch (error) {
+    if (signal?.aborted) throw new BrowserBackendError("aborted");
+    return undefined;
+  } finally {
+    await Promise.all(javascriptHandles.map(async handle => {
+      try { await handle.dispose?.(); } catch { /* page closure already disposed it */ }
+    }));
+    if (!completed) await Promise.all([...pendingProperties].map(async property => {
+      try { await property.dispose?.(); } catch { /* page closure already disposed it */ }
+    }));
+    if (!completed) await disposeUnownedHandles(elements);
+  }
+}
+
+async function snapshotSelectors(
+  page: BrowserPageLike,
+  selectors: readonly string[],
+  signal?: AbortSignal,
+): Promise<Map<string, BrowserElementHandleLike[] | undefined>> {
+  const batched = await snapshotSelectorsBatched(page, selectors, signal);
+  if (batched !== undefined) return batched;
+  return snapshotSelectorsLegacy(page, selectors, signal);
+}
+
 function errorCode(error: unknown, fallback: string): string {
   if (error && typeof error === "object" && "code" in error && typeof (error as { code?: unknown }).code === "string") {
     return (error as { code: string }).code;
@@ -249,6 +363,16 @@ function errorCode(error: unknown, fallback: string): string {
 
 function pageUrl(page: BrowserPageLike): string {
   try { return page.url(); } catch { return ""; }
+}
+
+function navigationRoute(value: string): string {
+  try {
+    const parsed = new URL(value);
+    parsed.hash = "";
+    return parsed.href;
+  } catch {
+    return value;
+  }
 }
 
 function authorizedOrigin(url: string, origins: readonly string[] | undefined, allowBlank: boolean): boolean {
@@ -372,10 +496,8 @@ function matchesSelector(control: InternalControl, selector: Selector): boolean 
   return true;
 }
 
-function pointInControl(frame: FrameState, point: { x: number; y: number }): InternalControl | undefined {
-  return Array.from(frame.controls.values())
-    .filter((control) => control.rect && containsPoint(control.rect, point))
-    .sort((left, right) => area(left.rect) - area(right.rect))[0];
+function pointControls(frame: FrameState, point: { x: number; y: number }): InternalControl[] {
+  return Array.from(frame.controls.values()).filter((control) => control.rect && containsPoint(control.rect, point));
 }
 
 function frameHas(privateState: BrowserPrivateState, frame: Frame, scope: string): FrameState {
@@ -396,6 +518,8 @@ export function createBrowserBackend(page: Page | BrowserPageLike, options: Brow
   const searchTimeoutMs = boundedInteger(options.searchTimeoutMs, DEFAULT_SEARCH_TIMEOUT, 30_000);
   const settleMs = boundedInteger(options.settleMs, DEFAULT_SETTLE, 2_000);
   const actionTimeoutMs = boundedInteger(options.actionTimeoutMs, DEFAULT_ACTION_TIMEOUT, 30_000);
+  const skipPostNavigationFocusRefresh = options.skipPostNavigationFocusRefresh === true;
+  const preferMouseNavigationClick = options.preferMouseNavigationClick === true;
   const includePublicValues = options.includePublicValues === true && options.publicDataOnly !== false;
   const protectedNames = (options.protectedFieldNames ?? []).map(String);
   const authorizedOrigins = options.authorizedOrigins === undefined ? undefined : Object.freeze([...options.authorizedOrigins]);
@@ -410,6 +534,7 @@ export function createBrowserBackend(page: Page | BrowserPageLike, options: Brow
   const rawScript = createRawCollectionScript();
   const documentTextScript = createDocumentTextScript();
   const privateState: BrowserPrivateState = { frames: new WeakMap() };
+  const pointEvidence = new WeakMap<FrameState, PointEvidence | null>();
   const documentCursors = new Map<string, DocumentCursorState>();
   const stableIds = new Map<string, string>();
   const usedIds = new Map<string, string>();
@@ -471,6 +596,30 @@ export function createBrowserBackend(page: Page | BrowserPageLike, options: Brow
       signal?.addEventListener("abort", () => { clearTimeout(timer); reject(new BrowserBackendError("aborted")); }, { once: true });
     });
     abortIfNeeded(signal);
+  }
+
+  async function waitForNavigationStart(beforeScope: string, beforeRoute: string, signal?: AbortSignal): Promise<boolean> {
+    const deadline = Date.now() + Math.min(actionTimeoutMs, MAX_NAVIGATION_RECEIPT_WAIT_MS);
+    while (true) {
+      ensureUsable();
+      abortIfNeeded(signal);
+      if (scope !== beforeScope && navigationRoute(pageUrl(browserPage)) !== beforeRoute) return true;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return false;
+      await new Promise<void>((resolve, reject) => {
+        const delay = Math.min(25, remaining);
+        const timer = setTimeout(() => {
+          signal?.removeEventListener("abort", onAbort);
+          resolve();
+        }, delay);
+        const onAbort = (): void => {
+          clearTimeout(timer);
+          reject(new BrowserBackendError("aborted"));
+        };
+        if (signal?.aborted) onAbort();
+        else signal?.addEventListener("abort", onAbort, { once: true });
+      });
+    }
   }
 
   async function collect(limit: number, signal?: AbortSignal, target?: TargetScan): Promise<{ controls: InternalControl[]; complete: boolean }> {
@@ -712,16 +861,34 @@ export function createBrowserBackend(page: Page | BrowserPageLike, options: Brow
     return matches[0];
   }
 
+  async function livePointHit(point: { x: number; y: number }, signal?: AbortSignal): Promise<InternalControl | undefined> {
+    const path = await pagePointHit(browserPage, point);
+    if (!path) return undefined;
+    const current = await collect(searchLimit, signal);
+    const hit = current.controls.filter((control) => control.__path === path);
+    return hit.length === 1 ? hit[0] : undefined;
+  }
+
   async function pointTarget(frame: FrameState, point: { x: number; y: number }, signal?: AbortSignal, originFrame = frame): Promise<CandidateResult> {
     if (!isPoint(point)) return { candidates: [] };
-    const origin = pointInControl(originFrame, point);
-    const path = await pagePointHit(browserPage, point);
-    const current = await collect(searchLimit, signal);
-    const hit = path ? current.controls.filter((control) => control.__path === path) : [];
-    if (hit.length !== 1 || (origin && hit[0].__stableKey !== origin.__stableKey)) {
-      return { candidates: hit, complete: current.complete, point, pointOccluded: Boolean(origin && !path) };
+    const originCandidates = pointControls(originFrame, point);
+    const hit = await livePointHit(point, signal);
+    if (!hit) return { candidates: [], point, pointOccluded: originCandidates.length > 0 };
+    const original = originCandidates.find((candidate) => candidate.id === hit.id);
+    const evidence = pointEvidence.get(originFrame);
+    // A browser image frame is safe for an overlapping point only when the
+    // same viewport/page is still showing the byte-identical screenshot. The
+    // unique-candidate path stays fast and still requires the live hit to
+    // retain the original ID/handle.
+    if (!original || !originFrame.handles.has(original.id)) {
+      return { candidates: [hit], point, pointOccluded: originCandidates.length > 0 };
     }
-    return { target: hit[0], candidates: hit, complete: current.complete, point, handle: frame.handles.get(hit[0].id), bindingMissing: !frame.handles.has(hit[0].id) };
+    if (originCandidates.length > 1) {
+      if (evidence === null || evidence === undefined || !await pointEvidenceMatches(evidence, signal)) {
+        return { candidates: [hit], point, pointOccluded: true };
+      }
+    }
+    return { target: hit, candidates: [hit], point, handle: frame.handles.get(hit.id), bindingMissing: !frame.handles.has(hit.id) };
   }
 
   async function resolveTarget(dispatch: Dispatch): Promise<CandidateResult> {
@@ -765,6 +932,47 @@ export function createBrowserBackend(page: Page | BrowserPageLike, options: Brow
     }
   }
 
+  async function compareIdentityHandles(
+    entries: readonly { key: string; previous: BrowserElementHandleLike; current: BrowserElementHandleLike }[],
+    signal?: AbortSignal,
+  ): Promise<Map<string, boolean>> {
+    const results = new Map<string, boolean>();
+    let next = 0;
+    const worker = async (): Promise<void> => {
+      while (true) {
+        const index = next++;
+        if (index >= entries.length) return;
+        const entry = entries[index];
+        abortIfNeeded(signal);
+        const same = entry.previous === entry.current
+          ? true
+          : await sameDomNode(entry.previous, entry.current);
+        abortIfNeeded(signal);
+        results.set(entry.key, same);
+      }
+    };
+    const workerCount = Math.min(IDENTITY_COMPARISON_CONCURRENCY, entries.length);
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+    return results;
+  }
+
+  async function releaseHandlesConcurrently(handles: readonly BrowserElementHandleLike[]): Promise<void> {
+    const counts = new Map<BrowserElementHandleLike, number>();
+    for (const handle of handles) counts.set(handle, (counts.get(handle) ?? 0) + 1);
+    const entries = [...counts.entries()];
+    let next = 0;
+    const worker = async (): Promise<void> => {
+      while (true) {
+        const index = next++;
+        if (index >= entries.length) return;
+        const [handle, count] = entries[index];
+        for (let release = 0; release < count; release += 1) await releaseHandle(handle);
+      }
+    };
+    const workerCount = Math.min(HANDLE_RELEASE_CONCURRENCY, entries.length);
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  }
+
   async function bindObservedControls(
     controls: readonly InternalControl[],
     signal?: AbortSignal,
@@ -781,18 +989,61 @@ export function createBrowserBackend(page: Page | BrowserPageLike, options: Brow
       selectorControls.set(selector, grouped);
     }
     const snapshots = await snapshotSelectors(browserPage, [...selectorControls.keys()], signal);
+    const fallbackSelectorByKey = new Map<string, string>();
+    const fallbackSelectors = new Set<string>();
+    for (const control of controls) {
+      if (control.role === "img" && control.actions.length === 0) continue;
+      const selector = selectorForControl(control);
+      const group = selectorControls.get(selector) ?? [];
+      const snapshot = snapshots.get(selector);
+      // Stable id/name selectors are the fast path. If a page repeats an id
+      // or name (common in hidden responsive navigation), recover this
+      // already-observed node through its exact DOM path instead of dropping
+      // the control from the pinned frame.
+      if ((group.length !== 1 || !snapshot || snapshot.length !== 1) && control.__path) {
+        fallbackSelectorByKey.set(control.__stableKey, control.__path);
+        fallbackSelectors.add(control.__path);
+      }
+    }
+    let fallbackSnapshots = new Map<string, BrowserElementHandleLike[] | undefined>();
+    try {
+      if (fallbackSelectors.size > 0) fallbackSnapshots = await snapshotSelectors(browserPage, [...fallbackSelectors], signal);
+    } catch (error) {
+      await disposeUnownedHandles([...snapshots.values()].flatMap((snapshot) => snapshot ?? []));
+      throw error;
+    }
+    const snapshotFor = (control: InternalControl): BrowserElementHandleLike[] | undefined => {
+      const fallbackSelector = fallbackSelectorByKey.get(control.__stableKey);
+      return fallbackSelector === undefined
+        ? snapshots.get(selectorForControl(control))
+        : fallbackSnapshots.get(fallbackSelector);
+    };
+    const groupFor = (control: InternalControl): InternalControl[] => fallbackSelectorByKey.has(control.__stableKey)
+      ? [control]
+      : selectorControls.get(selectorForControl(control)) ?? [];
     const consumed = new Set<BrowserElementHandleLike>();
     const pendingIdentityRetains: BrowserElementHandleLike[] = [];
     const missingKeys = new Set<string>();
+    const identityComparisons: { key: string; previous: BrowserElementHandleLike; current: BrowserElementHandleLike }[] = [];
+    for (const control of controls) {
+      if (control.role === "img" && control.actions.length === 0) continue;
+      const group = groupFor(control);
+      const snapshot = snapshotFor(control);
+      const previous = identityHandles.get(control.__stableKey);
+      if (group.length === 1 && snapshot?.length === 1 && previous) {
+        identityComparisons.push({ key: control.__stableKey, previous: previous.handle, current: snapshot[0] });
+      }
+    }
+    const retiredHandles: BrowserElementHandleLike[] = [];
     try {
+      const sameNodes = await compareIdentityHandles(identityComparisons, signal);
       for (const control of controls) {
         abortIfNeeded(signal);
         if (control.role === "img" && control.actions.length === 0) { rebound.push(control); continue; }
-        const selector = selectorForControl(control);
-        const group = selectorControls.get(selector) ?? [];
-        const snapshot = snapshots.get(selector);
-        // A selector shared by multiple observed controls or producing a
-        // non-unique/vanished snapshot cannot safely pin any of them.
+        const group = groupFor(control);
+        const snapshot = snapshotFor(control);
+        // A stable selector and its exact-path fallback both must identify
+        // one attached node before it can be pinned.
         if (group.length !== 1 || !snapshot || snapshot.length !== 1) {
           complete = false;
           missingKeys.add(control.__stableKey);
@@ -801,7 +1052,7 @@ export function createBrowserBackend(page: Page | BrowserPageLike, options: Brow
         const handle = snapshot[0];
         consumed.add(handle);
         const previous = identityHandles.get(control.__stableKey);
-        const sameNode = previous ? await sameDomNode(previous.handle, handle) : false;
+        const sameNode = previous ? (sameNodes.get(control.__stableKey) ?? false) : false;
         abortIfNeeded(signal);
         const current = identityHandles.get(control.__stableKey);
         const id = sameNode && current === previous
@@ -821,21 +1072,22 @@ export function createBrowserBackend(page: Page | BrowserPageLike, options: Brow
     } catch (error) {
       await Promise.all([...handles.values()].map(releaseHandle));
       await Promise.all(pendingIdentityRetains.map(releaseHandle));
+      await releaseHandlesConcurrently(retiredHandles);
       await disposeUnownedHandles([...snapshots.values()].flatMap((snapshot) => (snapshot ?? []).filter((handle) => !consumed.has(handle))));
+      await disposeUnownedHandles([...fallbackSnapshots.values()].flatMap((snapshot) => (snapshot ?? []).filter((handle) => !consumed.has(handle))));
       throw error;
     }
     // Commit identity changes only after the whole snapshot has been walked;
     // cancellation cannot leave a partially rebound cache behind.
     for (const control of controls) {
       if (control.role === "img" && control.actions.length === 0) continue;
-      const selector = selectorForControl(control);
-      const group = selectorControls.get(selector) ?? [];
-      const snapshot = snapshots.get(selector);
+      const group = groupFor(control);
+      const snapshot = snapshotFor(control);
       const previous = identityHandles.get(control.__stableKey);
       if (missingKeys.has(control.__stableKey) || group.length !== 1 || !snapshot || snapshot.length !== 1) {
         if (previous) {
           identityHandles.delete(control.__stableKey);
-          await releaseHandle(previous.handle);
+          retiredHandles.push(previous.handle);
         }
         continue;
       }
@@ -844,16 +1096,20 @@ export function createBrowserBackend(page: Page | BrowserPageLike, options: Brow
       if (!bound) continue;
       identityHandles.delete(control.__stableKey);
       identityHandles.set(control.__stableKey, { id: bound.id, handle });
-      if (previous && previous.handle !== handle) await releaseHandle(previous.handle);
+      if (previous && previous.handle !== handle) retiredHandles.push(previous.handle);
     }
+    await releaseHandlesConcurrently(retiredHandles);
     await disposeUnownedHandles([...snapshots.values()].flatMap((snapshot) => (snapshot ?? []).filter((handle) => !consumed.has(handle))));
+    await disposeUnownedHandles([...fallbackSnapshots.values()].flatMap((snapshot) => (snapshot ?? []).filter((handle) => !consumed.has(handle))));
+    const overflowHandles: BrowserElementHandleLike[] = [];
     while (identityHandles.size > searchLimit) {
       const oldest = identityHandles.keys().next().value as string | undefined;
       if (!oldest) break;
       const entry = identityHandles.get(oldest)!;
       identityHandles.delete(oldest);
-      await releaseHandle(entry.handle);
+      overflowHandles.push(entry.handle);
     }
+    await releaseHandlesConcurrently(overflowHandles);
     return { controls: rebound, handles, complete };
   }
 
@@ -893,7 +1149,7 @@ export function createBrowserBackend(page: Page | BrowserPageLike, options: Brow
               (overflowY !== "visible" && (y < clip.top || y >= clip.bottom))) inViewport = false;
           }
         }
-        return { connected: true, actionable, inViewport, topmost, focused: document.activeElement === target };
+        return { connected: true, actionable, inViewport, topmost, focused: document.activeElement === target, point: { x, y } };
       }, point);
       if (!result) return undefined;
       if (!control.approvalContext || !handle.evaluate) return { ...result, approvalChanged: false };
@@ -908,22 +1164,129 @@ export function createBrowserBackend(page: Page | BrowserPageLike, options: Brow
     return (await focused(signal))?.id;
   }
 
-  async function captureImage(signal?: AbortSignal): Promise<FrameImage> {
+  async function viewportEvidence(signal?: AbortSignal): Promise<Omit<PointEvidence, "image">> {
+    abortIfNeeded(signal);
+    const state = await browserPage.evaluate(() => ({
+      href: window.location.href,
+      viewportWidth: window.innerWidth,
+      viewportHeight: window.innerHeight,
+      scrollX: window.scrollX,
+      scrollY: window.scrollY,
+      mutationGeneration: (() => {
+        const key = "__desklatchPointEvidenceMutation";
+        type MutationState = { document: Document; generation: number; observer: MutationObserver };
+        const host = globalThis as typeof globalThis & { [key: string]: MutationState | undefined };
+        const relevantMutation = (record: MutationRecord): boolean => record.type === "childList"
+          || record.type === "characterData"
+          || (record.type === "attributes" && record.attributeName !== "style" && record.attributeName !== "class");
+        let current = host[key];
+        if (!current || current.document !== document) {
+          const next = { document, generation: 0, observer: undefined as unknown as MutationObserver };
+          next.observer = new MutationObserver(records => { next.generation += records.filter(relevantMutation).length; });
+          next.observer.observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
+          try {
+            Object.defineProperty(host, key, { configurable: true, value: next });
+          } catch {
+            host[key] = next;
+          }
+          current = next;
+        }
+        const pending = current.observer.takeRecords();
+        current.generation += pending.filter(relevantMutation).length;
+        return current.generation;
+      })(),
+      hitFingerprint: (() => {
+        const elements = Array.from(document.querySelectorAll<HTMLElement>("*"));
+        const relevant: string[] = [];
+        const interactiveTags = new Set(["A", "BUTTON", "INPUT", "SELECT", "TEXTAREA", "SUMMARY"]);
+        for (const [index, element] of elements.entries()) {
+          const style = getComputedStyle(element);
+          const interactive = Boolean(element.getAttribute("role")) || interactiveTags.has(element.tagName);
+          const hitRelevant = interactive
+            || style.pointerEvents !== "auto"
+            || style.zIndex !== "auto"
+            || style.position !== "static"
+            || style.opacity !== "1"
+            || style.visibility !== "visible"
+            || style.display === "none"
+            || style.display === "contents";
+          if (!hitRelevant) continue;
+          const rect = element.getBoundingClientRect();
+          relevant.push(`${index}:${element.tagName}:${rect.x},${rect.y},${rect.width},${rect.height}:${style.pointerEvents}:${style.zIndex}:${style.position}:${style.opacity}:${style.visibility}:${style.display}`);
+        }
+        let hash = 2_166_136_261;
+        const text = relevant.join("|");
+        for (let index = 0; index < text.length; index += 1) {
+          hash ^= text.charCodeAt(index);
+          hash = Math.imul(hash, 16_777_619);
+        }
+        return `${relevant.length}:${(hash >>> 0).toString(16)}`;
+      })(),
+    }));
+    if (!state || typeof state.href !== "string"
+      || !Number.isFinite(state.viewportWidth) || !Number.isFinite(state.viewportHeight)
+      || !Number.isFinite(state.scrollX) || !Number.isFinite(state.scrollY)
+      || !Number.isSafeInteger(state.mutationGeneration)) {
+      throw new BrowserBackendError("point_evidence_unavailable");
+    }
+    return {
+      href: state.href,
+      viewportWidth: Math.floor(state.viewportWidth),
+      viewportHeight: Math.floor(state.viewportHeight),
+      scrollX: state.scrollX,
+      scrollY: state.scrollY,
+      mutationGeneration: state.mutationGeneration,
+      hitFingerprint: state.hitFingerprint,
+    };
+  }
+
+  function sameViewportEvidence(left: Omit<PointEvidence, "image">, right: Omit<PointEvidence, "image">): boolean {
+    return left.href === right.href
+      && left.viewportWidth === right.viewportWidth
+      && left.viewportHeight === right.viewportHeight
+      && left.scrollX === right.scrollX
+      && left.scrollY === right.scrollY
+      && left.mutationGeneration === right.mutationGeneration
+      && left.hitFingerprint === right.hitFingerprint;
+  }
+
+  async function captureImageWithEvidence(signal?: AbortSignal): Promise<{ image: FrameImage; evidence?: PointEvidence }> {
     abortIfNeeded(signal);
     if (!allowImages) throw new BrowserBackendError("image_not_allowed");
     // A subtree grant must not silently become a full-page snapshot. The
     // host can provide a dedicated cropped Page/adapter when it wants this.
     if (rootSelector) throw new BrowserBackendError("image_scope_unsupported");
     if (!browserPage.screenshot) throw new BrowserBackendError("image_unavailable");
-    const viewport = await browserPage.evaluate(() => ({ width: window.innerWidth, height: window.innerHeight }));
+    const before = await viewportEvidence(signal);
     const bytes = await browserPage.screenshot({ type: "png", fullPage: false });
     abortIfNeeded(signal);
-    return {
+    const image = {
       mimeType: "image/png",
       dataBase64: Buffer.from(bytes).toString("base64"),
-      width: Math.max(0, Math.floor(viewport.width)),
-      height: Math.max(0, Math.floor(viewport.height)),
+      width: Math.max(0, before.viewportWidth),
+      height: Math.max(0, before.viewportHeight),
     };
+    const after = await viewportEvidence(signal);
+    return {
+      image,
+      ...(sameViewportEvidence(before, after) ? { evidence: { ...before, image } } : {}),
+    };
+  }
+
+  async function pointEvidenceMatches(evidence: PointEvidence, signal?: AbortSignal): Promise<boolean> {
+    try {
+      const before = await viewportEvidence(signal);
+      if (!sameViewportEvidence(before, evidence)) return false;
+      if (!browserPage.screenshot) return false;
+      const bytes = await browserPage.screenshot({ type: "png", fullPage: false });
+      abortIfNeeded(signal);
+      const after = await viewportEvidence(signal);
+      if (!sameViewportEvidence(before, after)) return false;
+      return Buffer.from(bytes).toString("base64") === evidence.image.dataBase64;
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      return false;
+    }
   }
 
   async function dispatch(request: Dispatch): Promise<BrowserDelivery> {
@@ -971,10 +1334,26 @@ export function createBrowserBackend(page: Page | BrowserPageLike, options: Brow
       if ((step.kind === "click" || step.kind === "keypress" || step.kind === "hotkey" || step.kind === "type" || step.kind === "setValue") && !physical.topmost) {
         return { status: "refused", code: resolved.point ? "point_occluded" : "occluded", risk };
       }
+      const beforeClickRoute = step.kind === "click" ? navigationRoute(pageUrl(browserPage)) : undefined;
+      const navigationClick = skipPostNavigationFocusRefresh
+        && step.kind === "click"
+        && target.role === "link"
+        && target.effect === "navigate"
+        && target.sameDocumentTab !== true;
       abortIfNeeded(request.signal);
       switch (step.kind) {
         case "click":
           if (resolved.point) { issued = true; await browserPage.mouse.click(resolved.point.x, resolved.point.y, { button: "left", clickCount: 1 }); }
+          else if (preferMouseNavigationClick && navigationClick && physical.point) {
+            // Playwright's element click waits on a navigation receipt over
+            // E2B CDP and can occupy the whole session deadline after the
+            // event has already been physically verified. A point click keeps
+            // the same target/material/approval checks above while allowing
+            // the existing post-action scope/origin guard to decide whether
+            // the receipt is a navigation or an unknown delivery.
+            issued = true;
+            await browserPage.mouse.click(physical.point.x, physical.point.y, { button: "left", clickCount: 1 });
+          }
           else if (resolved.handle.click) { issued = true; await resolved.handle.click({ button: "left", clickCount: 1, timeout: actionTimeoutMs }); }
           else return { status: "refused", code: "action_unavailable", risk };
           break;
@@ -1009,6 +1388,22 @@ export function createBrowserBackend(page: Page | BrowserPageLike, options: Brow
         }
         default:
           return { status: "refused", code: "unsupported_action", risk };
+      }
+      // A cross-document link click invalidates the old frame scope. On the
+      // E2B CDP path, refreshing focus here would scan/bind the entire new
+      // page before returning the receipt and can consume the session budget.
+      // The physical target and risk checks above already ran against the old
+      // page; the next observation is the authoritative new scope.
+      if (navigationClick) {
+        // Recheck lifecycle/origin and the actual route before omitting the
+        // old-scope focus lookup. Hash-only, prevented, download, and no-op
+        // clicks stay on the normal focus path. Mouse delivery can return
+        // before Chromium emits framenavigated, so wait briefly for the
+        // observable scope/route transition without issuing a DOM scan.
+        if (beforeClickRoute !== undefined
+          && await waitForNavigationStart(request.frame.scope, beforeClickRoute, request.signal)) {
+          return { status: "dispatched", code: "navigation_started", risk };
+        }
       }
       const focusId = await activeId(request.signal);
       return { status: "dispatched", ...(scope !== request.frame.scope ? { code: "navigation_started" } : {}), ...(focusId ? { focusId } : {}), risk };
@@ -1059,10 +1454,12 @@ export function createBrowserBackend(page: Page | BrowserPageLike, options: Brow
       // Document reads are explicit and never run for a selector-scoped
       // control lookup. This keeps act/expect refreshes prose-free.
       const document = request.read && !request.where ? await readDocument(request.read, request.signal) : undefined;
-      const image = view === "controls" ? undefined : await captureImage(request.signal);
+      const captured = view === "controls" ? undefined : await captureImageWithEvidence(request.signal);
+      const image = captured?.image;
       const frame: Frame = { scope, controls: controls.map(publicControl), complete, ...(focusId ? { focusId } : {}), ...(image ? { image } : {}), ...(document ? { document } : {}) };
       const state: FrameState = { scope, controls: new Map(controls.map((control) => [control.id, control])), handles };
       privateState.frames.set(frame, state);
+      if (image) pointEvidence.set(state, captured?.evidence ?? null);
       retainFrameState(state);
       return frame;
     } catch (error) {
@@ -1074,14 +1471,24 @@ export function createBrowserBackend(page: Page | BrowserPageLike, options: Brow
   async function hitTest(frame: Frame, point: { x: number; y: number }, signal?: AbortSignal): Promise<Control | undefined> {
     try {
       ensureUsable();
-      frameHas(privateState, frame, scope);
+      const state = frameHas(privateState, frame, scope);
       abortIfNeeded(signal);
       if (!isPoint(point)) return undefined;
-      const path = await pagePointHit(browserPage, point);
-      if (!path) return undefined;
-      const current = await collect(searchLimit, signal);
-      const hit = current.controls.filter((control) => control.__path === path);
-      return hit.length === 1 ? publicControl(hit[0]) : undefined;
+      const hit = await livePointHit(point, signal);
+      if (!hit) return undefined;
+      // TargetResolver uses the same backend method for its fresh live
+      // re-grounding. Only an image-bearing frame is an origin snapshot;
+      // controls-only frames must not be rejected merely because their live
+      // page currently has overlapping rectangles.
+      if (frame.image === undefined) return publicControl(hit);
+      const originalCandidates = pointControls(state, point);
+      const original = originalCandidates.find((candidate) => candidate.id === hit.id);
+      if (!original || !state.handles.has(original.id)) return undefined;
+      if (originalCandidates.length > 1) {
+        const evidence = pointEvidence.get(state);
+        if (evidence === null || evidence === undefined || !await pointEvidenceMatches(evidence, signal)) return undefined;
+      }
+      return publicControl(original);
     } catch {
       return undefined;
     }
@@ -1106,5 +1513,5 @@ export function createBrowserBackend(page: Page | BrowserPageLike, options: Brow
     { kind: "keypress", targets: ["selector", "ref", "focus"], keys: [...SAFE_KEYS] },
     { kind: "hotkey", targets: ["selector", "ref", "focus"], chords: [["ctrl", "a"], ["Control", "a"], ["meta", "a"], ["Meta", "a"]] },
   ];
-  return Object.freeze({ allowDocumentText, capabilities, observe, hitTest, dispatch, close });
+  return Object.freeze({ allowDocumentText, supportsScopedRefRefresh: true as const, hitTestSnapshot: true as const, capabilities, observe, hitTest, dispatch, close });
 }

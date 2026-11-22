@@ -502,7 +502,7 @@ export function createRawCollectionScript() {
       if (expanded === "true") states.push("expanded");
       const actions: string[] = [];
       if (!graphic && (["button", "checkbox", "link", "menuitem", "option", "radio", "switch", "tab"].includes(role) || ["A", "BUTTON", "SUMMARY"].includes(element.tagName))) actions.push("click");
-      if (!graphic && editable(element, role)) actions.push("type", "setValue");
+      if (!graphic && editable(element, role)) actions.push("click", "type", "setValue");
       if (!graphic && states.includes("enabled")) actions.push("keypress", "hotkey");
       if (!graphic && (element.scrollHeight > element.clientHeight || element.scrollWidth > element.clientWidth)) actions.push("scroll");
       const rect = element.getBoundingClientRect();

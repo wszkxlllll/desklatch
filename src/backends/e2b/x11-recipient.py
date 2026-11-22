@@ -24,9 +24,10 @@ MAX_DEPTH = 64
 MAX_TREE_NODES = 4096
 MAX_WINDOW_ID = 0xFFFFFFFF
 MAX_TYPE_TEXT = 4096
+MAX_SCROLL_AMOUNT = 20
 WINDOW_ID = re.compile(r"^[1-9][0-9]*$")
 APPLICATION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+-]{0,127}$")
-ALLOWED_REQUEST_KEYS = {"op", "window_id", "process_id", "application", "point", "text"}
+ALLOWED_REQUEST_KEYS = {"op", "window_id", "process_id", "application", "point", "text", "direction", "amount"}
 VIEWABLE = 2  # IsViewable from Xlib's map_state enum.
 ROOT_PARENT = 0
 POINTER_ROOT = 1
@@ -115,7 +116,7 @@ def safe_request(raw, operation=None):
     if not isinstance(raw, dict) or set(raw) - ALLOWED_REQUEST_KEYS:
         fail("x11_recipient_request_invalid")
     op = raw.get("op") if operation is None else operation
-    if op not in {"verify", "click", "keyboard_focus", "type_text"}:
+    if op not in {"verify", "click", "scroll", "keyboard_focus", "type_text"}:
         fail("x11_recipient_request_invalid")
     window_id = safe_window(raw.get("window_id"))
     pid = raw.get("process_id")
@@ -125,7 +126,7 @@ def safe_request(raw, operation=None):
     if not isinstance(application, str) or not APPLICATION.fullmatch(application):
         fail("x11_recipient_application_invalid")
     if op in {"keyboard_focus", "type_text"}:
-        if "point" in raw:
+        if any(key in raw for key in ("point", "direction", "amount")):
             fail("x11_recipient_request_invalid")
         if op == "type_text":
             text = raw.get("text")
@@ -133,13 +134,26 @@ def safe_request(raw, operation=None):
                 fail("x11_recipient_text_invalid")
             return {"op": op, "window_id": window_id, "process_id": pid, "application": application.lower(), "text": text}
         return {"op": op, "window_id": window_id, "process_id": pid, "application": application.lower()}
+    if op in {"verify", "click"} and ("direction" in raw or "amount" in raw):
+        fail("x11_recipient_request_invalid")
+    if op == "scroll":
+        direction = raw.get("direction")
+        amount = raw.get("amount")
+        if direction not in {"up", "down"}:
+            fail("x11_recipient_scroll_direction_invalid")
+        if isinstance(amount, bool) or not isinstance(amount, int) or amount < 1 or amount > MAX_SCROLL_AMOUNT:
+            fail("x11_recipient_scroll_amount_invalid")
     point = raw.get("point")
     if not isinstance(point, dict) or set(point) != {"x", "y"}:
         fail("x11_recipient_point_invalid")
     x, y = point.get("x"), point.get("y")
     if isinstance(x, bool) or isinstance(y, bool) or not isinstance(x, int) or not isinstance(y, int):
         fail("x11_recipient_point_invalid")
-    return {"op": op, "window_id": window_id, "process_id": pid, "application": application.lower(), "point": (x, y)}
+    result = {"op": op, "window_id": window_id, "process_id": pid, "application": application.lower(), "point": (x, y)}
+    if op == "scroll":
+        result["direction"] = direction
+        result["amount"] = amount
+    return result
 
 
 def load_x11():
@@ -185,6 +199,8 @@ def load_x11():
     x11.XGetInputFocus.restype = ctypes.c_int
     x11.XFlush.argtypes = [ctypes.c_void_p]
     x11.XFlush.restype = ctypes.c_int
+    x11.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    x11.XSync.restype = ctypes.c_int
     x11.XCreateSimpleWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_uint, ctypes.c_uint, ctypes.c_ulong, ctypes.c_ulong]
     x11.XCreateSimpleWindow.restype = ctypes.c_ulong
     x11.XDestroyWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
@@ -688,15 +704,65 @@ class X11Recipient:
             fail("x11_recipient_point_occluded")
         return {"window_id": str(window), "process_id": pid, "screen": {"width": self.screen_size[0], "height": self.screen_size[1]}, "bounds": bounds, "active_window_id": str(active), "focus_window_id": str(focus), "topmost_window_id": str(topmost), "topmost_chain": [str(item) for item in top_chain]}
 
+    def pointer_dispatch(self, request):
+        """Verify and deliver one bounded pointer transaction atomically.
+
+        The server grab keeps the authorized recipient, pointer position, and
+        topmost-window proof stable while XTest queues motion plus click or
+        wheel events. Any attempted physical event whose completion cannot be
+        established is deliberately reported as unknown.
+        """
+        grabbed = False
+        event_attempted = False
+        button_down = False
+        button = 1 if request["op"] == "click" else (4 if request["direction"] == "up" else 5)
+        try:
+            self.x11.XGrabServer(self.display)
+            grabbed = True
+            self.modal_blockers(request["window_id"], request["process_id"], self.identity(request["window_id"])[1])
+            self.verify(request)
+            x, y = request["point"]
+            if not self.xtst.XTestFakeMotionEvent(self.display, self.screen, x, y, 0):
+                fail("x11_recipient_motion_failed")
+            self.x11.XSync(self.display, 0)
+            proof = self.verify(request)
+            count = 1 if request["op"] == "click" else request["amount"]
+            for _ in range(count):
+                event_attempted = True
+                if not self.xtst.XTestFakeButtonEvent(self.display, button, 1, 0):
+                    fail("x11_recipient_click_failed" if request["op"] == "click" else "x11_recipient_scroll_failed")
+                button_down = True
+                if not self.xtst.XTestFakeButtonEvent(self.display, button, 0, 0):
+                    fail("x11_recipient_click_failed" if request["op"] == "click" else "x11_recipient_scroll_failed")
+                button_down = False
+            self.x11.XSync(self.display, 0)
+            return {
+                **proof,
+                ("clicked" if request["op"] == "click" else "scrolled"): True,
+                **({} if request["op"] == "click" else {"direction": request["direction"], "amount": request["amount"]}),
+            }
+        except RuntimeError:
+            if event_attempted:
+                fail("x11_recipient_delivery_unknown")
+            raise
+        finally:
+            if button_down:
+                try:
+                    self.xtst.XTestFakeButtonEvent(self.display, button, 0, 0)
+                except Exception:
+                    pass
+            try:
+                self.x11.XFlush(self.display)
+            finally:
+                if grabbed:
+                    self.x11.XUngrabServer(self.display)
+                    self.x11.XFlush(self.display)
+
     def click(self, request):
-        proof = self.verify(request)
-        x, y = request["point"]
-        if not self.xtst.XTestFakeMotionEvent(self.display, self.screen, x, y, 0):
-            fail("x11_recipient_motion_failed")
-        if not self.xtst.XTestFakeButtonEvent(self.display, 1, 1, 0) or not self.xtst.XTestFakeButtonEvent(self.display, 1, 0, 0):
-            fail("x11_recipient_click_failed")
-        self.x11.XFlush(self.display)
-        return {**proof, "clicked": True}
+        return self.pointer_dispatch(request)
+
+    def scroll(self, request):
+        return self.pointer_dispatch(request)
 
 
 def self_test():
@@ -720,6 +786,16 @@ def self_test():
         assert str(error) == "x11_recipient_text_invalid"
     else:
         raise AssertionError("type_text_bound_must_refuse")
+    scroll = safe_request({"op": "scroll", "window_id": "100", "process_id": 123, "application": "chrome", "point": {"x": 10, "y": 20}, "direction": "down", "amount": MAX_SCROLL_AMOUNT})
+    assert scroll["amount"] == MAX_SCROLL_AMOUNT
+    try:
+        # Re-encode the normalized integer window ID as the JSON wire string
+        # accepted by safe_request before testing the amount bound.
+        safe_request({**scroll, "window_id": str(scroll["window_id"]), "amount": MAX_SCROLL_AMOUNT + 1})
+    except RuntimeError as error:
+        assert str(error) == "x11_recipient_scroll_amount_invalid"
+    else:
+        raise AssertionError("scroll_bound_must_refuse")
     return {"ok": True, "foreign_overlay_refused": True, "overlay_depth_refused": True, "foreign_modal_refused": True, "type_text_bounded": True}
 
 
@@ -752,6 +828,8 @@ def main():
         try:
             if request["op"] == "click":
                 result = recipient.click(request)
+            elif request["op"] == "scroll":
+                result = recipient.scroll(request)
             elif request["op"] == "keyboard_focus":
                 result = recipient.keyboard_focus(request)
             elif request["op"] == "type_text":

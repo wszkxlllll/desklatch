@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
+import { isWindowPointGesture, sameWindowPointBounds } from "../../core/window-point.js";
 import type {
   ActionKind,
   Capability,
@@ -58,6 +59,7 @@ export interface E2BAtSpiWorker {
 export interface E2BX11Recipient {
   verify(request: Readonly<{ windowId: string; processId: number; application: string; point: Point }>, options?: { readonly signal?: AbortSignal }): Promise<boolean>;
   click(request: Readonly<{ windowId: string; processId: number; application: string; point: Point }>, options?: { readonly signal?: AbortSignal }): Promise<boolean>;
+  scroll?(request: Readonly<{ windowId: string; processId: number; application: string; point: Point; direction: "up" | "down"; amount: number }>, options?: { readonly signal?: AbortSignal }): Promise<boolean>;
   close?(): Promise<void>;
 }
 
@@ -93,7 +95,7 @@ export interface E2BDesktopBackendOptions {
   readonly allowTemporaryClipboard?: boolean;
   /** Let the model receive screenshots only when the host explicitly grants them. */
   readonly allowScreenshot?: boolean;
-  /** Explicitly opt into screenshot/point-only Window controls when AT-SPI is unavailable. */
+  /** Explicitly opt into screenshot/window-only controls when AT-SPI is unavailable. */
   readonly allowDegradedScreenshot?: boolean;
   /** Expose only non-sensitive AT-SPI values when explicitly enabled. */
   readonly includeValues?: boolean;
@@ -145,6 +147,14 @@ interface InternalFrame {
   readonly frame: Frame;
   readonly controls: ReadonlyMap<string, InternalControl>;
   readonly degraded: boolean;
+  /**
+   * Host-private point grounding. An image-only public frame is intentionally
+   * incomplete, but it may still be backed by a complete AT-SPI snapshot.
+   * Degraded/window-only snapshots never set this flag.
+   */
+  readonly pointEvidence: boolean;
+  /** Window active at capture, kept independently of AT-SPI completeness. */
+  readonly pointWindowId?: string;
 }
 
 const MAX_WINDOWS = 16;
@@ -152,11 +162,12 @@ const MAX_ELEMENTS = 512;
 const MAX_TEXT_LENGTH = 16_384;
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 const MAX_TIMEOUT_MS = 30_000;
+export const E2B_X11_SCROLL_MAX_AMOUNT = 20;
 const SAFE_WINDOW_ID = /^(?:0x[0-9a-f]+|[0-9]+)$/iu;
 const SAFE_APPLICATION = /^[A-Za-z0-9][A-Za-z0-9_.+-]{0,127}$/u;
 const SAFE_TEXT = /^[^\u0000\u0008\u000b\u000c\u000e-\u001f\u007f\u2028\u2029]*$/u;
 const VALID_STATES = new Set<State>(["visible", "enabled", "editable", "focused", "checked", "selected", "expanded"]);
-const VALID_ACTIONS = new Set<ActionKind>(["click", "type", "setValue", "keypress", "hotkey"]);
+const VALID_ACTIONS = new Set<ActionKind>(["click", "type", "setValue", "scroll", "keypress", "hotkey"]);
 const VALID_EFFECTS = new Set<NonNullable<Control["effect"]>>(["read", "navigate", "edit", "external", "financial", "destructive", "security", "sensitive", "unknown"]);
 const ALLOWED_KEYS = new Set([
   "backspace", "delete", "enter", "escape", "esc", "tab", "space", "left", "right", "up", "down", "home", "end", "page_up", "page_down", "insert",
@@ -284,24 +295,36 @@ function selectorMatches(control: Control, selector?: Selector): boolean {
   return true;
 }
 
-function actionCapabilities(allowPointActions: boolean, pointOwnershipProof: boolean, keyboardMode: "full" | "restricted" | "none"): Capability[] {
+function actionCapabilities(
+  allowPointActions: boolean,
+  pointOwnershipProof: boolean,
+  keyboardMode: "full" | "restricted" | "none",
+  scrollSupported: boolean,
+  windowPointAllowed: boolean,
+): Capability[] {
   const capabilities: Capability[] = [
     { kind: "click", targets: ["selector", "ref"], buttons: ["left"], counts: [1] },
   ];
   if (keyboardMode === "restricted") {
     capabilities.push(
-      { kind: "type", targets: ["selector", "ref"] },
+      { kind: "type", targets: ["selector", "ref", "focus"] },
       { kind: "hotkey", targets: ["selector", "ref"], chords: [["ctrl", "s"], ["Control", "s"]] },
     );
   } else if (keyboardMode === "full") {
     capabilities.push(
-      { kind: "type", targets: ["selector", "ref"] },
+      { kind: "type", targets: ["selector", "ref", "focus"] },
       { kind: "setValue", targets: ["selector", "ref"] },
       { kind: "keypress", targets: ["selector", "ref"], keys: [...ALLOWED_KEYS] },
       { kind: "hotkey", targets: ["selector", "ref"], chords: [...[...ALLOWED_CHORDS].map((item) => item.split("+") as string[])] },
     );
   }
+  if (scrollSupported && keyboardMode !== "none") {
+    capabilities.push({ kind: "scroll", targets: ["selector", "ref"], directions: ["up", "down"], units: ["line"] });
+  }
   if (allowPointActions && pointOwnershipProof) capabilities.push({ kind: "click", targets: ["point"], buttons: ["left"], counts: [1] });
+  if (windowPointAllowed && scrollSupported) {
+    capabilities.push({ kind: "scroll", targets: ["point"], directions: ["up", "down"], units: ["line"] });
+  }
   return capabilities;
 }
 
@@ -354,6 +377,9 @@ export async function createE2BDesktopBackend(
   const keyboardGrant = keyboardEnabled ? grants[0] : undefined;
   const pointOwnershipProof = Boolean(recipient && grants.every((grant) => grant.processId !== undefined)) || typeof desktop.verifyPointOwnership === "function";
   const keyboardMode: "full" | "restricted" | "none" = keyboardEnabled ? "restricted" : allowDegradedScreenshot ? "none" : "full";
+  const scrollSupported = Boolean(recipient?.scroll && grants.every((grant) => grant.processId !== undefined));
+  const windowPointAllowed = allowScreenshot && allowPointActions && allowDegradedScreenshot
+    && recipient !== undefined && grants.every((grant) => grant.processId !== undefined);
   const scope = `e2b-desktop-${randomUUID()}`;
   const knownFrames = new WeakMap<Frame, InternalFrame>();
   const activationEvents: E2BDesktopActivationEvent[] = [];
@@ -393,6 +419,13 @@ export async function createE2BDesktopBackend(
     }
   }
 
+  function x11PointerRefusal(code: string | undefined): boolean {
+    if (!code) return false;
+    if (code.startsWith("e2b_x11_recipient_")) return code !== "e2b_x11_recipient_delivery_unknown";
+    if (!code.startsWith("x11_recipient_")) return false;
+    return !["x11_recipient_click_failed", "x11_recipient_scroll_failed", "x11_recipient_delivery_unknown"].includes(code);
+  }
+
   async function clickPoint(target: InternalControl, point: Point, signal?: AbortSignal): Promise<Delivery | undefined> {
     if (recipient && target.window.processId !== undefined) {
       try {
@@ -402,7 +435,7 @@ export async function createE2BDesktopBackend(
       } catch (error) {
         if (signal?.aborted) throw error;
         const code = errorCode(error);
-        if (code && code.startsWith("e2b_x11_recipient_") && code !== "e2b_x11_recipient_delivery_unknown") {
+        if (x11PointerRefusal(code)) {
           return { status: "refused", code };
         }
         return { status: "unknown", code: code ?? "e2b_desktop_point_delivery_unknown" };
@@ -414,6 +447,31 @@ export async function createE2BDesktopBackend(
     if (!desktop.leftClick) return { status: "refused", code: "e2b_desktop_pointer_unavailable" };
     await desktop.leftClick(Math.round(point.x), Math.round(point.y));
     return undefined;
+  }
+
+  async function scrollPoint(target: InternalControl, point: Point, direction: "up" | "down", amount: number, signal?: AbortSignal): Promise<Delivery | undefined> {
+    if (!recipient?.scroll || target.window.processId === undefined) {
+      return { status: "refused", code: "e2b_desktop_scroll_unavailable" };
+    }
+    try {
+      const scrolled = await recipient.scroll({
+        windowId: target.windowId,
+        processId: target.window.processId,
+        application: target.window.application,
+        point: { x: Math.round(point.x), y: Math.round(point.y) },
+        direction,
+        amount,
+      }, signal ? { signal } : undefined);
+      if (!scrolled) return { status: "refused", code: "e2b_desktop_point_not_owned" };
+      return undefined;
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      const code = errorCode(error);
+      if (x11PointerRefusal(code)) {
+        return { status: "refused", code };
+      }
+      return { status: "unknown", code: code ?? "e2b_desktop_scroll_delivery_unknown" };
+    }
   }
 
   async function verifyGrant(grant: E2BWindowGrant): Promise<{ live: boolean; title?: string }> {
@@ -564,7 +622,7 @@ export async function createE2BDesktopBackend(
     if (optionsForObserve.view === "image" && !allowPointActions) {
       const image = await capture(optionsForObserve.view);
       const frame: Frame = Object.freeze({ scope, controls: Object.freeze([]), complete: false, ...(image ? { image } : {}) });
-      knownFrames.set(frame, { frame, controls: new Map(), degraded: false });
+      knownFrames.set(frame, { frame, controls: new Map(), degraded: false, pointEvidence: false });
       return frame;
     }
     const live = await Promise.all(grants.map(async (grant) => ({ grant, status: await verifyGrant(grant) })));
@@ -575,7 +633,12 @@ export async function createE2BDesktopBackend(
     const degraded = inspected.degraded;
     for (const { grant, status } of live) {
       if (!status.live) { complete = false; continue; }
-      const snapshot = byWindow.get(grant.windowId);
+      let snapshot = byWindow.get(grant.windowId);
+      if (!snapshot && windowPointAllowed && grant.processId !== undefined) {
+        complete = false;
+        const bounds = await fallbackWindowBounds(grant.windowId, optionsForObserve.signal);
+        if (bounds) snapshot = { bounds, controls: [] };
+      }
       if (!snapshot) { complete = false; continue; }
       const title = status.title ?? normalizeTitle(snapshot.title) ?? grant.title;
       const windowBounds = rect(snapshot.bounds);
@@ -584,6 +647,7 @@ export async function createE2BDesktopBackend(
         role: "Window",
         ...(title === undefined ? {} : { name: title }),
         within: grant.application,
+        windowScope: `x11:${grant.windowId}:${grant.processId ?? "unknown"}`,
         states: ["visible", "enabled"],
         // A degraded screenshot only proves an enrolled window, not a
         // semantic document/editor target. Keep activation discoverable but
@@ -595,6 +659,7 @@ export async function createE2BDesktopBackend(
       controls.push({ control: windowControl, windowId: grant.windowId, window: grant });
       const rawControls = Array.isArray(snapshot.controls) ? snapshot.controls : [];
       if (!Array.isArray(snapshot.controls)) complete = false;
+      const controlsBefore = controls.length;
       for (let index = 0; index < rawControls.length && controls.length < maxElements; index += 1) {
         const raw = rawControls[index];
         if (!raw || typeof raw !== "object" || Array.isArray(raw)) { complete = false; continue; }
@@ -624,12 +689,24 @@ export async function createE2BDesktopBackend(
         };
         controls.push({ control, windowId: grant.windowId, window: grant });
       }
-      if (rawControls.length + controls.length > maxElements) complete = false;
+      if (rawControls.length > Math.max(0, maxElements - controlsBefore)) complete = false;
     }
     const filtered = optionsForObserve.view === "image" ? [] : controls.filter((item) => selectorMatches(item.control, optionsForObserve.where));
+    const pointWindowId = windowPointAllowed ? await currentTopLevelWindowId(optionsForObserve.signal) : undefined;
     const image = await capture(optionsForObserve.view);
+    const boundPointWindow = pointWindowId && (!image || pointWindowId === await currentTopLevelWindowId(optionsForObserve.signal))
+      ? pointWindowId : undefined;
     const frame: Frame = Object.freeze({ scope, controls: Object.freeze(filtered.map((item) => item.control)), complete: optionsForObserve.view !== "image" && !degraded && complete && filtered.length <= maxElements, ...(image ? { image } : {}) });
-    knownFrames.set(frame, { frame, controls: new Map(controls.map((item) => [item.control.id, item])), degraded });
+    // Keep this evidence private. A screenshot-only observation remains
+    // incomplete on the public surface, while a complete AT-SPI snapshot can
+    // still ground a point after the final X11 owner/occlusion probe.
+    knownFrames.set(frame, {
+      frame,
+      controls: new Map(controls.map((item) => [item.control.id, item])),
+      degraded,
+      pointEvidence: !degraded && complete,
+      ...(boundPointWindow ? { pointWindowId: boundPointWindow } : {}),
+    });
     return frame;
   }
 
@@ -679,7 +756,8 @@ export async function createE2BDesktopBackend(
     if (request.signal?.aborted) return { status: "refused", code: "cancelled_before_dispatch" };
     const stored = knownFrames.get(request.frame);
     if (!stored || request.frame.scope !== scope) return { status: "refused", code: "e2b_desktop_stale_observation" };
-    if (request.origin && request.origin.scope !== scope) return { status: "refused", code: "e2b_desktop_stale_origin" };
+    const originStored = request.origin === undefined ? undefined : knownFrames.get(request.origin);
+    if (request.origin && (!originStored || request.origin.scope !== scope)) return { status: "refused", code: "e2b_desktop_stale_origin" };
     const latest = await observe({ view: "controls", signal: request.signal });
     const latestInternal = knownFrames.get(latest)!;
     const current = latestInternal.controls.get(request.target.id);
@@ -687,11 +765,43 @@ export async function createE2BDesktopBackend(
     if (!current || !original || !sameMaterial(original.control, current.control)) return { status: "refused", code: "e2b_desktop_target_stale" };
     if (!sameWindowGrant(original.window, current.window)) return { status: "refused", code: "e2b_desktop_window_grant_changed" };
     const step = request.step;
+    if (request.target.windowPoint === true) {
+      if (!windowPointAllowed || !isWindowPointGesture(step) || current.control.role !== "Window") {
+        return { status: "refused", code: "window_point_gesture_unavailable" };
+      }
+      const point = step.target.point;
+      const initial = originStored?.controls.get(request.target.id);
+      const image = originStored?.frame.image;
+      if (!image || !initial || current.windowId !== originStored?.pointWindowId || current.windowId !== latestInternal.pointWindowId
+        || !sameWindowGrant(initial.window, current.window) || !sameWindowPointBounds(initial.control.rect, current.control.rect)
+        || !current.control.rect || !pointInRect(point, current.control.rect)
+        || point.x < 0 || point.y < 0 || point.x >= image.width || point.y >= image.height
+        || pointControls(latestInternal, point, step.kind).length !== 0) return { status: "refused", code: "stale_point" };
+      let stopped: Delivery | undefined;
+      if (step.kind === "click") stopped = await clickPoint(current, point, request.signal);
+      else {
+        if ((step.direction !== "up" && step.direction !== "down") || !Number.isSafeInteger(step.amount)
+          || step.amount < 1 || step.amount > E2B_X11_SCROLL_MAX_AMOUNT) {
+          return { status: "refused", code: "e2b_desktop_scroll_unsupported" };
+        }
+        stopped = await scrollPoint(current, point, step.direction, step.amount, request.signal);
+      }
+      return stopped ?? { status: "dispatched", suppressFocusHandoff: true };
+    }
     if (step.kind === "click") {
       if ((step.button ?? "left") !== "left" || (step.count ?? 1) !== 1) return { status: "refused", code: "e2b_desktop_click_unsupported" };
       const pointTarget = "point" in step.target ? step.target.point : undefined;
       if (pointTarget && (!Number.isFinite(pointTarget.x) || !Number.isFinite(pointTarget.y) || !current.control.rect || !pointInRect(pointTarget, current.control.rect))) {
         return { status: "refused", code: "e2b_desktop_point_outside_target" };
+      }
+      if (pointTarget) {
+        if (!allowPointActions || !pointOwnershipProof || current.control.role === "Window") {
+          return { status: "refused", code: "e2b_desktop_point_target_unsupported" };
+        }
+        const source = originStored ?? stored;
+        if (!source.pointEvidence || !latestInternal.pointEvidence) {
+          return { status: "refused", code: "e2b_desktop_point_observation_incomplete" };
+        }
       }
       const switched = await activate(current, current.control.id, request.signal, current.control.role === "Window" && !pointTarget);
       if (switched) return switched;
@@ -703,6 +813,29 @@ export async function createE2BDesktopBackend(
       if (current.control.role === "Window") return { status: "dispatched", code: "window_activated", focusId: current.control.id };
       const clicked = await centerClick(current, request.signal);
       if (clicked) return clicked;
+      return { status: "dispatched", focusId: current.control.id };
+    }
+    if (step.kind === "scroll") {
+      if (!scrollSupported) return { status: "refused", code: "e2b_desktop_scroll_unavailable" };
+      if (!latestInternal.pointEvidence) return { status: "refused", code: "e2b_desktop_observation_incomplete" };
+      if (!current.control.actions.includes("scroll")) return { status: "refused", code: "e2b_desktop_control_not_scrollable" };
+      if (!current.control.rect) return { status: "refused", code: "e2b_desktop_control_geometry_missing" };
+      if ((step.direction !== "up" && step.direction !== "down")
+        || !Number.isSafeInteger(step.amount) || step.amount < 1 || step.amount > E2B_X11_SCROLL_MAX_AMOUNT
+        || (step.by !== undefined && step.by !== "line")) {
+        return { status: "refused", code: "e2b_desktop_scroll_unsupported" };
+      }
+      const switched = await activate(current, current.control.id, request.signal, current.control.role === "Window");
+      if (switched) return switched;
+      const point = "point" in step.target ? step.target.point : {
+        x: current.control.rect.x + current.control.rect.width / 2,
+        y: current.control.rect.y + current.control.rect.height / 2,
+      };
+      if ("point" in step.target && (!originStored?.pointEvidence || !pointInRect(point, current.control.rect))) {
+        return { status: "refused", code: "stale_point" };
+      }
+      const scrolled = await scrollPoint(current, point, step.direction, step.amount, request.signal);
+      if (scrolled) return scrolled;
       return { status: "dispatched", focusId: current.control.id };
     }
     if (step.kind === "type" || step.kind === "setValue") {
@@ -764,27 +897,35 @@ export async function createE2BDesktopBackend(
     return { status: "refused", code: "e2b_desktop_action_unsupported" };
   }
 
-  async function hitTest(frame: Frame, point: Point, signal?: AbortSignal): Promise<Control | undefined> {
+  function pointControls(internal: InternalFrame, point: Point, kind: ActionKind): InternalControl[] {
+    return [...internal.controls.values()].filter(item => item.control.role !== "Window"
+      && item.control.rect && pointInRect(point, item.control.rect)
+      && (item.control.actions.includes(kind) || item.control.sensitive));
+  }
+
+  async function hitTest(frame: Frame, point: Point, signal?: AbortSignal, kind: ActionKind = "click"): Promise<Control | undefined> {
     if (!allowPointActions || !knownFrames.has(frame)) return undefined;
     signal?.throwIfAborted();
     const internal = knownFrames.get(frame)!;
-    const candidates = [...internal.controls.values()].filter((item) => (internal.degraded || item.control.role !== "Window")
-      && item.control.rect && pointInRect(point, item.control.rect) && item.control.actions.includes("click"));
-    if (candidates.length !== 1) return undefined;
-    if (!(await verifyPointOwnership(candidates[0], point, signal))) return undefined;
-    return candidates[0].control;
+    const candidates = pointControls(internal, point, kind);
+    if (candidates.length !== 0) {
+      if (!internal.pointEvidence || candidates.length !== 1 || !candidates[0].control.actions.includes(kind)) return undefined;
+      return await verifyPointOwnership(candidates[0], point, signal) ? candidates[0].control : undefined;
+    }
+    if (!windowPointAllowed || !internal.pointWindowId || (kind !== "click" && (kind !== "scroll" || !scrollSupported))) return undefined;
+    const window = internal.controls.get(`e2b-window:${internal.pointWindowId}`);
+    const bounds = window?.control.rect;
+    if (!window || !bounds || !pointInRect(point, bounds) || !await verifyPointOwnership(window, point, signal)) return undefined;
+    return { ...window.control, actions: ["click", ...(scrollSupported ? ["scroll" as const] : [])], windowPoint: true };
   }
 
   const backend: DesktopBackend & { readonly hitTestSnapshot: boolean; readonly activationEvents: readonly E2BDesktopActivationEvent[]; readonly capabilityMode: "atspi" | "screenshot-point-degraded" } = {
-    // The live ownership probe is not evidence of which object owned a point
-    // when an earlier incomplete screenshot was captured. Keep coordinates out
-    // of the public session in degraded mode; host-only dispatch may still use
-    // hitTest after its own final ownership check.
-    capabilities: Object.freeze(actionCapabilities(allowPointActions && !allowDegradedScreenshot, pointOwnershipProof, keyboardMode)),
+    capabilities: Object.freeze(actionCapabilities(allowPointActions, pointOwnershipProof, keyboardMode, scrollSupported, windowPointAllowed)),
     allowDocumentText: false,
-    hitTestSnapshot: !allowDegradedScreenshot,
+    // Semantic and window-only targets both require live X11 ownership proof.
+    hitTestSnapshot: allowPointActions && pointOwnershipProof,
     observe: (input) => enqueue(() => observe(input)),
-    hitTest: (frame, point, signal) => enqueue(() => hitTest(frame, point, signal)),
+    hitTest: (frame, point, signal, kind) => enqueue(() => hitTest(frame, point, signal, kind)),
     dispatch: (request) => enqueue(() => dispatch(request)),
     close: async () => {
       if (closed) return;
@@ -863,6 +1004,14 @@ export class E2BX11RecipientProcess implements E2BX11Recipient {
     return this.request({ op: "click", ...request }, options);
   }
 
+  async scroll(request: Readonly<{ windowId: string; processId: number; application: string; point: Point; direction: "up" | "down"; amount: number }>, options: { readonly signal?: AbortSignal } = {}): Promise<boolean> {
+    if ((request.direction !== "up" && request.direction !== "down")
+      || !Number.isSafeInteger(request.amount) || request.amount < 1 || request.amount > E2B_X11_SCROLL_MAX_AMOUNT) {
+      throw desktopError("e2b_x11_scroll_amount_invalid");
+    }
+    return this.request({ op: "scroll", ...request }, options);
+  }
+
   async verifyFocus(request: Readonly<{ windowId: string; processId: number; application: string }>, options: { readonly signal?: AbortSignal } = {}): Promise<boolean> {
     return this.request({ op: "keyboard_focus", ...request }, options);
   }
@@ -896,6 +1045,10 @@ export class E2BX11RecipientProcess implements E2BX11Recipient {
     };
     if (request.point !== undefined) payloadValue.point = request.point;
     if (request.op === "type_text") payloadValue.text = request.text;
+    if (request.op === "scroll") {
+      payloadValue.direction = request.direction;
+      payloadValue.amount = request.amount;
+    }
     this.#source ??= readFile(new URL("./x11-recipient.py", import.meta.url), "utf8");
     const command = packagedWorkerCommand(await this.#source, payloadValue);
     const result = await this.#desktop.commands!.run(command, { timeoutMs: this.#timeoutMs, requestTimeoutMs: this.#timeoutMs, signal: options.signal });
@@ -907,6 +1060,7 @@ export class E2BX11RecipientProcess implements E2BX11Recipient {
     const value = parsed as Record<string, unknown>;
     if (value.ok !== true) throw desktopError(typeof value.code === "string" ? value.code : "e2b_x11_recipient_refused");
     if (request.op === "type_text" && value.delivered !== true) throw desktopError("e2b_desktop_text_delivery_unknown");
+    if (request.op === "scroll" && value.scrolled !== true) throw desktopError("e2b_desktop_scroll_delivery_unknown");
     return true;
   }
 }

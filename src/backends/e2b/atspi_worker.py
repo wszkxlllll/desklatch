@@ -18,6 +18,7 @@ MAX_ELEMENTS = 512
 MAX_NAME = 512
 MAX_DEPTH = 32
 MAX_TREE_NODES = 4096
+SCROLL_ROLES = frozenset(("scroll pane", "scrollbar", "scroll bar", "viewport"))
 
 
 def safe_text(value, limit=MAX_NAME):
@@ -79,6 +80,14 @@ def actions_for(accessible):
     except Exception:
         pass
     return actions
+
+
+def scrollable_role(role, bounds):
+    """Return semantic wheel support only for bounded AT-SPI scroll roles."""
+    if bounds is None:
+        return False
+    normalized = " ".join(role.lower().replace("_", " ").split())
+    return normalized in SCROLL_ROLES
 
 
 def value_for(accessible, role, states):
@@ -189,6 +198,9 @@ def snapshot_accessible(root, window_id, max_elements):
         states = state_names(accessible)
         actions = actions_for(accessible)
         editable = "editable" in states
+        bounds = rect_for(accessible)
+        if scrollable_role(role, bounds) and "scroll" not in actions:
+            actions.append("scroll")
         item = {
             "id": path,
             "token": path,
@@ -199,7 +211,6 @@ def snapshot_accessible(root, window_id, max_elements):
         }
         if name:
             item["name"] = name
-        bounds = rect_for(accessible)
         if bounds:
             item["rect"] = bounds
         value = value_for(accessible, role, states)

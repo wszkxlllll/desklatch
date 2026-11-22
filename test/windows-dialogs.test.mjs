@@ -54,6 +54,19 @@ test('owned-dialog discovery can be cancelled without dispatching or changing wi
   await assert.rejects(inspector.findOwnedDialogs(target, { signal: controller.signal }), { name: 'AbortError' });
 });
 
+test('owned-dialog bounds enter and restore the physical per-monitor DPI context', async () => {
+  const api = fakeNativeWindows();
+  const contexts = [];
+  api.setThreadDpiAwarenessContext = context => {
+    contexts.push(context);
+    return contexts.length === 1 ? -2n : -4n;
+  };
+  const inspector = createWindowsOwnedDialogInspector(api);
+  const dialogs = await inspector.findOwnedDialogs(target);
+  assert.equal(dialogs.length, 2);
+  assert.deepEqual(contexts, [-4n, -2n]);
+});
+
 test('desktop backend exposes owned-dialog evidence only for an enrolled parent', async () => {
   const calls = [];
   const owned = [{ target, hwnd: 0x70010002n, pid: target.pid, ownerHwnd: target.hwnd, ownerChain: [target.hwnd], bounds: { x: 90, y: 100, width: 280, height: 180 } }];

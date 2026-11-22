@@ -258,6 +258,87 @@ test('the authorized Office host advertises focused saving and gates it through 
   assert.equal(fixture.dispatches.length, 2);
 });
 
+test('the guarded Office backend forwards the type action kind to writable point hit testing', async t => {
+  const fixture = makeHostFixture();
+  fixture.setGrants({ version: 1, apps: [{ id: 'editor', name: 'EXCEL' }], allowDesktopCapture: true, allowForegroundInput: true });
+  const { policy: _ignored, ...seams } = fixture.seams;
+  const workspace = await createWindowsProductHost({ authorizationFile: 'ignored-for-seams', test: {
+    ...seams,
+    async transportFactory(context) {
+      const opened = await seams.transportFactory(context);
+      const observe = opened.transport.observeWindow;
+      opened.transport.observeWindow = async (window, options) => {
+        const snapshot = await observe(window, options);
+        if (window.hwnd !== 10001n) return snapshot;
+        const windowBounds = { x: 20, y: 30, width: 400, height: 260 };
+        const cell = { x: 140, y: 120, width: 100, height: 28 };
+        return {
+          target: window,
+          title: 'Excel grid',
+          bounds: windowBounds,
+          screenshotWidth: 400,
+          screenshotHeight: 260,
+          screenshotOrigin: { x: 20, y: 30 },
+          complete: true,
+          elements: [
+            { index: '0', depth: 0, role: 'Window', label: 'Excel grid', actions: [], rect: windowBounds },
+            { index: '1', parent_index: '0', depth: 1, role: 'DataItem', label: 'Action', actions: ['set_value'], enabled: true, editable: true, token: 'excel-action-cell', rect: cell },
+          ],
+        };
+      };
+      return opened;
+    },
+  } });
+  t.after(() => workspace.close());
+  const activated = await workspace.act({ activate: 'editor' });
+  assert.equal(activated.status, 'completed');
+  const observed = await workspace.observe({ view: 'both' });
+  const result = await workspace.act({
+    observationId: observed.observationId,
+    steps: [{ kind: 'type', target: { point: { x: 160, y: 130 } }, text: 'accepted', delivery: 'foreground' }],
+  });
+  assert.equal(result.status, 'completed', JSON.stringify(result));
+  assert.equal(fixture.dispatches.length, 1);
+  assert.equal(fixture.dispatches[0].step.kind, 'type');
+  assert.equal(fixture.dispatches[0].target.foreground, true);
+  assert.equal(fixture.dispatches[0].target.control.control.role, 'DataItem');
+});
+
+test('product foreground hotkey checkpoint rechecks revoked grants before native SendInput', async t => {
+  const fixture = makeHostFixture();
+  fixture.setGrants({ version: 1, apps: [{ id: 'editor', name: 'WINWORD' }], allowDesktopCapture: false, allowForegroundInput: true });
+  let nativeHotkeys = 0;
+  const { policy: _ignored, ...baseSeams } = fixture.seams;
+  const workspace = await createWindowsProductHost({ authorizationFile: 'ignored-for-seams', onApprovalRequested: () => 'allow', test: {
+    ...baseSeams,
+    async transportFactory(context) {
+      const opened = await baseSeams.transportFactory(context);
+      const observe = opened.transport.observeWindow;
+      opened.transport.observeWindow = async (window, options) => {
+        const snapshot = await observe(window, options);
+        return { ...snapshot, elements: snapshot.elements.map(element => element.label === 'Value'
+          ? { ...element, role: 'Document', editable: true, runtimeId: 'document-focused' } : element) };
+      };
+      opened.transport.authorizeForegroundHotkey = async () => undefined;
+      opened.inspector.readFocused = async target => ({ target, focused: true, runtimeId: 'document-focused', pid: target.pid, hwnd: target.hwnd });
+      opened.inspector.dispatchHotkey = async () => { nativeHotkeys += 1; return { status: 'dispatched' }; };
+      return opened;
+    },
+  } });
+  t.after(() => workspace.close());
+  await workspace.act({ activate: 'editor' });
+  const target = { name: 'Value', role: 'Document', within: 'hwnd:1001:10001' };
+  const select = await workspace.act({ steps: [{ kind: 'hotkey', keys: ['ctrl', 'a'], target }] });
+  assert.equal(select.status, 'completed', JSON.stringify(select));
+  assert.equal(nativeHotkeys, 1);
+  const pending = await workspace.act({ steps: [{ kind: 'hotkey', keys: ['ctrl', 's'], target }] });
+  assert.equal(pending.code, 'approval_required');
+  fixture.setGrants({ version: 1, apps: [{ id: 'editor', name: 'WINWORD' }], allowDesktopCapture: false, allowForegroundInput: false });
+  const revoked = await workspace.resolveApproval(pending.requestId, 'approve');
+  assert.equal(revoked.status, 'stopped');
+  assert.equal(nativeHotkeys, 1);
+});
+
 test('the public control list cap leaves named action grounding available', async t => {
   const fixture = makeHostFixture();
   const workspace = await createWindowsProductHost({ authorizationFile: 'ignored-for-seams', test: {
@@ -439,6 +520,61 @@ test('optional Windows OCR uses only the granted local window capture and preser
   assert.equal(runnerCalls.length, 2);
   assert.equal(fixture.imageCaptures.length, 0);
   await workspace.close();
+});
+
+test('the Windows product uses a bounded OCR crop for an opaque window point', async t => {
+  const fixture = makeHostFixture();
+  fixture.setGrants({
+    version: 1, apps: [{ id: 'editor', name: 'Editor' }], allowDesktopCapture: true, allowForegroundInput: true,
+  });
+  const { policy: _testPolicy, transportFactory, ...seams } = fixture.seams;
+  const actions = [];
+  let caption = 'Options';
+  const ocrCrops = [];
+  const workspace = await createWindowsProductHost({
+    authorizationFile: 'ignored-for-seams',
+    ocr: {
+      pythonExecutable: 'python',
+      detectorModelPath: 'C:\\ocr\\detector.onnx',
+      recognizerModelPath: 'C:\\ocr\\recognizer.onnx',
+      dictionaryPath: 'C:\\ocr\\dict.txt',
+    },
+    test: {
+      ...seams,
+      async transportFactory(input) {
+        const created = await transportFactory(input);
+        created.transport.observeWindow = async () => { throw Error('no UIA provider'); };
+        created.inspector.dispatchWindowPoint = async (target, step) => {
+          actions.push({ target, step });
+          return { status: 'dispatched', suppressFocusHandoff: true };
+        };
+        return created;
+      },
+      ocrRunner: {
+        async recognize({ region, image }) {
+          ocrCrops.push(region);
+          assert.equal(image.width, 1000);
+          return [{ text: caption, confidence: 0.99 }];
+        },
+      },
+    },
+  });
+  t.after(() => workspace.close());
+  assert.equal((await workspace.act({ activate: 'editor' })).status, 'completed');
+  const point = { x: 150, y: 140 };
+  const click = async () => {
+    const { observationId } = await workspace.observe({ view: 'image' });
+    return workspace.act({ observationId, steps: [{ kind: 'click', target: { point } }] });
+  };
+  assert.equal((await click()).steps[0].status, 'dispatched');
+  assert.equal(actions[0].target.hwnd, 10001n);
+  caption = 'Send message';
+  const pending = await click();
+  assert.equal(pending.code, 'approval_required');
+  assert.equal((await workspace.resolveApproval(pending.requestId, 'deny')).code, 'approval_denied');
+  assert.equal(actions.length, 1);
+  assert.deepEqual(ocrCrops, Array(2).fill({ x: 22, y: 60, width: 256, height: 160 }));
+  assert.equal(fixture.windowImageCaptures.length, 0, 'the fallback does not require CUA geometry or a window capture');
 });
 
 test('configured extra applications remain discoverable without Windows grants', async () => {

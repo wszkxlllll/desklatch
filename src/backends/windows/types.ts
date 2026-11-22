@@ -4,12 +4,14 @@ import type {
   DesktopBackend,
   Frame,
   FrameImage,
+  HostPolicyEvidence,
   Point,
   Rect,
   Selector,
   Step,
   Target,
 } from "../../contracts.js";
+import type { WindowPointGesture } from "../../core/window-point.js";
 import type { WindowsOwnedDialog, WindowsOwnedDialogInspector } from "./dialogs.js";
 
 /**
@@ -70,6 +72,12 @@ export interface WindowsImage {
 /** Minimal structural surface implemented by CUA 0.54's native driver. */
 export interface WindowsCuaDriver {
   callTool(name: string, argumentsJson: string, options?: { readonly signal?: AbortSignal }): Promise<WindowsToolResult>;
+  /** Host-only opt-in for the one-shot native grid Enter route. */
+  authorizeForegroundGridEnter?(
+    target: WindowsWindowTarget,
+    query: WindowsGridEditQuery & { readonly expected: WindowsGridEditContext },
+    options: { readonly signal?: AbortSignal },
+  ): Promise<string | undefined>;
   metadata?(options?: { readonly signal?: AbortSignal }): Promise<unknown>;
   startSession?(input: unknown, options?: { readonly signal?: AbortSignal }): Promise<unknown>;
   endSession?(input: unknown, options?: { readonly signal?: AbortSignal }): Promise<unknown>;
@@ -99,12 +107,18 @@ export interface WindowsWindowElement {
   readonly rect?: Rect;
   /** True when `rect` came from the older window-local screenshot_frame field. */
   readonly rectIsWindowLocal?: boolean;
+  /** Original screenshot-local frame retained for CUA geometry validation. */
+  readonly screenshotRect?: Rect;
 }
 
 export interface WindowsWindowSnapshot {
   readonly target: WindowsWindowTarget;
   readonly title?: string;
   readonly bounds?: Rect;
+  /** Screenshot-space basis from the same CUA snapshot, when exposed. */
+  readonly screenshotWidth?: number;
+  readonly screenshotHeight?: number;
+  readonly screenshotOrigin?: Point;
   readonly elements: readonly WindowsWindowElement[];
   readonly complete: boolean;
   readonly degraded?: boolean;
@@ -142,10 +156,143 @@ export interface WindowsFocusEvidence {
   readonly code?: string;
 }
 
+/** Native identity captured for one model-selected grid item. Bounds are in physical desktop pixels. */
+export interface WindowsGridItemIdentity {
+  readonly role: string;
+  readonly name?: string;
+  readonly runtimeId?: string;
+  readonly bounds: Rect;
+}
+
+/** Native GridPattern location captured from the exact physical hit before typing. */
+export interface WindowsGridItemAnchor {
+  readonly selectedItem: WindowsGridItemIdentity & { readonly runtimeId: string };
+  readonly gridRuntimeId: string;
+  /** RawView runtime identities from the enrolled root to the containing grid. */
+  readonly gridPath: readonly string[];
+  readonly row: number;
+  readonly column: number;
+}
+
+/** One live selected grid item and its exact focused native edit surface. */
+export interface WindowsGridEditContext {
+  readonly selectedItem: WindowsGridItemIdentity & { readonly runtimeId: string; readonly selected: true };
+  readonly editor: {
+    readonly role: string;
+    readonly runtimeId: string;
+    readonly bounds: Rect;
+    /** Native child HWND at the physical point; must be a child of the enrolled root. */
+    readonly hwnd: bigint;
+    /** Physical caret sample from GetGUIThreadInfo, contained by the selected item. */
+    readonly caret: { readonly x: number; readonly y: number; readonly width: number; readonly height: number };
+  };
+  readonly focus: WindowsFocusEvidence;
+}
+
+/** Host-private proof carried from a dispatched grid type to its same-batch Enter policy check. */
+export interface WindowsGridCommitProof extends HostPolicyEvidence {
+  readonly kind: "windows_grid_commit";
+  readonly binding: string;
+  readonly sourceControlId: string;
+  readonly focusControlId: string;
+  readonly windowScope: string;
+  readonly point: Point;
+  readonly selectedItem: WindowsGridItemIdentity & { readonly runtimeId: string };
+  readonly anchor: WindowsGridItemAnchor;
+  readonly context: WindowsGridEditContext;
+}
+
+/** Same-act step linkage is added by the session; this object never reaches the model surface. */
+export interface WindowsGridCommitPolicyEvidence extends WindowsGridCommitProof {
+  readonly sourceStep: number;
+  readonly commitStep: number;
+}
+
+export interface WindowsGridItemQuery {
+  readonly point: Point;
+  readonly selectedItem: WindowsGridItemIdentity;
+}
+
+export interface WindowsGridEditQuery extends WindowsGridItemQuery {
+  readonly anchor: WindowsGridItemAnchor;
+}
+
+/** Host-private identity for a native point surface; never sent to the model. */
+export interface WindowsPointerSurfaceIdentity {
+  readonly runtimeId: string;
+  readonly role: string;
+  readonly name?: string;
+  readonly bounds: Rect;
+}
+
+/**
+ * Native UIA proof for classifying one exact physical point. The primary
+ * identity is the grounded text/document or grid item; leaf/container are
+ * optional identities used by the caller to match its observed tree.
+ */
+export interface WindowsPointerSurface extends WindowsPointerSurfaceIdentity {
+  readonly kind: "text" | "grid";
+  readonly leaf?: WindowsPointerSurfaceIdentity;
+  readonly container?: WindowsPointerSurfaceIdentity;
+}
+
 export interface WindowsPhysicalInspector {
   read(target: WindowsWindowTarget, point?: Point, signal?: AbortSignal): Promise<WindowsPhysicalEvidence | undefined>;
   /** Optional native UIA focus probe. Keyboard actions require this proof. */
   readFocused?(target: WindowsWindowTarget, signal?: AbortSignal): Promise<WindowsFocusEvidence | undefined>;
+  /** Optional bounded native UIA proof for a point's text or grid surface. */
+  readPointerSurface?(
+    target: WindowsWindowTarget,
+    point: Point,
+    signal?: AbortSignal,
+  ): Promise<WindowsPointerSurface | undefined>;
+  /**
+   * Optional narrow proof for a just-typed grid item. It must bind the exact
+   * selected item, one native focused element, and the unique visible editor
+   * at the supplied physical point under this enrolled root.
+   */
+  readGridEditContext?(
+    target: WindowsWindowTarget,
+    query: WindowsGridEditQuery,
+    signal?: AbortSignal,
+  ): Promise<WindowsGridEditContext | undefined>;
+  /** Capture the exact native grid row/column and RuntimeId before typing. */
+  readGridItemAnchor?(
+    target: WindowsWindowTarget,
+    query: WindowsGridItemQuery,
+    signal?: AbortSignal,
+  ): Promise<WindowsGridItemAnchor | undefined>;
+  /**
+   * One-shot native Enter route. The worker must repeat the selection, editor,
+   * foreground, and exact focus checks immediately before sending one key
+   * batch, and must never retry a partial or unknown delivery.
+   */
+  dispatchGridEnter?(
+    target: WindowsWindowTarget,
+    query: WindowsGridEditQuery & { readonly expected: WindowsGridEditContext },
+    signal?: AbortSignal,
+  ): Promise<WindowsTransportDelivery>;
+  /**
+   * Optional exact foreground chord route. The implementation must recheck
+   * the enrolled HWND/PID and active focus synchronously immediately before
+   * its single native key batch, then recheck them after delivery. It is
+   * intentionally narrower than generic keyboard input and never replaces
+   * the existing keypress path.
+   */
+  dispatchHotkey?(
+    target: WindowsWindowTarget,
+    keys: readonly string[],
+    focused: WindowsFocusEvidence,
+    signal?: AbortSignal,
+  ): Promise<WindowsTransportDelivery>;
+  /** Native physical pixel delivery for an already active, authorized window without controls. */
+  dispatchWindowPoint?(
+    target: WindowsWindowTarget,
+    gesture: WindowPointGesture,
+    bounds: Rect,
+    display: Pick<FrameImage, "width" | "height">,
+    signal?: AbortSignal,
+  ): Promise<WindowsTransportDelivery>;
   /** Return the primary display in the same coordinate space as read(). */
   captureDesktopImage?(signal?: AbortSignal): Promise<WindowsDesktopImage | undefined>;
   close?(): Promise<void>;
@@ -156,6 +303,13 @@ export interface WindowsDispatchTarget {
   readonly control?: WindowsResolvedControl;
   /** Desktop-space point. The transport maps it to the native window space. */
   readonly point?: Point;
+  /**
+   * True when `point` came from the model's coordinate target. A semantic
+   * selector/ref may still carry a private center point for physical checks,
+   * but must retain its token delivery route. Keeping this bit host-private
+   * prevents a selector click from being silently rewritten as a pixel click.
+   */
+  readonly coordinate?: boolean;
   /** Window bounds from the observation, checked against the fresh capture. */
   readonly windowBounds?: Rect;
   readonly foreground: boolean;
@@ -173,6 +327,8 @@ export interface WindowsTransportDelivery {
   readonly status: "dispatched" | "refused" | "partial" | "unknown";
   readonly code?: string;
   readonly focusId?: string;
+  /** Prevents a window-scoped native chord's transitioned child becoming a stale handoff. */
+  readonly suppressFocusHandoff?: true;
 }
 
 /**
@@ -193,11 +349,33 @@ export interface WindowsTransport {
     readonly signal?: AbortSignal;
     /** Optional exact role/name for a read-only candidate snapshot of this window. */
     readonly where?: Selector;
+    /** Host-private capture proof for a granted foreground point lane. */
+    readonly includeScreenshot?: boolean;
   }): Promise<WindowsWindowSnapshot>;
   /** Fresh read-only pixels for one exact authorized HWND/PID. */
   observeWindowImage?(target: WindowsWindowTarget, options: { readonly signal?: AbortSignal }): Promise<WindowsDesktopImage | undefined>;
   observeDesktopImage?(options: { readonly signal?: AbortSignal }): Promise<WindowsDesktopImage | undefined>;
   dispatch(step: Step, target: WindowsDispatchTarget, options: { readonly signal?: AbortSignal }): Promise<WindowsTransportDelivery>;
+  /**
+   * Optional late authorization checkpoint for the native foreground chord
+   * route. A non-empty result is a refusal code; callers must not fall back
+   * to another hotkey transport after this hook is present.
+   */
+  authorizeForegroundHotkey?(
+    target: WindowsWindowTarget,
+    options: { readonly signal?: AbortSignal },
+  ): Promise<string | undefined>;
+  /** Recheck live product grants immediately before the native window-point route. */
+  authorizeWindowPoint?(
+    target: WindowsWindowTarget,
+    options: { readonly signal?: AbortSignal },
+  ): Promise<string | undefined>;
+  /** Late product-grant checkpoint for the one-shot selected-grid Enter route. */
+  authorizeForegroundGridEnter?(
+    target: WindowsWindowTarget,
+    query: WindowsGridEditQuery & { readonly expected: WindowsGridEditContext },
+    options: { readonly signal?: AbortSignal },
+  ): Promise<string | undefined>;
   /** Optional explicit foreground escalation. Never called for background UIA actions. */
   bringToFront?(target: WindowsWindowTarget, options: { readonly signal?: AbortSignal }): Promise<WindowsTransportDelivery>;
   close?(): Promise<void>;

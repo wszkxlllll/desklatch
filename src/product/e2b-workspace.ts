@@ -13,6 +13,7 @@ import {
   type BrowserBackendOptions,
   type WorkspaceNavigationResult,
 } from "../backends/browser/index.js";
+import { E2B_X11_SCROLL_MAX_AMOUNT } from "../backends/e2b/index.js";
 import type { E2BDesktopSurface, E2BGuest, E2BX11KeyboardRecipient, E2BX11Recipient, E2BWindowGrant } from "../backends/e2b/index.js";
 import {
   createOnDemandWorkspaceApplication,
@@ -35,8 +36,9 @@ const PRODUCT_APPLICATION_IDS = Object.freeze({ writer: "e2b-writer", browser: "
 const DEFAULT_BROWSER_ORIGINS = Object.freeze(["https://docs.python.org"]);
 
 const WRITER_CAPABILITIES: readonly Capability[] = Object.freeze([
-  Object.freeze({ kind: "click", targets: ["selector", "ref"], buttons: ["left"], counts: [1] } as const),
-  Object.freeze({ kind: "type", targets: ["selector", "ref"] } as const),
+  Object.freeze({ kind: "click", targets: ["selector", "ref", "point"], buttons: ["left"], counts: [1] } as const),
+  Object.freeze({ kind: "type", targets: ["selector", "ref", "focus"] } as const),
+  Object.freeze({ kind: "scroll", targets: ["selector", "ref"], directions: ["up", "down"], units: ["line"] } as const),
   Object.freeze({ kind: "hotkey", targets: ["selector", "ref"], chords: [["ctrl", "s"], ["Control", "s"]] } as const),
 ]);
 
@@ -48,6 +50,13 @@ const BROWSER_CAPABILITIES: readonly Capability[] = Object.freeze([
   Object.freeze({ kind: "keypress", targets: ["selector", "ref", "focus"], keys: ["enter", "escape", "tab", "space", "left", "right", "up", "down", "home", "end", "page_up", "page_down"] } as const),
   Object.freeze({ kind: "hotkey", targets: ["selector", "ref", "focus"], chords: [["ctrl", "a"], ["Control", "a"], ["meta", "a"], ["Meta", "a"]] } as const),
 ]);
+
+const BROWSER_CAPABILITIES_NO_IMAGES: readonly Capability[] = Object.freeze(
+  BROWSER_CAPABILITIES.map(capability => Object.freeze({
+    ...capability,
+    targets: Object.freeze(capability.targets.filter(target => target !== "point")),
+  })),
+);
 
 export type E2BProductWorkspaceErrorCode =
   | "invalid_installation_root" | "invalid_api_key" | "e2b_sdk_unavailable" | "invalid_browser_origins"
@@ -327,11 +336,16 @@ async function openWriter(
       allowTemporaryClipboard: true,
       allowScreenshot: true,
       allowDegradedScreenshot: true,
+      // Vision/Hybrid Writer arms may click a screenshot point. The desktop
+      // backend still requires the exact enrolled window/process grant and
+      // X11 recipient ownership proof before exposing this capability.
+      allowPointActions: true,
       includeValues: true,
       timeoutMs: actionTimeoutMs,
     });
     const session = createDeskSession(backend, {
       allowModelImages: true,
+      maxScrollAmount: E2B_X11_SCROLL_MAX_AMOUNT,
       onApprovalRequested: options.onApprovalRequested,
       async policy(input) {
         const { step, target } = input;
@@ -388,7 +402,13 @@ async function openBrowser(
       browser: { ...browserOptions, authorizedOrigins: origins, allowBlank: true },
     });
     const grant = await discoverWindow(runtime.guest, "google-chrome", /Chrome|Chromium/iu, startupTimeoutMs, signal);
-    backend = createBrowserBackend(managed.page, { ...browserOptions, authorizedOrigins: origins, allowBlank: true });
+    backend = createBrowserBackend(managed.page, {
+      ...browserOptions,
+      skipPostNavigationFocusRefresh: browserOptions.skipPostNavigationFocusRefresh ?? true,
+      preferMouseNavigationClick: browserOptions.preferMouseNavigationClick ?? true,
+      authorizedOrigins: origins,
+      allowBlank: true,
+    });
     const session = createDeskSession(backend, {
       allowModelImages: browserOptions.allowImages === true,
       allowModelDocumentText: browserOptions.allowDocumentText === true,
@@ -487,6 +507,7 @@ export function createE2BProductWorkspace(options: E2BProductWorkspaceOptions): 
     description: "A real isolated LibreOffice Writer document in the product-owned cloud desktop.",
     capabilities: WRITER_CAPABILITIES,
     allowModelImages: true,
+    allowObservationProjection: true,
     open: async signal => {
       const current = await ensureRuntime(signal);
       try { return await openWriter(current, options, desktopTimeoutMs, signal); }
@@ -497,10 +518,13 @@ export function createE2BProductWorkspace(options: E2BProductWorkspaceOptions): 
     id: PRODUCT_APPLICATION_IDS.browser,
     name: "E2B managed browser",
     description: "A fresh cloud Chromium page restricted to the host-authorized public origins.",
-    capabilities: BROWSER_CAPABILITIES,
+    // Keep the lazy catalog aligned with the activated browser session:
+    // point targets are only model-visible when image evidence is granted.
+    capabilities: browserOptions.allowImages === true ? BROWSER_CAPABILITIES : BROWSER_CAPABILITIES_NO_IMAGES,
     allowModelImages: browserOptions.allowImages === true,
     allowModelDocumentText: browserOptions.allowDocumentText === true,
     allowNavigation: true,
+    allowObservationProjection: true,
     open: async signal => {
       const current = await ensureRuntime(signal);
       try { return await openBrowser(current, options, origins, browserOptions, navigationTimeoutMs, guestTimeoutMs, startupTimeoutMs, signal); }

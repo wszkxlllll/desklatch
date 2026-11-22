@@ -11,6 +11,8 @@ import type {
 /** Minimal structural surface for a trusted scoped CDP adapter. */
 export interface BrowserPageLike {
   evaluate<R, A = unknown>(pageFunction: (arg: A) => R | Promise<R>, arg?: A): Promise<R>;
+  /** Optional native Playwright handle evaluation used for batched snapshots. */
+  evaluateHandle?<R, A = unknown>(pageFunction: (arg: A) => R | Promise<R>, arg?: A): Promise<BrowserJavaScriptHandleLike>;
   locator(selector: string): BrowserLocatorLike;
   mouse: {
     click(x: number, y: number, options?: { button?: "left" | "right"; clickCount?: number }): Promise<void>;
@@ -22,6 +24,13 @@ export interface BrowserPageLike {
   waitForTimeout?(milliseconds: number): Promise<void>;
   mainFrame?(): unknown;
   isClosed?(): boolean;
+}
+
+/** Minimal JSHandle surface required to unwrap a batched ElementHandle array. */
+export interface BrowserJavaScriptHandleLike {
+  getProperties?(): Promise<Map<string, BrowserJavaScriptHandleLike>>;
+  asElement?(): BrowserElementHandleLike | null;
+  dispose?(): Promise<void>;
 }
 
 export interface BrowserLocatorLike {
@@ -60,6 +69,10 @@ export interface BrowserBackendOptions {
   searchTimeoutMs?: number;
   settleMs?: number;
   actionTimeoutMs?: number;
+  /** E2B-only opt-in: avoid a broad post-navigation focus refresh after a link click. */
+  skipPostNavigationFocusRefresh?: boolean;
+  /** E2B-only opt-in: deliver verified cross-document link clicks by point. */
+  preferMouseNavigationClick?: boolean;
   rootSelector?: string;
   authorizedOrigins?: readonly string[];
   allowBlank?: boolean;
@@ -85,6 +98,9 @@ export const MAX_DOCUMENT_CURSORS = 32;
 
 export interface BrowserBackend extends DesktopBackend {
   readonly allowDocumentText: boolean;
+  readonly supportsScopedRefRefresh: true;
+  /** Browser point origin checks use retained screenshot/layout evidence. */
+  readonly hitTestSnapshot: true;
 }
 
 export interface BrowserRiskSignal {

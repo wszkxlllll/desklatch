@@ -4,7 +4,7 @@ import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
-import { createDeskSession, createDeskTools } from "desklatch";
+import { createDeskSession, createDeskTools, createRiskPolicy } from "desklatch";
 import { createBrowserBackend } from "../dist/backends/browser/index.js";
 
 const chromium = Number.parseInt(process.versions.node.split(".")[0], 10) >= 20
@@ -46,6 +46,55 @@ async function withPage(callback) {
   }
 }
 
+test("a sandbox host can delegate an unclassified point inside its local palette while the adjacent send still requires approval", async t => {
+  const result = await withPage(async page => {
+    await page.setContent('<button id="palette" type="button">Amber</button><button id="send" type="button">Send message</button><input aria-label="Draft"><output></output>');
+    await page.evaluate(() => document.addEventListener("click", e => {
+      if (e.target.id) document.querySelector("output").textContent += e.target.id;
+    }));
+    const backend = createBrowserBackend(page, { allowImages: true, includePublicValues: true });
+    const controls = (await backend.observe({ view: "controls" })).controls;
+    const palette = controls.find(c => c.name === "Amber");
+    const send = controls.find(c => c.name === "Send message");
+    assert.ok(palette?.rect && send?.rect);
+    const grant = { targetId: palette.id, region: palette.rect };
+    const session = createDeskSession(backend, {
+      allowModelImages: true,
+      policy: createRiskPolicy({ hostRules: { allowScopedPointClick: () => grant } }),
+    });
+    const click = async (rect, following = []) => {
+      const { observationId } = await session.observe({ view: "image" });
+      const point = { x: Math.floor(rect.x + rect.width / 2), y: Math.floor(rect.y + rect.height / 2) };
+      return session.act({ observationId, steps: [{ kind: "click", target: { point } }, ...following] });
+    };
+    try {
+      const type = { kind: "setValue", target: { name: "Draft" }, value: "ready", expect: { target: { name: "Draft" }, valueEquals: "ready" } };
+      const mixed = await click(palette.rect, [type]);
+      assert.deepEqual(mixed.steps.map(step => step.status), ["dispatched", "verified"]);
+      assert.equal(await page.locator("input").inputValue(), "ready");
+      const pending = await click(send.rect);
+      assert.equal(pending.code, "approval_required");
+      await session.resolveApproval(pending.requestId, "deny");
+      assert.equal(await page.locator("output").textContent(), "palette");
+
+      const outer = await session.observe({ view: "image" });
+      const point = { x: Math.floor(palette.rect.x + palette.rect.width / 2), y: Math.floor(palette.rect.y + palette.rect.height / 2) };
+      const { createDeskCodeMode } = await import("desklatch/code-mode");
+      const guest = createDeskCodeMode(session);
+      try {
+        const args = { observationId: outer.observationId, steps: [{ kind: "click", target: { point } }] };
+        const ran = await guest.runCode({ code: `await desk.act(${JSON.stringify(args)}); const snap = await desk.observe({where:{name:"Draft"}}); inspect(snap.controls.length);` });
+        assert.equal(ran.status, "completed", JSON.stringify(ran.actions));
+        assert.equal(ran.actions[0].steps[0].status, "dispatched");
+        assert.deepEqual(ran.inspections, [1]);
+        assert.equal(await page.locator("output").textContent(), "palettepalette");
+      } finally { await guest.close(); }
+    } finally { await session.close(); }
+    return { skipped: false };
+  });
+  if (result.skipped) t.skip("No installed Edge/Chrome/Chromium executable");
+});
+
 test("DOM observe and form actions stay zero-image", async (t) => {
   const result = await withPage(async (page) => {
     await page.setContent(await fixture("browser-form.html"));
@@ -67,6 +116,57 @@ test("DOM observe and form actions stay zero-image", async (t) => {
     assert.equal(await page.locator("#title").inputValue(), "Public title");
     assert.equal(screenshots, 0);
     await backend.close();
+    return { skipped: false };
+  });
+  if (result.skipped) t.skip("No installed Edge/Chrome/Chromium executable");
+});
+
+test("real Playwright snapshots observed selectors through one exact DOM batch", async t => {
+  const result = await withPage(async page => {
+    await page.setContent(await fixture("browser-form.html"));
+    assert.equal(typeof page.evaluateHandle, "function");
+    const nativeEvaluateHandle = page.evaluateHandle.bind(page);
+    const nativeLocator = page.locator.bind(page);
+    let batchCalls = 0;
+    let getPropertiesCalls = 0;
+    let locatorSnapshotCalls = 0;
+    page.evaluateHandle = async (...args) => {
+      batchCalls += 1;
+      const root = await nativeEvaluateHandle(...args);
+      const nativeGetProperties = root.getProperties.bind(root);
+      root.getProperties = async (...propertyArgs) => {
+        getPropertiesCalls += 1;
+        return nativeGetProperties(...propertyArgs);
+      };
+      return root;
+    };
+    page.locator = selector => {
+      const locator = nativeLocator(selector);
+      if (typeof locator.elementHandles === "function") {
+        const nativeElementHandles = locator.elementHandles.bind(locator);
+        locator.elementHandles = async (...args) => {
+          locatorSnapshotCalls += 1;
+          return nativeElementHandles(...args);
+        };
+      }
+      return locator;
+    };
+    const backend = createBrowserBackend(page);
+    try {
+      const frame = await backend.observe({ view: "controls" });
+      const title = frame.controls.find(control => control.name === "Title");
+      assert.ok(title);
+      // The fixture includes one material approval candidate, so observe has
+      // two independent snapshot phases: approval context and frame binding.
+      assert.equal(batchCalls, 2, "approval and bind phases should each use one batched DOM evaluation");
+      assert.equal(getPropertiesCalls, 2, "approval and bind phases should each unwrap one flattened property map");
+      assert.equal(locatorSnapshotCalls, 0, "native Playwright must not acquire one locator snapshot per selector");
+      const edited = await backend.dispatch({ frame, target: title, step: { kind: "setValue", target: { ref: "opaque-core-ref" }, value: "batched" } });
+      assert.equal(edited.status, "dispatched");
+      assert.equal(await nativeLocator("#title").inputValue(), "batched");
+    } finally {
+      await backend.close();
+    }
     return { skipped: false };
   });
   if (result.skipped) t.skip("No installed Edge/Chrome/Chromium executable");
@@ -98,6 +198,9 @@ test("scoped remote actions bind only matching controls, scroll clipped targets,
       loc.elementHandles = async (...args) => (await getHandles(...args)).map(track);
       return loc;
     };
+    // This test intentionally exercises the legacy locator adapter seam and
+    // its synthetic timeout injection; the native batch path has its own test.
+    page.evaluateHandle = undefined;
     const session = createDeskSession(createBrowserBackend(page));
     const [, act] = createDeskTools(session);
     const write = name => act.invoke({ steps: [{ kind: "setValue", target: { name }, value: "ok" }] });
@@ -204,6 +307,114 @@ test("pixel target is rejected after a modal occludes it", async (t) => {
   if (result.skipped) t.skip("No installed Edge/Chrome/Chromium executable");
 });
 
+test("pixel target accepts the live topmost control when source rectangles overlap", async (t) => {
+  const result = await withPage(async page => {
+    await page.setContent(`
+      <main style="position:relative;width:240px;height:120px">
+        <button id="under" style="position:absolute;left:20px;top:20px;width:180px;height:70px;z-index:1">Under</button>
+        <button id="top" style="position:absolute;left:20px;top:20px;width:180px;height:70px;z-index:2">Top</button>
+      </main>
+      <script>document.getElementById('top').addEventListener('click', () => document.body.dataset.clicked = 'top');</script>
+    `);
+    const session = createDeskSession(createBrowserBackend(page, { allowImages: true }), {
+      allowModelImages: true,
+      policy: () => ({ decision: "allow", code: "test" }),
+    });
+    try {
+      const [observe, act] = createDeskTools(session);
+      const observation = await observe.invoke({ view: "image" });
+      const top = observation.controls.find(control => control.name === "Top");
+      const under = observation.controls.find(control => control.name === "Under");
+      assert.ok(top?.rect && under?.rect);
+      assert.ok(top.rect.x === under.rect.x && top.rect.y === under.rect.y
+        && top.rect.width === under.rect.width && top.rect.height === under.rect.height);
+      const point = {
+        x: Math.floor(top.rect.x + top.rect.width / 2),
+        y: Math.floor(top.rect.y + top.rect.height / 2),
+      };
+      const result = await act.invoke({ observationId: observation.observationId, steps: [{ kind: "click", target: { point } }] });
+      assert.equal(result.status, "completed", JSON.stringify(result));
+      assert.equal(result.steps[0].status, "dispatched");
+      assert.equal(await page.locator("body").getAttribute("data-clicked"), "top");
+    } finally { await session.close(); }
+    return { skipped: false };
+  });
+  if (result.skipped) t.skip("No installed Edge/Chrome/Chromium executable");
+});
+
+test("editable browser controls accept a click for visual focus handoff", async (t) => {
+  const result = await withPage(async page => {
+    await page.setContent('<input id="query" aria-label="Query">');
+    const backend = createBrowserBackend(page, { allowImages: true });
+    try {
+      const frame = await backend.observe({ view: "both" });
+      const query = frame.controls.find(control => control.name === "Query");
+      assert.ok(query);
+      assert.ok(query.actions.includes("click"));
+      const clicked = await backend.dispatch({ frame, target: query, step: { kind: "click", target: { ref: "query-ref" } } });
+      assert.equal(clicked.status, "dispatched", JSON.stringify(clicked));
+      assert.equal(await page.evaluate(() => document.activeElement?.id), "query");
+    } finally { await backend.close(); }
+    return { skipped: false };
+  });
+  if (result.skipped) t.skip("No installed Edge/Chrome/Chromium executable");
+});
+
+test("pixel overlap origin fails closed for a covering popup and a replaced target", async (t) => {
+  const result = await withPage(async page => {
+    await page.setContent(`
+      <main style="position:relative;width:240px;height:120px">
+        <button id="under" style="position:absolute;left:20px;top:20px;width:180px;height:70px;z-index:1">Under</button>
+        <button id="top" style="position:absolute;left:20px;top:20px;width:180px;height:70px;z-index:2">Top</button>
+      </main>
+    `);
+    const session = createDeskSession(createBrowserBackend(page, { allowImages: true }), {
+      allowModelImages: true,
+      policy: () => ({ decision: "allow", code: "test" }),
+    });
+    try {
+      const [observe, act] = createDeskTools(session);
+      const observation = await observe.invoke({ view: "image" });
+      const top = observation.controls.find(control => control.name === "Top");
+      assert.ok(top?.rect);
+      const point = {
+        x: Math.floor(top.rect.x + top.rect.width / 2),
+        y: Math.floor(top.rect.y + top.rect.height / 2),
+      };
+      await page.evaluate(() => {
+        const popup = document.createElement("button");
+        popup.id = "popup";
+        popup.textContent = "Popup";
+        popup.style.cssText = "position:absolute;left:20px;top:20px;width:180px;height:70px;z-index:9;opacity:0";
+        document.body.append(popup);
+      });
+      const covered = await act.invoke({ observationId: observation.observationId, steps: [{ kind: "click", target: { point } }] });
+      assert.notEqual(covered.status, "completed", JSON.stringify(covered));
+      assert.equal(covered.steps[0].status, "not_dispatched");
+      assert.ok(["point_occluded", "point_target_changed", "point_not_unique"].includes(covered.code), JSON.stringify(covered));
+
+      await page.evaluate(() => document.getElementById("popup")?.remove());
+      await page.evaluate(() => { document.getElementById("top").style.pointerEvents = "none"; });
+      const pointerChanged = await act.invoke({ observationId: observation.observationId, steps: [{ kind: "click", target: { point } }] });
+      assert.notEqual(pointerChanged.status, "completed", JSON.stringify(pointerChanged));
+      assert.equal(pointerChanged.steps[0].status, "not_dispatched");
+      assert.ok(["point_target_changed", "point_not_unique", "stale_point"].includes(pointerChanged.code), JSON.stringify(pointerChanged));
+
+      await page.evaluate(() => { document.getElementById("top").style.pointerEvents = "auto"; });
+      await page.evaluate(() => {
+        const old = document.getElementById("top");
+        old?.replaceWith(old.cloneNode(true));
+      });
+      const replaced = await act.invoke({ observationId: observation.observationId, steps: [{ kind: "click", target: { point } }] });
+      assert.notEqual(replaced.status, "completed", JSON.stringify(replaced));
+      assert.equal(replaced.steps[0].status, "not_dispatched");
+      assert.ok(["point_target_changed", "point_not_unique", "stale_point"].includes(replaced.code), JSON.stringify(replaced));
+    } finally { await session.close(); }
+    return { skipped: false };
+  });
+  if (result.skipped) t.skip("No installed Edge/Chrome/Chromium executable");
+});
+
 test("public act finds an off-list edit, distinguishes inserting and replacing, and refuses duplicate names", async t => {
   const result = await withPage(async page => {
     const filler = Array.from({ length: 35 }, (_, i) => `<input aria-label="Field ${i}">`).join("");
@@ -288,7 +499,16 @@ test("scoped observe searches beyond the public first-page budget", async (t) =>
 test("replacement between observations receives a fresh identity", async (t) => {
   const result = await withPage(async (page) => {
     await page.setContent(await fixture("browser-form.html"));
-    const backend = createBrowserBackend(page);
+    const native = createBrowserBackend(page);
+    let dispatched = 0;
+    const backend = {
+      ...native,
+      async dispatch(request) {
+        const result = await native.dispatch(request);
+        if (result.status === "dispatched") dispatched += 1;
+        return result;
+      },
+    };
     const first = await backend.observe({ view: "controls" });
     const oldTitle = first.controls.find((control) => control.name === "Title");
     assert.ok(oldTitle);
@@ -305,6 +525,7 @@ test("replacement between observations receives a fresh identity", async (t) => 
     assert.equal(stale.code, "target_changed");
     const fresh = await backend.dispatch({ frame: second, target: newTitle, step: { kind: "setValue", target: { ref: "new-public-ref" }, value: "accepted" } });
     assert.equal(fresh.status, "dispatched");
+    assert.equal(dispatched, 1, "the stale replacement attempt must not dispatch; only the fresh target may dispatch");
     assert.equal(await page.locator("#title").inputValue(), "accepted");
     await backend.close();
     return { skipped: false };

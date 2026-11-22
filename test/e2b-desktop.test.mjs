@@ -111,7 +111,7 @@ test("E2B desktop backend performs bounded native text and key delivery", async 
     assert.equal(set.status, "dispatched");
     const beforeScroll = fixture.calls.filter(call => call[0] === "scroll").length;
     const unboundScroll = await backend.dispatch({ frame, target: document, step: { kind: "scroll", target: { ref: document.id }, direction: "down", amount: 1 } });
-    assert.deepEqual(unboundScroll, { status: "refused", code: "e2b_desktop_action_unsupported" });
+    assert.deepEqual(unboundScroll, { status: "refused", code: "e2b_desktop_scroll_unavailable" });
     assert.equal(backend.capabilities.some(capability => capability.kind === "scroll"), false);
     assert.equal(fixture.calls.filter(call => call[0] === "scroll").length, beforeScroll);
     assert.deepEqual(fixture.calls.filter(call => call[0] === "press").at(-1), ["press", ["ctrl", "a"]]);
@@ -274,6 +274,7 @@ test("a child loss after a verified point click is unknown, never not-dispatched
   const backend = await createE2BDesktopBackend(fixture.desktop, {
     windows: [{ windowId: "200", application: "libreoffice", processId: 123, title: "Untitled 1 - LibreOffice Writer" }],
     worker: fixture.worker,
+    allowPointActions: true,
     recipient: {
       async verify() { return true; },
       async click() { throw Error("child_stdout_lost_after_click"); },
@@ -290,7 +291,7 @@ test("a child loss after a verified point click is unknown, never not-dispatched
   }
 });
 
-test("public sessions use complete-frame point evidence and withdraw degraded coordinates", async () => {
+test("public sessions retain complete AT-SPI point evidence while rejecting degraded coordinates", async () => {
   const { createE2BDesktopBackend } = await import("../dist/backends/e2b/desktop.js");
   const { createDeskSession } = await import("../dist/index.js");
 
@@ -319,6 +320,9 @@ test("public sessions use complete-frame point evidence and withdraw degraded co
     windows: [{ windowId: "200", application: "libreoffice", processId: 123, title: "Untitled 1 - LibreOffice Writer" }],
     worker: fixture.worker,
     allowScreenshot: true,
+    // Configuring the fallback must not suppress point support when AT-SPI
+    // still returns a complete, identity-bound snapshot.
+    allowDegradedScreenshot: true,
     allowPointActions: true,
   });
   const session = createDeskSession(backend, { allowModelImages: true });
@@ -328,14 +332,17 @@ test("public sessions use complete-frame point evidence and withdraw degraded co
     const observation = await session.observe({ view: "both" });
     const delivered = await session.act({ observationId: observation.observationId, steps: [{ kind: "click", target: { point: { x: 40, y: 40 } } }] });
     assert.equal(delivered.status, "completed", JSON.stringify(delivered));
+    const imageObservation = await session.observe({ view: "image" });
+    const imageDelivered = await session.act({ observationId: imageObservation.observationId, steps: [{ kind: "click", target: { point: { x: 40, y: 40 } } }] });
+    assert.equal(imageDelivered.status, "completed", JSON.stringify(imageDelivered));
     const beforeClicks = fixture.calls.filter(call => call[0] === "click").length;
     changedPoint = true;
-    const changed = await session.act({ observationId: observation.observationId, steps: [{ kind: "click", target: { point: { x: 40, y: 40 } } }] });
+    const changed = await session.act({ observationId: imageObservation.observationId, steps: [{ kind: "click", target: { point: { x: 40, y: 40 } } }] });
     assert.equal(changed.status, "stopped");
     assert.equal(changed.code, "stale_point");
     changedPoint = false;
     fixture.desktop.verifyPointOwnership = async () => false;
-    const occluded = await session.act({ observationId: observation.observationId, steps: [{ kind: "click", target: { point: { x: 40, y: 40 } } }] });
+    const occluded = await session.act({ observationId: imageObservation.observationId, steps: [{ kind: "click", target: { point: { x: 40, y: 40 } } }] });
     assert.equal(occluded.status, "stopped");
     assert.equal(fixture.calls.filter(call => call[0] === "click").length, beforeClicks);
   } finally {
@@ -343,6 +350,13 @@ test("public sessions use complete-frame point evidence and withdraw degraded co
   }
 
   const degradedFixture = makeFixture();
+  degradedFixture.desktop.screenshot = async () => {
+    const image = Uint8Array.from(png1x1);
+    const dimensions = new DataView(image.buffer);
+    dimensions.setUint32(16, 800);
+    dimensions.setUint32(20, 600);
+    return image;
+  };
   degradedFixture.desktop.commands = {
     async run(command) {
       if (command.startsWith("xprop -root")) return { stdout: "_NET_ACTIVE_WINDOW(WINDOW): window id # 0xc8\n" };
@@ -361,11 +375,16 @@ test("public sessions use complete-frame point evidence and withdraw degraded co
   });
   const degradedSession = createDeskSession(degraded, { allowModelImages: true });
   try {
-    assert.equal(degraded.hitTestSnapshot, false);
-    assert.equal(degradedSession.capabilities.some(capability => capability.targets.includes("point")), false);
+    assert.equal(degraded.hitTestSnapshot, true);
+    assert.equal(degradedSession.capabilities.some(capability => capability.targets.includes("point")), true);
     const observation = await degradedSession.observe({ view: "both" });
+    assert.equal(observation.complete, false);
+    assert.equal(observation.image?.width, 800);
+    assert.equal(observation.image?.height, 600);
+    assert.equal(observation.controls.filter(control => control.role === "Window").length, 1);
     const refused = await degradedSession.act({ observationId: observation.observationId, steps: [{ kind: "click", target: { point: { x: 400, y: 300 } } }] });
-    assert.equal(refused.status, "rejected");
+    assert.equal(refused.status, "stopped");
+    assert.equal(refused.code, "point_not_unique");
     assert.equal(degradedFixture.calls.some(call => call[0] === "click"), false);
   } finally {
     await degradedSession.close();
@@ -451,13 +470,13 @@ test("opt-in screenshot fallback exposes an incomplete Window canvas and require
     }]);
     const target = frame.controls[0];
     const hit = await backend.hitTest(frame, { x: 400, y: 300 });
-    assert.equal(hit?.id, target.id);
-    const click = await backend.dispatch({ frame, target: hit, origin: frame, step: { kind: "click", target: { point: { x: 400, y: 300 } } } });
-    assert.equal(click.status, "dispatched");
+    assert.equal(hit, undefined);
+    const click = await backend.dispatch({ frame, target, origin: frame, step: { kind: "click", target: { point: { x: 400, y: 300 } } } });
+    assert.deepEqual(click, { status: "refused", code: "e2b_desktop_point_target_unsupported" });
     pointOwned = false;
     assert.equal(await backend.hitTest(frame, { x: 400, y: 300 }), undefined);
     const foreign = await backend.dispatch({ frame, target, origin: frame, step: { kind: "click", target: { point: { x: 400, y: 300 } } } });
-    assert.deepEqual(foreign, { status: "refused", code: "e2b_desktop_point_not_owned" });
+    assert.deepEqual(foreign, { status: "refused", code: "e2b_desktop_point_target_unsupported" });
     const typed = await backend.dispatch({ frame, target, step: { kind: "type", target: { ref: target.id }, text: "真实编辑器输入" } });
     assert.deepEqual(typed, { status: "refused", code: "e2b_desktop_control_not_editable" });
     assert.equal(calls.some(call => call[0] === "write"), false);
@@ -504,4 +523,67 @@ test("focused-window keyboard input requires an explicit single-grant verifier",
   } finally {
     await backend.close();
   }
+});
+
+test("E2B image points work in the active enrolled window without an AT-SPI tree", async t => {
+  const { createDeskSession } = await import("../dist/index.js");
+  const { createE2BDesktopBackend } = await import("../dist/backends/e2b/desktop.js");
+  const fixture = makeFixture();
+  let active = "200";
+  let ownsPoint = true;
+  let expectSemanticTarget = false;
+  const delivered = [];
+  fixture.desktop.getCurrentWindowId = async () => active;
+  fixture.desktop.screenshot = async () => {
+    const image = Buffer.from(png1x1);
+    image.writeUInt32BE(800, 16);
+    image.writeUInt32BE(600, 20);
+    return image;
+  };
+  fixture.desktop.commands = {
+    async run(command) {
+      if (command.startsWith("xprop -id")) return { stdout: "_NET_WM_PID(CARDINAL) = 123" };
+      if (command.startsWith("xdotool getwindowgeometry")) return { stdout: "WINDOW=200\nX=0\nY=0\nWIDTH=800\nHEIGHT=600" };
+      return { stdout: "" };
+    },
+  };
+  const worker = {
+    async request() {
+      if (!expectSemanticTarget) return { ok: false, code: "e2b_atspi_unavailable" };
+      return { ok: true, complete: true, windows: [{
+        window_id: "200", process_id: 123,
+        bounds: { x: 0, y: 0, width: 800, height: 600 }, complete: true,
+        controls: [{ id: "send", role: "Button", name: "Send message", actions: ["invoke"],
+          states: ["visible", "enabled"], rect: { x: 350, y: 250, width: 100, height: 100 } }],
+      }] };
+    },
+  };
+  const recipient = {
+    async verify(request) { return ownsPoint && request.windowId === active; },
+    async click(request) { delivered.push(["click", request.point]); return true; },
+    async scroll(request) { delivered.push(["scroll", request.point]); return true; },
+  };
+  const backend = await createE2BDesktopBackend(fixture.desktop, {
+    windows: [{ windowId: "200", application: "libreoffice", processId: 123 }],
+    worker, recipient, allowScreenshot: true, allowPointActions: true, allowDegradedScreenshot: true,
+  });
+  const session = createDeskSession(backend, { allowModelImages: true });
+  t.after(() => session.close());
+  const point = { x: 400, y: 300 };
+  const { observationId } = await session.observe({ view: "image" });
+  const click = { kind: "click", target: { point } };
+  assert.equal((await session.act({ observationId, steps: [click] })).steps[0].status, "dispatched");
+  assert.equal((await session.act({ observationId, steps: [{ kind: "scroll", direction: "down", amount: 2, target: { point } }] })).steps[0].status, "dispatched");
+
+  ownsPoint = false;
+  assert.equal((await session.act({ observationId, steps: [click] })).code, "point_not_unique");
+  ownsPoint = true;
+  active = "100";
+  assert.equal((await session.act({ observationId, steps: [click] })).code, "point_not_unique");
+  active = "200";
+  expectSemanticTarget = true;
+  assert.equal((await session.act({ observationId, steps: [click] })).code, "stale_point");
+  const refreshed = await session.observe({ view: "image" });
+  assert.equal((await session.act({ observationId: refreshed.observationId, steps: [click] })).code, "approval_required");
+  assert.deepEqual(delivered, [["click", point], ["scroll", point]]);
 });
