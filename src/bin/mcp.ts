@@ -3,6 +3,7 @@ import { isAbsolute, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { createDeskMcpServer } from "../integrations/mcp.js";
 import { resolveDeskToolHost } from "../integrations/shared.js";
+import { parseCodeModeMaxCallsEnvironment } from "../code-mode/operator-options.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
 const args = process.argv.slice(2);
@@ -17,6 +18,10 @@ async function main() {
   if (!input || extra !== undefined || (windows ? !authorizationFile || !isAbsolute(authorizationFile) : authorizationFile !== undefined)) {
     throw Error(usage);
   }
+  const codeModeEnabled = codeFlag || process.env.DESKLATCH_CODE_MODE === "1";
+  const codeModeOptions = codeModeEnabled
+    ? { maxCalls: parseCodeModeMaxCallsEnvironment(process.env.DESKLATCH_CODE_MODE_MAX_CALLS) }
+    : undefined;
   const opened = windows
     ? await (await import("../product/windows-mcp.js")).createWindowsMcpHost(authorizationFile!)
     : input === "--demo"
@@ -24,10 +29,10 @@ async function main() {
     : await openHost(input);
   const baseHost = resolveDeskToolHost(opened);
   let toolHost = baseHost;
-  if (codeFlag || process.env.DESKLATCH_CODE_MODE === "1") {
+  if (codeModeEnabled) {
     try {
       const { createDeskCodeMode } = await import("../code-mode/index.js");
-      toolHost = createDeskCodeMode(baseHost);
+      toolHost = createDeskCodeMode(baseHost, codeModeOptions);
     } catch (error) {
       await baseHost.close();
       throw error;
@@ -55,9 +60,12 @@ async function openHost(input: string) {
   return host.openDeskSession();
 }
 
-main().catch(() => {
+main().catch((error: unknown) => {
   // stdout is reserved for MCP. Host exceptions may contain credentials or paths.
-  if (args[0] === "--windows") console.error("DeskLatch could not start the Windows desktop host. Check installation and application authorization.");
+  const code = typeof error === "object" && error !== null && "code" in error ? String((error as { code?: unknown }).code) : undefined;
+  const message = typeof error === "object" && error !== null && "message" in error ? String((error as { message?: unknown }).message) : "";
+  if (code === "invalid_code_mode_max_calls") console.error(message);
+  else if (args[0] === "--windows") console.error("DeskLatch could not start the Windows desktop host. Check installation and application authorization.");
   else if (args.length !== 1) console.error(usage);
   else if (args[0] === "--demo") console.error("DeskLatch demo could not start. Run desklatch-setup mcp to check Playwright and Chromium.");
   else console.error("DeskLatch MCP host could not start");

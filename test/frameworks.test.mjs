@@ -27,7 +27,7 @@ test("LangGraph ToolNode invokes only observe and act and keeps image bytes nati
     messages: [
       new AIMessage({
         content: "",
-        tool_calls: [{ name: "observe", args: { view: "both" }, id: "fixture-call", type: "tool_call" }],
+        tool_calls: [{ name: "observe", args: { view: "both", projection: { mode: "compact" } }, id: "fixture-call", type: "tool_call" }],
       }),
     ],
   });
@@ -36,6 +36,7 @@ test("LangGraph ToolNode invokes only observe and act and keeps image bytes nati
   assert.equal(content.some((block) => block.type === "image" && block.data === PIXELS), true);
   const text = content.find((block) => block.type === "text")?.text ?? "";
   assert.equal(text.includes(PIXELS), false);
+  assert.equal(JSON.parse(text).projection.kind, "snapshot");
 });
 
 test("Chat Completions receives requested screen pixels once, after all tool replies, without changing graph history", async () => {
@@ -78,6 +79,15 @@ test("official MCP Client lists and calls the same endpoints over InMemoryTransp
 
     const listed = await client.listTools();
     assert.deepEqual(listed.tools.map((tool) => tool.name), ["observe", "act"]);
+    assert.ok(listed.tools[0].inputSchema.properties.projection);
+    assert.match(listed.tools[0].description, /\blayout\b/iu);
+    const compact = await client.callTool({ name: "observe", arguments: { projection: { mode: "compact" } } });
+    const base = JSON.parse(compact.content[0].text);
+    const repeated = await client.callTool({
+      name: "observe",
+      arguments: { projection: { mode: "compact", since: base.observationId } },
+    });
+    assert.equal(JSON.parse(repeated.content[0].text).projection.kind, "unchanged");
     const called = await client.callTool({ name: "observe", arguments: { view: "both" } });
     assert.deepEqual(called.content.map((block) => block.type), ["text", "image"]);
     assert.equal(called.content.some((block) => block.type === "image" && block.data === PIXELS), true);

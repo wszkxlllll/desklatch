@@ -101,6 +101,36 @@ test("native Cordis plugin registers exact capability-filtered names and execute
   assert.equal(fixture.closes, 1);
 });
 
+test("native DSH observe repairs only serialized read objects before strict validation", async () => {
+  const fixture = fixtureSession({ capabilities: [] });
+  fixture.session.allowModelDocumentText = true;
+  const runtime = await createDshContext();
+  const fiber = runtime.ctx.plugin(createDeskDshPlugin(async () => fixture.session));
+  await fiber.await();
+  try {
+    const observe = runtime.ctx.tools.get("desklatch_observe");
+    assert.ok(observe);
+    const execution = { signal: new AbortController().signal };
+    await observe.execute({ read: '{"query":"pathlib"}' }, execution);
+    assert.equal(fixture.calls.at(-1).kind, "observe");
+    const observedInput = fixture.calls.at(-1).input;
+    assert.deepEqual({ view: observedInput.view, read: observedInput.read }, { view: "document", read: { query: "pathlib" } });
+    await assert.rejects(
+      () => observe.execute({ read: '{"query":"pathlib","extra":"reject"}' }, execution),
+      /invalid_document_read/u,
+    );
+    assert.equal(fixture.calls.length, 1, "strict validation must reject before the host observe call");
+    await assert.rejects(() => observe.execute({ read: "not-json" }, execution), /invalid_document_read/u);
+    assert.equal(fixture.calls.length, 1);
+  } finally {
+    await fiber.dispose();
+    await runtime.executor.dispose();
+    await runtime.tools.dispose();
+    await runtime.prompt.dispose();
+  }
+  assert.equal(fixture.closes, 1);
+});
+
 test("native DSH image results use an authorized durable attachment projection", async () => {
   const fixture = fixtureSession();
   const runtime = await createDshContext();
@@ -331,10 +361,11 @@ test("native DSH plugin writes and reads an isolated Chromium fixture", async (t
     const result = await executeModelToolFixture(runtime.ctx, {
       callId: "dsh-real-observe",
       name: "desklatch_observe",
-      arguments: { view: "controls" },
+      arguments: { view: "controls", projection: { mode: "compact" } },
       signal,
     });
     assert.match(result.content[0].text, /Title/u);
+    assert.equal(JSON.parse(result.content[0].text).projection.kind, "snapshot");
     const stopped = await executeModelToolFixture(runtime.ctx, {
       callId: "dsh-confirm", name: "desklatch_act",
       arguments: { steps: [{ kind: "click", target: { name: "Send message" } }] }, signal,

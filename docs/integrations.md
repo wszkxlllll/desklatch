@@ -122,6 +122,8 @@ export function connectDesktop(backend: DesktopBackend, showCard: (card: Approva
 
 ## 工具接口
 
+DSH 原生插件、MCP、LangGraph 和 Agents SDK 都使用同一个 `observe` 参数。支持紧凑观察的会话会在现有 Schema 公布 `projection`。SDK 宿主可以在创建会话时设置 `defaultObservationProjection:"compact"`，或者使用 `"incremental"` 让重复的宽范围观察自动尝试差分。默认会话继续使用原有输出。宿主有历史替换能力时，可以参考 `observationId` 和 `projection.base` 处理旧消息。[紧凑观察和增量读取](actions.md)
+
 | 工具 | 常见用法 |
 | --- | --- |
 | `observe` | 使用 `{workspace:true}` 列出可选应用，或读取当前界面的控件、正文和获准的截图 |
@@ -144,9 +146,11 @@ export function connectDesktop(backend: DesktopBackend, showCard: (card: Approva
 }
 ```
 
-使用截图坐标、控件引用或拖拽端点时，需要带上 `observationId`。后端公布支持的动作与参数组合。网页正文需要浏览器后端和会话均授权读取，之后用 `observe({read:{query:"停止入场"}})` 查找，或把 `nextCursor` 作为 `read.cursor` 续读。宿主可用 `desklatch/reuse` 开启已核验步骤的记录与复用。[动作输入契约](../schema/act-input.schema.json) · [执行架构](architecture.md)
+使用截图坐标、控件引用或拖拽端点时，需要带上 `observationId`。后端公布支持的动作与参数组合。网页正文需要浏览器后端和会话均授权读取，之后用 `observe({read:{query:"停止入场"}})` 查找，或把 `nextCursor` 作为 `read.cursor` 续读。宿主可用 `desklatch/reuse` 开启已核验步骤的记录与复用。[动作输入契约](../schema/act-input.schema.json) · [动作空间参考](actions.md) · [执行架构](architecture.md)
 
-Windows 控件可返回 `windowScope`。将它填进目标的 `within`，可把 `role + name` 查找限定到该已授权窗口。已知目标时直接提交 `act`，唯一性、窗口归属和执行准入由 DeskLatch 检查。工作区清单中的 `activeCapabilities` 给出当前应用支持的动作。
+应用切换成功后，`act({activate:id})` 的回执通过 `actionParameters` 说明该应用支持的目标形式、按键和组合键等参数。也可以从工作区清单读取 `activeCapabilities` 和 `activeActionParameters`。程序内的 `desk.act` 可以读取同一份回执。某个控件可以执行哪些动作，以该控件的 `actions` 为准，执行器在派发前会重新核对。
+
+`type` 在光标或选区处输入，`setValue` 替换控件公开的整个值。Windows CUA 能力带 `foreground:true` 时，`type` 可以显式选择 `delivery:"foreground"`，并通过前台输入、桌面捕获授权和实时可写目标核对。输入后可读回公开值或保存结果。按键可指向已观察到的焦点控件，或用 `target:{focusFromStep:1}` 引用同批第 1 步建立的焦点。焦点变更后请重新观察。Windows 控件返回 `windowScope` 时，可用它为 `role + name` 查找限定窗口。
 
 ## 选装与验收
 

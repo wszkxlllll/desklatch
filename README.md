@@ -5,6 +5,7 @@
 <p align="center">
   <a href="https://github.com/wszkxlllll/desklatch/releases/download/v0.1.0-dev.2/DeskLatch-Windows-Setup.zip">下载 Windows 预览</a> ·
   <a href="docs/integrations.md">接入指南</a> ·
+  <a href="docs/actions.md">动作空间</a> ·
   <a href="docs/verification.md">实测记录</a>
 </p>
 

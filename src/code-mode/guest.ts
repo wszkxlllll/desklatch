@@ -6,9 +6,10 @@ import {
   type QuickJSDeferredPromise, type QuickJSHandle,
 } from "quickjs-emscripten-core";
 import {
-  MAX_INSPECTIONS, MAX_TOOL_INPUT_BYTES, MAX_TOOL_REPLY_BYTES,
+  MAX_INSPECTIONS, MAX_TOOL_INPUT_BYTES, MAX_TOOL_REPLY_BYTES, MAX_TRACE_BYTES,
   type CodeProgram, type CodeTool, type ReplyMessage, type StartMessage,
 } from "./protocol.js";
+import type { CodeModeInstrumentation } from "./instrument.js";
 
 const WASM_PAGE_BYTES = 65_536;
 // The pinned QuickJS release requires 16 MiB of engine memory at instantiation.
@@ -20,13 +21,64 @@ const bootstrap = `((observe, act, emit) => {
   const encode = JSON.stringify;
   const decode = JSON.parse;
   const AsyncFunction = (async () => {}).constructor;
+  function createTrace(metadataJson) {
+    const metadata = decode(metadataJson);
+    const branches = metadata.branches.map((entry) => ({ ...entry }));
+    const loops = metadata.loops.map((entry) => ({ ...entry }));
+    const branch = (id, value) => {
+      const entry = branches.find((candidate) => candidate.id === id);
+      if (entry) {
+        entry.evaluations += 1;
+        if (Boolean(value)) entry.taken += 1;
+        else entry.notTaken += 1;
+      }
+      return value;
+    };
+    const logical = (id, value, operator) => {
+      const entry = branches.find((candidate) => candidate.id === id);
+      if (entry) {
+        entry.evaluations += 1;
+        const taken = operator === "??" ? value !== null && value !== undefined : Boolean(value);
+        if (taken) entry.taken += 1;
+        else entry.notTaken += 1;
+      }
+      return value;
+    };
+    const loop = (id) => {
+      const entry = loops.find((candidate) => candidate.id === id);
+      if (entry) entry.iterations += 1;
+    };
+    const switchCase = (id) => {
+      const entry = branches.find((candidate) => candidate.id === id);
+      if (entry) {
+        entry.evaluations += 1;
+        entry.taken += 1;
+      }
+    };
+    const snapshot = () => ({
+      status: metadata.status,
+      transformer: metadata.transformer,
+      branches: branches.map((entry) => ({ ...entry })),
+      loops: loops.map((entry) => ({ ...entry })),
+      unsupported: [...metadata.unsupported],
+      fixedWrapper: metadata.fixedWrapper,
+    });
+    return Object.freeze({ branch, logical, loop, switchCase, snapshot });
+  }
   return {
     desk: Object.freeze({
       async observe(input = {}) { return decode(await observe(encode(input))); },
       async act(input) { return decode(await act(encode(input))); },
     }),
     inspect(value) { emit(encode(value) ?? "null"); },
-    compile(source) { return new AsyncFunction("desk", "inspect", '"use strict";\\n' + source); },
+    createTrace,
+    compile(source, traceName) {
+      if (!traceName) return new AsyncFunction("desk", "inspect", '"use strict";\\n' + source);
+      // Keep the established AsyncFunction isolation.  The randomized third
+      // parameter is a pure counter object; it has no bootstrap closure and
+      // no access to observe/act/inspect bridges beyond the supplied SDK.
+      return new AsyncFunction("desk", "inspect", traceName, '"use strict";\\n' + source);
+    },
   };
 })`;
 
@@ -52,6 +104,20 @@ async function execute(start: StartMessage): Promise<void> {
   try { source = javascript(start); }
   catch { send({ type: "done", status: "failed", code: "code_syntax_error" }); return; }
 
+  let instrumentation: CodeModeInstrumentation | undefined;
+  if (start.evaluation === true) {
+    try {
+      const { instrumentJavaScript } = await import("./instrument.js");
+      instrumentation = await instrumentJavaScript(source);
+    } catch { instrumentation = {
+      code: source,
+      controlFlow: {
+        status: "fallback", transformer: "none", branches: [], loops: [],
+        unsupported: ["instrumentation_error"], fixedWrapper: false,
+      },
+    }; }
+  }
+
   let deadline = performance.now() + start.timeoutMs;
   const memory = new WebAssembly.Memory({
     initial: WASM_INITIAL_PAGES,
@@ -70,14 +136,38 @@ async function execute(start: StartMessage): Promise<void> {
   let inspectBytes = 0;
   let pending: { id: number; promise: QuickJSDeferredPromise } | undefined;
   let program: QuickJSHandle | undefined;
+  let trace: QuickJSHandle | undefined;
+  let traceSent = false;
   let waitingSince: number | undefined;
   const expired = () => waitingSince === undefined && performance.now() >= deadline;
   vm.runtime.setInterruptHandler(() => ended || expired());
 
+  function emitTrace(): void {
+    if (traceSent || !trace || !process.connected) return;
+    traceSent = true;
+    try {
+      using snapshot = vm.getProp(trace, "snapshot");
+      const value = vm.callFunction(snapshot, trace);
+      if (value.error) {
+        value.error.dispose();
+        return;
+      }
+      try {
+        const json = JSON.stringify(vm.dump(value.value));
+        if (typeof json === "string" && Buffer.byteLength(json, "utf8") <= MAX_TRACE_BYTES) {
+          send({ type: "trace", json });
+        }
+      } finally { value.value.dispose(); }
+    } catch { /* Trace evidence must never change execution status. */ }
+  }
+
   function finish(status: "completed" | "failed" | "stopped", code?: string): void {
     if (ended) return;
     ended = true;
-    try { send({ type: "done", status, ...(code && { code }) }); }
+    try {
+      emitTrace();
+      send({ type: "done", status, ...(code && { code }) });
+    }
     finally { settle(); }
   }
 
@@ -157,9 +247,36 @@ async function execute(start: StartMessage): Promise<void> {
   try {
     using init = vm.unwrapResult(vm.evalCode(bootstrap, "sdk.js"));
     using bindings = vm.unwrapResult(vm.callFunction(init, vm.undefined, observe, act, emit));
+    if (instrumentation) {
+      using createTrace = vm.getProp(bindings, "createTrace");
+      using traceMetadata = vm.newString(JSON.stringify(instrumentation.controlFlow));
+      const createdTrace = vm.callFunction(createTrace, vm.undefined, traceMetadata);
+      if (createdTrace.error) {
+        createdTrace.error.dispose();
+        // Evaluation instrumentation is best-effort. If its private trace
+        // cannot be created, run the untouched source below.
+        instrumentation = undefined;
+      } else {
+        trace = createdTrace.value;
+      }
+    }
     using compile = vm.getProp(bindings, "compile");
-    using code = vm.newString(source);
-    const compiled = vm.callFunction(compile, vm.undefined, code);
+    using code = vm.newString(instrumentation?.code ?? source);
+    const traceName = instrumentation?.traceName ? vm.newString(instrumentation.traceName) : undefined;
+    let compiled = traceName && trace
+      ? vm.callFunction(compile, vm.undefined, code, traceName)
+      : vm.callFunction(compile, vm.undefined, code);
+    traceName?.dispose();
+    if (compiled.error && instrumentation) {
+      // A printer/QuickJS mismatch must not turn an evaluation hook into a
+      // product behavior change. Retry once with the original source.
+      compiled.error.dispose();
+      trace?.dispose();
+      trace = undefined;
+      instrumentation = undefined;
+      using rawCode = vm.newString(source);
+      compiled = vm.callFunction(compile, vm.undefined, rawCode);
+    }
     if (compiled.error) {
       compiled.error.dispose();
       finish("failed", "code_syntax_error");
@@ -168,7 +285,9 @@ async function execute(start: StartMessage): Promise<void> {
     using userFunction = compiled.value;
     using sdk = vm.getProp(bindings, "desk");
     using inspect = vm.getProp(bindings, "inspect");
-    const result = vm.callFunction(userFunction, vm.undefined, sdk, inspect);
+    const result = trace && instrumentation?.traceName
+      ? vm.callFunction(userFunction, vm.undefined, sdk, inspect, trace)
+      : vm.callFunction(userFunction, vm.undefined, sdk, inspect);
     if (result.error) {
       result.error.dispose();
       if (expired()) finish("stopped", "code_timeout");
@@ -183,6 +302,7 @@ async function execute(start: StartMessage): Promise<void> {
     process.off("disconnect", disconnected);
     pending?.promise.dispose();
     program?.dispose();
+    trace?.dispose();
   }
 }
 

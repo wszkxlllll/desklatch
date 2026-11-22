@@ -1,5 +1,11 @@
 import { createDeskDshApprovalBridge, createDeskDshPlugin } from "desklatch/dsh";
 import { createDemoDeskSession } from "desklatch/demo";
+import { parseCodeModeMaxCallsEnvironment } from "desklatch/code-mode";
+
+export function resolveDshCodeModeOptions(environment = process.env) {
+  if (environment.DESKLATCH_CODE_MODE !== "1") return false;
+  return { maxCalls: parseCodeModeMaxCallsEnvironment(environment.DESKLATCH_CODE_MODE_MAX_CALLS) };
+}
 
 /**
  * Official Cordis entry for the portable DeskLatch bundle.
@@ -12,6 +18,7 @@ export default {
   name: "desklatch-dsh",
   inject: ["tools"],
   async apply(ctx) {
+    const codeModeOptions = resolveDshCodeModeOptions();
     const approval = createDeskDshApprovalBridge(ctx);
     const openSession = process.platform === "win32"
       ? async () => {
@@ -24,7 +31,7 @@ export default {
       : () => createDemoDeskSession({ onApprovalRequested: approval.onApprovalRequested });
     await ctx.plugin(createDeskDshPlugin(openSession, {
       approval,
-      codeMode: process.env.DESKLATCH_CODE_MODE === "1",
+      codeMode: codeModeOptions,
     })).await();
   },
 };

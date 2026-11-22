@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { createDeskSession } from "desklatch";
+import { createDeskSession, createDeskTools } from "desklatch";
 import { createDeskCodeMode } from "desklatch/code-mode";
 import { createLangChainTools } from "desklatch/langchain";
 import { createDeskMcpServer } from "desklatch/mcp";
@@ -50,6 +50,108 @@ test("one TypeScript program processes observations and runs only the chosen act
   });
   assert.deepEqual(calls[1].input, write);
   assert.equal((await host.runCode({ code: `inspect("next run")` })).status, "completed");
+});
+
+test("run_code guidance reports the host's shared call budget and compact progress rules", async t => {
+  const { host } = makeHost(t, { limits: { maxCalls: 3, maxInspectBytes: 128 } });
+  const description = host.tools.find(tool => tool.name === "run_code").description;
+  assert.match(description, /maxCalls=3 total calls to desk\.observe and desk\.act combined/u);
+  assert.match(description, /budget both reads and actions/u);
+  assert.match(description, /maxInspectBytes=128 UTF-8 bytes total per program/u);
+  assert.match(description, /Inspect small, meaningful progress before either budget runs out/u);
+  assert.match(description, /match count, selected names, sourceUrl, or nextCursor/u);
+  assert.match(description, /one scoped collection by the relevant role or container/u);
+  assert.match(description, /If compact output clips needed rows and the host advertises projection, use projection:\{mode:"full"\}/u);
+  assert.match(description, /Report only conclusions and coverage supported by the returned data/u);
+  assert.match(description, /desk\.observe returns a frame \(controls or document\); desk\.act returns a receipt \(status, steps\)/u);
+  assert.match(description, /A completed run_code status means the program ended, not that the task is complete/u);
+  assert.match(description, /continue from the returned source, query, or cursor/u);
+  assert.match(description, /do not repeat the same read unless you have new data or a changed query/u);
+  assert.doesNotMatch(description, /result\.status|JSON\.stringify\(result\)\.slice/u);
+  assert.doesNotMatch(description, /Windows|Excel|Pane/u);
+});
+
+test("Code Mode keeps point targets flat and does not advertise screenshots inside code", async t => {
+  const session = createDeskSession({
+    capabilities: [{ kind: "click", targets: ["point"], buttons: ["left"], counts: [1] }],
+    async observe() { return { scope: "point-code", complete: true, controls: [] }; },
+    async dispatch() { return { status: "dispatched" }; },
+    close() {},
+  }, { allowModelImages: true });
+  const host = createDeskCodeMode({ tools: createDeskTools(session), close: () => session.close() });
+  t.after(() => host.close());
+  const description = host.tools.find(tool => tool.name === "run_code").description;
+  assert.match(description, /point target is exactly target:\{point:\{x:integer,y:integer\}\}/u);
+  assert.match(description, /observationId is required when any step uses drag or a ref\/point target/u);
+  assert.match(description, /image\/both views are unavailable inside run_code/u);
+  assert.match(description, /preflight schema, capability, or focus rejection means no step was dispatched/u);
+  assert.doesNotMatch(description, /observe\(\{"view":"image"\}\).*obs-fresh/u);
+});
+
+test("Code Mode uses the session's compact snapshot and unchanged response", async t => {
+  const session = createDeskSession({
+    capabilities: [],
+    async observe() {
+      return { scope: "code-projection-test", complete: true, controls: [
+        { id: "field-id", role: "Edit", name: "Draft", value: "ready", actions: [], states: ["visible"] },
+      ] };
+    },
+    async dispatch() { throw new Error("read_only_fixture"); },
+    close() {},
+  });
+  const host = createDeskCodeMode({ tools: createDeskTools(session), close: () => session.close() });
+  t.after(() => host.close());
+  const description = host.tools.find(tool => tool.name === "run_code").description;
+  assert.match(description, /projection=.*"compact"/u);
+  assert.match(description, /name is the control's own name, while within is an observed enclosing container\/window, not a position, range, or leaf control name/u);
+  assert.match(description, /A scoped role or observed enclosing-container query is appropriate/u);
+  assert.match(description, /maxControls is a requested upper bound and may also be clipped by host or byte limits/u);
+  assert.match(description, /frame\.projection\.backendComplete/u);
+  assert.match(description, /frame\.projection\.truncated/u);
+  assert.match(description, /For full results, check frame\.complete/u);
+  assert.match(description, /projection:\{mode:"full"\}/u);
+  assert.match(description, /Compare since:"previous" only against the same view\/where\/maxControls scope when backendComplete:true/u);
+  assert.match(description, /not pagination for previously clipped rows/u);
+  assert.doesNotMatch(description, /explicit maxControls wins|Role alone is broad; avoid unfiltered/u);
+  const result = await host.runCode({ code: `
+    const first = await desk.observe({ projection: { mode: "compact" } });
+    const repeat = await desk.observe({ projection: { mode: "compact", since: first.observationId } });
+    const full = await desk.observe({ projection: { mode: "full" } });
+    inspect({
+      hasRef: typeof first.controls[0].ref === "string",
+      repeat: repeat.projection.kind,
+      controls: repeat.controls.length,
+      freshId: repeat.observationId !== first.observationId,
+      compactBackendComplete: first.projection.backendComplete,
+      compactTruncated: first.projection.truncated,
+      fullComplete: full.complete,
+    });
+  ` });
+  assert.equal(result.status, "completed");
+  assert.deepEqual(result.inspections, [{
+    hasRef: true,
+    repeat: "unchanged",
+    controls: 0,
+    freshId: true,
+    compactBackendComplete: true,
+    compactTruncated: false,
+    fullComplete: true,
+  }]);
+});
+
+test("run_code exposes only the last verified activation guide and clears denied switches", async t => {
+  const guide = "steps{type{target=ref;text=string}}";
+  const { host } = makeHost(t, {
+    act: input => input?.activate === "editor"
+      ? { status: "completed", code: "activated", applicationId: "editor", actionParameters: guide, steps: [] }
+      : { status: "stopped", code: "application_automation_blocked", steps: [] },
+  });
+  const successful = await host.runCode({ code: `await desk.act({ activate: "editor" });` });
+  assert.deepEqual(successful.lastVerifiedActivation, { applicationId: "editor", actionParameters: guide });
+
+  const denied = await host.runCode({ code: `await desk.act({ activate: "editor" }); await desk.act({ activate: "denied" });` });
+  assert.equal(denied.status, "stopped");
+  assert.equal(denied.lastVerifiedActivation, undefined);
 });
 
 test("the guest only sees its isolated JavaScript globals and the bounded SDK", async t => {
@@ -113,6 +215,43 @@ test("confirmed zero-dispatch grounding failure requires a fresh observation and
   assert.deepEqual(recovered.actions.map(action => action.call), [1, 3]);
   assert.deepEqual(calls.map(call => call.name), ["act", "observe", "act"]);
   assert.equal(calls.at(-1).input.observationId, "fresh");
+});
+
+for (const code of ["focus_changed", "focus_unavailable"]) {
+  test(`a confirmed zero-dispatch ${code} permits one fresh observation recovery`, async t => {
+    const failure = { status: "stopped", code, steps: [{ index: 1, kind: "type", status: "not_dispatched", code }] };
+    const recovered = { status: "completed", steps: [{ index: 1, kind: "type", status: "verified" }] };
+    let actCalls = 0;
+    const { calls, host } = makeHost(t, {
+      observe: () => ({ observationId: `fresh-${code}`, controls: [{ name: "Title" }] }),
+      act: () => actCalls++ === 0 ? failure : recovered,
+    });
+    const step = JSON.stringify(write);
+    const result = await host.runCode({ code: `
+      const first = await desk.act(${step});
+      if (first.code === ${JSON.stringify(code)}) {
+        const frame = await desk.observe({});
+        await desk.act({ ...${step}, observationId: frame.observationId });
+      }
+    ` });
+    assert.equal(result.status, "completed");
+    assert.deepEqual(result.actions.map(action => action.call), [1, 3]);
+    assert.deepEqual(calls.map(call => call.name), ["act", "observe", "act"]);
+    assert.equal(calls.at(-1).input.observationId, `fresh-${code}`);
+  });
+}
+
+test("a focus failure with an authoritative dispatch never enters recovery", async t => {
+  const dispatched = { status: "stopped", code: "focus_changed", steps: [{ index: 1, kind: "type", status: "dispatched", code: "focus_changed" }] };
+  const { calls, host } = makeHost(t, { act: () => dispatched });
+  const result = await host.runCode({ code: `
+    try { await desk.act(${JSON.stringify(write)}); } catch {}
+    try { await desk.observe({}); } catch {}
+  ` });
+  assert.equal(result.status, "stopped");
+  assert.equal(result.code, "focus_changed");
+  assert.deepEqual(result.actions, [{ call: 1, ...dispatched }]);
+  assert.deepEqual(calls.map(call => call.name), ["act"]);
 });
 
 test("timeouts, unsettled promises and excess memory close the guest", async t => {

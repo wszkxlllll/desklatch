@@ -121,6 +121,8 @@ export function errorText(error: unknown): string {
 /** A host-owned public tool surface, such as a workspace or one DeskSession. */
 export interface DeskToolHost {
   readonly tools: readonly ToolEndpoint[];
+  /** Optional host-private active surface used only for dynamic guidance. */
+  readonly activeTools?: readonly ToolEndpoint[];
   close(): void | Promise<void>;
   resolveApproval?(requestId: string, decision: "approve" | "deny"): Promise<unknown>;
   cancel?(reason?: string): void;
@@ -134,6 +136,7 @@ export function resolveDeskToolHost(source: DeskToolSource): DeskToolHost {
     const host = source as DeskToolHost;
     return {
       tools: normalizeEndpoints(host.tools),
+      get activeTools() { return host.activeTools; },
       close: host.close.bind(host),
       ...(host.resolveApproval ? { resolveApproval: host.resolveApproval.bind(host) } : {}),
       ...(host.cancel ? { cancel: host.cancel.bind(host) } : {}),

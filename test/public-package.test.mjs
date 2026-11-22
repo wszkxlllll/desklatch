@@ -30,6 +30,9 @@ test("Agents SDK function tools invoke the real executor and keep host controls 
   assert.ok(Array.isArray(observe));
   assert.equal(observe.some(b => b.type === "text" && b.text.includes("AQID")), false);
   assert.ok(observe.some(b => b.type === "image"));
+  const compact = await tools[0].invoke(new RunContext({}), '{"projection":{"mode":"compact"}}');
+  const compactText = typeof compact === "string" ? compact : compact.find(block => block.type === "text")?.text;
+  assert.equal(JSON.parse(compactText).projection.kind, "snapshot");
   const act = tools[1];
   const receipt = JSON.parse(await act.invoke(new RunContext({}), JSON.stringify({
     steps: [{ kind: "type", target: { name: "Title" }, text: "SDK", expect: { target: { name: "Title" }, valueEquals: "SDK" } }],

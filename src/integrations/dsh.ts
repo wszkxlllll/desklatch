@@ -124,6 +124,30 @@ function deniedApprovalResult(requestId: string): Record<string, unknown> {
   return { requestId, status: "stopped", code: "approval_unavailable", steps: [] };
 }
 
+/**
+ * Some DSH model/tool adapters serialize the nested observe `read` object as
+ * a JSON string before invoking the native tool.  Recover only that one
+ * transport representation; the shared observe parser still performs the
+ * strict query/cursor shape and length checks.  No act or authorization input
+ * is coerced here.
+ */
+function normalizeDshObserveInput(endpointName: string, args: unknown): unknown {
+  if (endpointName !== "observe" || typeof args !== "object" || args === null || Array.isArray(args)) return args;
+  const input = args as Record<string, unknown>;
+  if (typeof input.read !== "string" || input.read === "document") return args;
+  const encoded = input.read.trim();
+  if (!encoded.startsWith("{") || !encoded.endsWith("}")) return args;
+  try {
+    const parsed: unknown = JSON.parse(encoded);
+    if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+      return { ...input, read: parsed };
+    }
+  } catch {
+    // Leave malformed transport input untouched so the strict parser rejects it.
+  }
+  return args;
+}
+
 function mergeApprovalReceipts(previous: unknown, next: unknown): unknown {
   if (typeof previous !== "object" || previous === null || !Array.isArray((previous as { steps?: unknown }).steps)) return next;
   if (typeof next !== "object" || next === null) return next;
@@ -263,7 +287,7 @@ function makeDefinition(ctx: Context, endpoint: ToolEndpoint, approval: DeskDshA
   const projections = new WeakMap<ToolExecution, PreparedImageProjection>();
   return {
     name,
-    description: endpoint.description,
+    get description() { return endpoint.description; },
     get parameters() { return endpoint.inputSchema; },
     output: {
       schema: {
@@ -285,7 +309,10 @@ function makeDefinition(ctx: Context, endpoint: ToolEndpoint, approval: DeskDshA
     },
     execute: async (args: unknown, execution: ToolExecution) => {
       try {
-        const input = (typeof args === "object" && args !== null ? args : {}) as Record<string, unknown>;
+        const normalized = normalizeDshObserveInput(endpoint.name, args);
+        const input = typeof normalized === "object" && normalized !== null && !Array.isArray(normalized)
+          ? normalized as Record<string, unknown>
+          : {};
         const invoke = () => endpoint.name === "run_code" && runCode
           ? runCode(input, execution)
           : endpoint.invoke(input, execution.signal);
