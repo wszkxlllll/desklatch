@@ -1,7 +1,7 @@
 export type * from "./contracts.js";
 export { createDeskSession } from "./session.js";
 export type {
-  DeskSession, DeskSessionOptions, DeskSessionActOptions, VerifiedStepEvidence, DeskObservation, ActResult, StepReceipt,
+  DeskSession, DeskSessionOptions, DeskSessionActOptions, VerifiedStepEvidence, DeskObservation, ObservationProjection, ObservationProjectionRequest, ActResult, ActValidationDiagnostic, StepReceipt,
   ApprovalRequest, ApprovalDecision, ApprovalResolution, ApprovalHandler,
 } from "./session.js";
 export { createDeskTools, desktopToolInstructions } from "./tools.js";

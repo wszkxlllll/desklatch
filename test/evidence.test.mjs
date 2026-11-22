@@ -166,6 +166,131 @@ test("execution wrapper archives only host-approved local before/after captures"
   assert.equal(closed, true);
 });
 
+test("execution wrapper preserves optional point hit testing and action kind", async () => {
+  const frame = {
+    scope: "image-only-hit-test-scope",
+    controls: [],
+    complete: true,
+    image: { mimeType: "image/png", dataBase64: Buffer.from([1, 2, 3]).toString("base64"), width: 20, height: 20 },
+  };
+  const privateTarget = {
+    id: "private-button",
+    role: "Button",
+    name: "Private target",
+    states: ["visible", "enabled"],
+    actions: ["click"],
+    rect: { x: 0, y: 0, width: 20, height: 20 },
+    effect: "read",
+  };
+  const makeBackend = () => {
+    const calls = { hitTest: [], dispatch: 0 };
+    const backend = {
+      capabilities: [{ kind: "click", targets: ["point"], buttons: ["left"], counts: [1] }],
+      hitTestSnapshot: true,
+      async observe() { return frame; },
+      async hitTest(hitFrame, point, signal, kind) {
+        calls.hitTest.push({ hitFrame, point, signal, kind });
+        return kind === "click" ? privateTarget : undefined;
+      },
+      async dispatch(request) {
+        assert.equal(request.target, privateTarget);
+        calls.dispatch += 1;
+        return { status: "dispatched" };
+      },
+      async close() {},
+    };
+    return { backend, calls };
+  };
+  const run = async (backend) => {
+    const session = createDeskSession(backend, { allowModelImages: true, policy: () => ({ decision: "allow", code: "test" }) });
+    const observation = await session.observe({ view: "image" });
+    const result = await session.act({
+      observationId: observation.observationId,
+      steps: [{ kind: "click", target: { point: { x: 5, y: 5 } } }],
+    });
+    await session.close();
+    return result;
+  };
+
+  const plain = makeBackend();
+  const plainResult = await run(plain.backend);
+  const store = new MemoryPrivateEvidenceStore();
+  const wrappedFixture = makeBackend();
+  const wrapped = new EvidenceCapturingBackend(wrappedFixture.backend, {
+    sessionId: "image-only-hit-test-session",
+    sink: new LocalEvidenceSink({ store, redactor: { redact: image => ({ ...image, redacted: true }) } }),
+    capturePolicy: { localOnly: true, approve: () => true },
+    captureImage: async () => frame.image,
+    captureBefore: true,
+    captureAfter: true,
+  });
+  assert.equal(wrapped.hitTestSnapshot, true);
+  assert.equal(typeof wrapped.hitTest, "function");
+  const wrappedResult = await run(wrapped);
+
+  assert.equal(plainResult.status, "completed");
+  assert.equal(wrappedResult.status, "completed");
+  assert.equal(plain.calls.dispatch, 1);
+  assert.equal(wrappedFixture.calls.dispatch, 1);
+  assert.equal(plain.calls.hitTest.length, 2);
+  assert.equal(wrappedFixture.calls.hitTest.length, 2);
+  assert.deepEqual(plain.calls.hitTest.map(call => call.kind), ["click", "click"]);
+  assert.deepEqual(wrappedFixture.calls.hitTest.map(call => call.kind), ["click", "click"]);
+  assert.equal(store.size, 2);
+});
+
+test("execution wrapper does not manufacture hit testing for a backend without it", async () => {
+  const frame = { scope: "no-hit-test-scope", controls: [], complete: true };
+  const backend = {
+    capabilities: [],
+    async observe() { return frame; },
+    async dispatch() { return { status: "dispatched" }; },
+    async close() {},
+  };
+  const wrapped = new EvidenceCapturingBackend(backend, {
+    sessionId: "no-hit-test-session",
+    sink: { async save() { throw new Error("not expected"); } },
+    capturePolicy: { localOnly: true, approve: () => true },
+  });
+  assert.equal(wrapped.hitTestSnapshot, undefined);
+  assert.equal(wrapped.hitTest, undefined);
+  assert.equal("hitTestSnapshot" in wrapped, false);
+  assert.equal("hitTest" in wrapped, false);
+  assert.equal(await wrapped.observe({ view: "controls" }), frame);
+});
+
+test("execution wrapper remains fail-closed when before capture fails", async () => {
+  const frame = {
+    scope: "failsafe-capture-scope",
+    controls: [],
+    complete: true,
+    image: { mimeType: "image/png", dataBase64: Buffer.from([4, 5, 6]).toString("base64"), width: 2, height: 2 },
+  };
+  let dispatches = 0;
+  const backend = {
+    capabilities: [],
+    async observe() { return frame; },
+    async dispatch() { dispatches += 1; return { status: "dispatched" }; },
+    async close() {},
+  };
+  const diagnostics = [];
+  const wrapped = new EvidenceCapturingBackend(backend, {
+    sessionId: "failsafe-capture-session",
+    sink: { async save() { throw new Error("capture storage failed"); } },
+    capturePolicy: { localOnly: true, approve: () => true },
+    captureBefore: true,
+    onDiagnostic: diagnostic => diagnostics.push(diagnostic),
+  });
+  const delivery = await wrapped.dispatch({
+    step: { kind: "click", target: { point: { x: 1, y: 1 } } },
+    frame,
+    target: { id: "private-target", role: "Button", states: ["visible", "enabled"], actions: ["click"] },
+  });
+  assert.deepEqual(delivery, { status: "refused", code: "evidence_capture_failed" });
+  assert.equal(dispatches, 0);
+  assert.deepEqual(diagnostics, [{ phase: "before", code: "storage_failed" }]);
+});
+
 test("capture hooks never observe/rebind a strict dispatch frame and post-storage errors preserve delivery", async () => {
   const image = { mimeType: "image/png", dataBase64: Buffer.from([4, 5, 6]).toString("base64"), width: 2, height: 2 };
   const frame = { scope: "strict-scope", controls: [], complete: true, image };

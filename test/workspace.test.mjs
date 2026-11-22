@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { createDeskSession, createDeskTools } from "desklatch";
 import { createOnDemandWorkspaceApplication, createWorkspace, createWorkspaceTools } from "desklatch/workspace";
 
 function fakeSession(id, options = {}) {
@@ -106,6 +107,8 @@ test("workspace discovery works before activation and exposes exactly observe/ac
   const workspace = createWorkspace({ applications: [app("one", first.session), app("two", second.session)] });
   const tools = createWorkspaceTools(workspace);
   assert.deepEqual(tools.map((tool) => tool.name), ["observe", "act"]);
+  assert.match(tools[0].description, /No application is active.*workspace:true.*activate/u);
+  assert.match(tools[1].description, /No application is active.*workspace:true.*activate/u);
   assert.deepEqual(await tools[0].invoke({ workspace: true }), {
     active: null,
     applications: [
@@ -115,6 +118,50 @@ test("workspace discovery works before activation and exposes exactly observe/ac
   });
   assert.equal(first.calls.observe.length, 0);
   await workspace.close();
+});
+
+test("workspace navigation, application switches and authorization invalidate compact baselines", async t => {
+  function application(id) {
+    const session = createDeskSession({
+      capabilities: [],
+      async observe() {
+        return { scope: id, complete: true, controls: [
+          { id: "stable-widget", role: "Edit", name: "Title", value: "record", actions: [], states: ["visible"] },
+        ] };
+      },
+      async dispatch() { throw new Error("read_only_fixture"); },
+      close() {},
+    });
+    return app(id, session, {
+      activate: () => ({ status: "activated" }),
+      verifyFront: () => true,
+      navigate: () => ({ status: "completed", code: "navigated" }),
+    });
+  }
+  let allowed = true;
+  const workspace = createWorkspace({
+    applications: [application("first"), application("second")],
+    initialActive: "first",
+    canAutomate: () => allowed,
+  });
+  t.after(() => workspace.close());
+  assert.ok(workspace.tools.find(tool => tool.name === "observe").inputSchema.properties.projection);
+  const compact = { mode: "compact" };
+  const read = (since) => workspace.observe({ projection: { ...compact, ...(since ? { since } : {}) } });
+  const first = await read();
+  assert.equal((await read(first.observationId)).projection.kind, "unchanged");
+  assert.equal((await workspace.act({ navigate: "https://example.test/settings" })).status, "completed");
+  const navigated = await read(first.observationId);
+  assert.equal(navigated.projection.kind, "snapshot");
+  assert.equal(navigated.projection.fallback, "since_invalid");
+  assert.equal((await workspace.act({ activate: "second" })).status, "completed");
+  assert.equal((await workspace.act({ activate: "first" })).status, "completed");
+  const switched = await read(navigated.observationId);
+  assert.equal(switched.projection.fallback, "since_invalid");
+  allowed = false;
+  assert.equal((await read(switched.observationId)).code, "application_automation_blocked");
+  allowed = true;
+  assert.equal((await read(switched.observationId)).projection.fallback, "since_invalid");
 });
 
 test("step reuse stays inside the two workspace tools and invalidates refs after switching apps", async () => {
@@ -308,6 +355,54 @@ test("workspace schemas retain the active DeskSession capability and delivery ga
   await workspace.close();
 });
 
+test("layout and coordinate guidance follow the active application's grants", async () => {
+  const visual = fakeSession("visual");
+  visual.session.allowModelImages = true;
+  visual.session.capabilities = [{ kind: "click", targets: ["point"] }];
+  const directTools = createDeskTools(visual.session);
+  assert.match(directTools[0].description, /\blayout\b/iu);
+  assert.match(directTools[0].description, /screenshot-native x\/y/u);
+  assert.match(directTools[1].description, /exact observationId/u);
+  assert.match(directTools[1].description, /One valid point call is observe\(\{"view":"image"\}\).*target":\{"point":\{"x":420,"y":300\}\}/u);
+  assert.match(directTools[1].description, /top-left pixel is origin \(0,0\)/u);
+  assert.match(directTools[1].description, /target\.point is an object, never \[x,y\]/u);
+  assert.match(directTools[1].description, /each sibling as its own flat \{kind,target,\.\.\.\} step/u);
+
+  const workspace = createWorkspace({ applications: [app("visual", visual.session)], initialActive: "visual" });
+  assert.match(workspace.tools[0].description, /screenshot-native x\/y/u);
+  assert.match(workspace.tools[1].description, /not_dispatched/u);
+  assert.match(workspace.tools[0].description, /omit workspace/iu);
+  assert.match(workspace.activeTools[0].description, /omit workspace/iu);
+  assert.match(workspace.tools[0].inputSchema.properties.workspace.description, /omit workspace/iu);
+  await assert.rejects(() => workspace.tools[0].invoke({ workspace: true, view: "image" }), /invalid_workspace_observe/u);
+  assert.equal(visual.calls.observe.length, 0);
+  await workspace.tools[0].invoke({ view: "image" });
+  assert.equal(visual.calls.observe[0].view, "image");
+  await workspace.close();
+
+  const visualFirst = fakeSession("visual-first");
+  visualFirst.session.allowModelImages = true;
+  visualFirst.session.capabilities = [{ kind: "click", targets: ["point"] }];
+  const controlsActive = fakeSession("controls-active");
+  const controlsWorkspace = createWorkspace({
+    applications: [app("visual-first", visualFirst.session), app("controls-active", controlsActive.session)],
+    initialActive: "controls-active",
+  });
+  assert.doesNotMatch(controlsWorkspace.tools[0].description, /screenshot-native x\/y/u);
+  assert.doesNotMatch(controlsWorkspace.tools[0].description, /\blayout\b/iu);
+  assert.doesNotMatch(controlsWorkspace.tools[1].description, /screenshot-native x\/y/u);
+  assert.doesNotMatch(JSON.stringify(controlsWorkspace.activeTools[0].inputSchema), /"image"|"both"/u);
+  await controlsWorkspace.close();
+
+  const controlsOnly = fakeSession("controls-only");
+  controlsOnly.session.allowModelImages = true;
+  controlsOnly.session.capabilities = [{ kind: "click", targets: ["selector"] }];
+  const controlsOnlyTools = createDeskTools(controlsOnly.session);
+  assert.match(controlsOnlyTools[0].description, /\blayout\b/iu);
+  assert.doesNotMatch(controlsOnlyTools[0].description, /screenshot-native x\/y/u);
+  await controlsOnly.session.close();
+});
+
 test("activation calls the real activator and independently verifies repeated switches", async () => {
   const first = fakeSession("one");
   const second = fakeSession("two");
@@ -324,6 +419,47 @@ test("activation calls the real activator and independently verifies repeated sw
   assert.equal((await workspace.act({ activate: "one" })).code, "activated");
   assert.deepEqual(activations, ["two", "one"]);
   assert.equal((await workspace.act({ activate: "one" })).code, "already_active");
+  await workspace.close();
+});
+
+test("verified app switches expose the exact active action-parameter guide", async () => {
+  const first = fakeSession("one");
+  const second = fakeSession("two");
+  first.session.capabilities = [{ kind: "click", targets: ["selector"] }];
+  second.session.capabilities = [{ kind: "type", targets: ["ref"] }];
+  const workspace = createWorkspace({
+    applications: [
+      app("one", first.session, { activate: () => {}, verifyFront: async () => true }),
+      app("two", second.session, { activate: () => {}, verifyFront: async () => true, navigate: async () => ({ status: "completed", steps: [], finalUrl: "https://example.test/active" }) }),
+    ],
+    initialActive: "one",
+  });
+  assert.match(JSON.stringify(workspace.tools[1].inputSchema), /"const"\s*:\s*"type"/u);
+  assert.match(JSON.stringify(workspace.activeTools[1].inputSchema), /"const"\s*:\s*"click"/u);
+  assert.doesNotMatch(JSON.stringify(workspace.activeTools[1].inputSchema), /"const"\s*:\s*"type"/u);
+  assert.equal(workspace.activeTools[0].inputSchema.properties.workspace.type, "boolean");
+  assert.equal(workspace.activeTools[1].inputSchema.properties.activate.type, "string");
+  assert.match(workspace.tools[1].description, /Exact action parameter guide:.*click/iu);
+  assert.doesNotMatch(workspace.tools[1].description, /Exact action parameter guide:.*type/iu);
+  const toTwo = await workspace.act({ activate: "two" });
+  assert.match(JSON.stringify(workspace.activeTools[1].inputSchema), /"const"\s*:\s*"type"/u);
+  assert.doesNotMatch(JSON.stringify(workspace.activeTools[1].inputSchema), /"const"\s*:\s*"click"/u);
+  assert.equal(workspace.activeTools[1].inputSchema.properties.navigate.type, "string");
+  assert.match(workspace.tools[1].description, /Exact action parameter guide:.*type/iu);
+  assert.doesNotMatch(workspace.tools[1].description, /Exact action parameter guide:.*click/iu);
+  const toOne = await workspace.act({ activate: "one" });
+  assert.equal(toTwo.code, "activated");
+  assert.equal(toOne.code, "activated");
+  assert.equal(typeof toTwo.actionParameters, "string");
+  assert.equal(typeof toOne.actionParameters, "string");
+  assert.match(toTwo.actionParameters, /activate=<application id>/u);
+  assert.match(toTwo.actionParameters, /navigate=<authorized URI>/u);
+  assert.notEqual(toTwo.actionParameters, toOne.actionParameters);
+  assert.match(toTwo.actionParameters, /type/iu);
+  assert.match(toOne.actionParameters, /click/iu);
+  const inventory = await workspace.observe({ workspace: true });
+  assert.equal(inventory.active, "one");
+  assert.equal(inventory.activeActionParameters, toOne.actionParameters);
   await workspace.close();
 });
 

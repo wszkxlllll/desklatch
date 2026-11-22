@@ -7,29 +7,35 @@ import type {
   DesktopBackend,
   Dispatch,
   Frame,
+  HostPolicyEvidence,
   RiskDecision,
   RiskInput,
   State,
   View,
   Selector,
   Expect,
+  Step,
 } from "./contracts.js";
 import type {
   ActResult,
+  ActValidationDiagnostic,
   ApprovalDecision,
   ApprovalRequest,
   ApprovalResolution,
   CandidateSummary,
   DeskObservation,
   DeskObserveOptions,
+  ObservationProjectionRequest,
   DeskSession,
   DeskSessionActOptions,
   DeskSessionOptions,
   StepReceipt,
   VerifiedStepEvidence,
 } from "./core/session-types.js";
+import { ACT_EXPECTATION_FAILURE_HINT, ACT_POINT_CLICK_EVIDENCE_HINT } from "./core/session-types.js";
 export type {
   ActResult,
+  ActValidationDiagnostic,
   ApprovalDecision,
   ApprovalHandler,
   ApprovalRequest,
@@ -38,6 +44,8 @@ export type {
   ControlObservation,
   DeskObservation,
   DeskObserveOptions,
+  ObservationProjection,
+  ObservationProjectionRequest,
   DeskSession,
   DeskSessionActOptions,
   DeskSessionOptions,
@@ -46,7 +54,7 @@ export type {
   VerifiedStepEvidence,
 } from "./core/session-types.js";
 import { randomUUID } from "node:crypto";
-import { validateRequest } from "./request.js";
+import { RequestValidationError, validateRequest } from "./request.js";
 import { canonicalRole, matchControl } from "./grounding.js";
 import { defaultRiskPolicy, recheckRiskApproval } from "./policy.js";
 import { awaitAbortable, deepFreeze, freezeCapabilities, intersectCapabilities, mergeSignals, safeAdapterCode, safeValidationCode } from "./core/session-support.js";
@@ -79,6 +87,50 @@ interface SuspendedBatch {
   result?: ApprovalResolution;
 }
 
+interface FocusBindingRecord {
+  readonly binding: string;
+  readonly signal: AbortSignal;
+  readonly sourceStep: number;
+  readonly controlId: string;
+  readonly windowScope: string;
+  readonly sourceControlId: string;
+  readonly proof: FocusBindingProof;
+}
+
+interface FocusBindingProof extends HostPolicyEvidence {
+  readonly binding: string;
+  readonly sourceControlId: string;
+  readonly focusControlId: string;
+  readonly windowScope: string;
+}
+
+interface FocusHandoffPolicyEvidence extends HostPolicyEvidence {
+  readonly kind: "focus_handoff";
+  readonly binding: string;
+  readonly sourceStep: number;
+  readonly commitStep: number;
+  readonly sourceControlId: string;
+  readonly focusControlId: string;
+  readonly windowScope: string;
+  /** Backend-specific proof is opaque to Core and visible only to host policy. */
+  readonly proof: HostPolicyEvidence;
+}
+
+function evidenceRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function isFocusBindingProof(value: HostPolicyEvidence | undefined): value is FocusBindingProof {
+  if (!value || typeof value.kind !== "string" || value.kind.length === 0) return false;
+  const raw = value as Record<string, unknown>;
+  return typeof raw.binding === "string" && raw.binding.length > 0 && raw.binding.length <= 128
+    && typeof raw.sourceControlId === "string" && raw.sourceControlId.length > 0
+    && typeof raw.focusControlId === "string" && raw.focusControlId.length > 0
+    && typeof raw.windowScope === "string" && raw.windowScope.length > 0;
+}
+
 interface ActiveExecution {
   controller: AbortController;
   epoch: number;
@@ -88,6 +140,7 @@ interface ActiveExecution {
   pendingApprovals: Set<PendingApproval>;
   pinnedObservations: Set<StoredObservation>;
   focusRecords: Map<number, FocusRecord>;
+  focusBindings: Map<number, FocusBindingRecord>;
   timeoutTimer?: ReturnType<typeof setTimeout>;
   removeParentAbort?: () => void;
   suspended?: SuspendedBatch;
@@ -99,6 +152,26 @@ const DEFAULT_MAX_SCROLL_AMOUNT = 100;
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_APPROVAL_TIMEOUT_MS = 30_000;
 const OBSERVATION_VIEWS: readonly View[] = ["controls", "image", "both", "document"];
+
+function controlsQueryKey(where: Selector | undefined): string {
+  return JSON.stringify([where?.role, where?.name, where?.within, where?.state]);
+}
+
+function isBroadControlsQuery(view: View, where: Selector | undefined, read: DocumentRead | undefined): boolean {
+  if ((view !== "controls" && view !== "both") || read !== undefined) return false;
+  return where === undefined || (Object.keys(where).length === 1 && typeof where.role === "string");
+}
+
+function compactDocumentRead(read: DocumentRead): DocumentRead {
+  const requested = read === "document" ? { kind: "document" as const } : read;
+  if (requested.cursor !== undefined) return requested;
+  return {
+    ...requested,
+    maxChars: Math.min(requested.maxChars ?? 4_096, 4_096),
+    maxChunks: Math.min(requested.maxChunks ?? 8, 8),
+    chunkSize: Math.min(requested.chunkSize ?? 1_024, 1_024),
+  };
+}
 
 /**
  * Construct an execution-only desktop session. The session contains no provider
@@ -131,6 +204,10 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
       return targets.length > 0 ? [{ ...capability, targets }] : [];
     }));
   const sessionLimits = Object.freeze({ maxSteps, maxTextLength, maxScrollAmount });
+  const defaultObservationProjection: ObservationProjectionRequest | undefined =
+    options.defaultObservationProjection === "compact" || options.defaultObservationProjection === "incremental"
+    ? { mode: "compact" }
+    : undefined;
 
   function grantedAction(kind: ActionKind): boolean {
     return effectiveCapabilities.some((capability) => capability.kind === kind
@@ -224,6 +301,25 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
     return target.effect === "read" && (disclosure || filter || tab);
   }
 
+  function capturesFocusForLaterStep(request: ActRequest, position: number, index: number): boolean {
+    for (let later = position + 1; later < request.steps.length; later += 1) {
+      const candidate = request.steps[later];
+      if (!("target" in candidate)) continue;
+      if ("focusFromStep" in candidate.target && candidate.target.focusFromStep === index) return true;
+    }
+    return false;
+  }
+
+  function capturesFocusForEnterLater(request: ActRequest, position: number, index: number): boolean {
+    for (let later = position + 1; later < request.steps.length; later += 1) {
+      const candidate = request.steps[later];
+      if (candidate.kind === "keypress" && candidate.key === "Enter"
+        && "target" in candidate && "focusFromStep" in candidate.target
+        && candidate.target.focusFromStep === index) return true;
+    }
+    return false;
+  }
+
   function currentReason(execution: ActiveExecution): string {
     if (execution.reason) return execution.reason;
     if (closed) return "closed";
@@ -267,7 +363,13 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
     };
   }
 
-  function rejectedResult(rawRequest: ActRequest | undefined, code: string, candidates?: readonly CandidateSummary[]): ActResult {
+  function pointClickEvidenceHint(step: Step, code: string | undefined): typeof ACT_POINT_CLICK_EVIDENCE_HINT | undefined {
+    if (step.kind !== "click" || !("point" in step.target)) return undefined;
+    if (code !== "ambiguous_click_target" && code !== "unknown_effect") return undefined;
+    return ACT_POINT_CLICK_EVIDENCE_HINT;
+  }
+
+  function rejectedResult(rawRequest: ActRequest | undefined, code: string, candidates?: readonly CandidateSummary[], atStep?: number, validation?: ActValidationDiagnostic): ActResult {
     const steps: StepReceipt[] = [];
     for (let index = 1; index <= (rawRequest?.steps.length ?? 0); index += 1) {
       steps.push({ index, kind: rawRequest?.steps[index - 1]?.kind, status: "not_dispatched", code: "preflight_failed" });
@@ -276,6 +378,8 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
       status: "rejected",
       code,
       steps,
+      ...(Number.isSafeInteger(atStep) && (atStep as number) >= 1 ? { atStep } : {}),
+      ...(validation ? { validation } : {}),
       ...(candidates && candidates.length > 0 ? { candidates } : {}),
     };
   }
@@ -499,6 +603,7 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
       pendingApprovals: new Set(),
       pinnedObservations: new Set(),
       focusRecords: new Map(),
+      focusBindings: new Map(),
     };
     active = execution;
     const limit = Math.max(1, timeoutMs);
@@ -529,6 +634,8 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
     if (active === execution) active = undefined;
     if (execution.timeoutTimer) clearTimeout(execution.timeoutTimer);
     execution.removeParentAbort?.();
+    try { backend.clearExecutionState?.(execution.controller.signal); } catch { /* cleanup cannot change the action result */ }
+    execution.focusBindings.clear();
     if (!execution.suspended) {
       cancelPending(execution, execution.reason === "corrected" ? "corrected" : execution.reason === "closed" ? "closed" : "cancelled");
     }
@@ -556,11 +663,32 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
   ): Promise<{ prepared?: PreparedStep; code?: string; candidates?: readonly Control[]; candidateObservation?: StoredObservation }> {
     const refreshed = await revalidateApproval(request, index, prepared, execution);
     if (!refreshed.prepared) return refreshed;
+    const hostEvidence = pending.riskInput?.hostEvidence;
+    if (hostEvidence?.kind === "focus_handoff") {
+      const evidence = hostEvidence as Record<string, unknown>;
+      const proof = evidenceRecord(evidence.proof);
+      const sourceStep = evidence.sourceStep;
+      const commitStep = evidence.commitStep;
+      const focusTarget = refreshed.prepared.step.kind === "keypress"
+        ? refreshed.prepared.step.target
+        : undefined;
+      if (pending.riskInput?.signal !== execution.controller.signal
+        || !Number.isSafeInteger(sourceStep) || !Number.isSafeInteger(commitStep) || commitStep !== index
+        || !focusTarget || !("focusFromStep" in focusTarget)
+        || focusTarget.focusFromStep !== sourceStep
+        || evidence.focusControlId !== refreshed.prepared.target.id
+        || evidence.windowScope !== refreshed.prepared.target.windowScope
+        || !proof || evidence.binding !== proof.binding || evidence.sourceControlId !== proof.sourceControlId
+        || evidence.focusControlId !== proof.focusControlId || evidence.windowScope !== proof.windowScope) {
+        return { code: "approval_stale" };
+      }
+    }
     const refreshedInput: RiskInput = {
       step: refreshed.prepared.step,
       target: policyControl(refreshed.prepared.target),
       ...(refreshed.prepared.destination ? { destination: policyControl(refreshed.prepared.destination) } : {}),
       signal: execution.controller.signal,
+      ...(hostEvidence ? { hostEvidence } : {}),
     };
     let finalDecision: RiskDecision;
     try {
@@ -699,6 +827,36 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
           prepared = resolution.prepared;
         }
 
+        const focusFromStep = step.kind === "keypress" && step.key === "Enter" && "focusFromStep" in step.target
+          ? step.target.focusFromStep
+          : undefined;
+        const focusBindingRecord = focusFromStep === undefined ? undefined : execution.focusBindings.get(focusFromStep);
+        let hostEvidence: HostPolicyEvidence | undefined;
+        if (focusBindingRecord) {
+          const proof = focusBindingRecord.proof;
+          if (focusBindingRecord.signal !== execution.controller.signal
+            || focusBindingRecord.sourceStep !== focusFromStep
+            || focusBindingRecord.controlId !== prepared.target.id
+            || focusBindingRecord.windowScope !== prepared.target.windowScope
+            || proof.binding !== focusBindingRecord.binding
+            || proof.sourceControlId !== focusBindingRecord.sourceControlId
+            || proof.focusControlId !== prepared.target.id
+            || proof.windowScope !== focusBindingRecord.windowScope) {
+            return stoppedResult(request, index, "grid_commit_proof_expired", receipts, step.kind);
+          }
+          const evidence: FocusHandoffPolicyEvidence = Object.freeze({
+            kind: "focus_handoff",
+            binding: focusBindingRecord.binding,
+            sourceStep: focusFromStep,
+            commitStep: index,
+            sourceControlId: focusBindingRecord.sourceControlId,
+            focusControlId: focusBindingRecord.controlId,
+            windowScope: focusBindingRecord.windowScope,
+            proof,
+          });
+          hostEvidence = evidence;
+        }
+
         let decision: RiskDecision | undefined;
         let riskInput: RiskInput | undefined;
         if (!usingInitialPrepared) {
@@ -708,6 +866,7 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
               target: policyControl(prepared.target),
               ...(prepared.destination ? { destination: policyControl(prepared.destination) } : {}),
               signal: execution.controller.signal,
+              ...(hostEvidence ? { hostEvidence } : {}),
             };
             decision = await awaitAbortable(policy(riskInput), execution.controller.signal);
           } catch {
@@ -723,7 +882,12 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
         }
         if (!usingInitialPrepared && decision?.decision === "needs_evidence") {
           const result = stoppedResult(request, index, decision.code || "risk_evidence_required", receipts, step.kind);
-          return { ...result, code: "risk_evidence_required" };
+          const recoveryHint = pointClickEvidenceHint(step, decision.code);
+          return {
+            ...result,
+            code: "risk_evidence_required",
+            ...(recoveryHint ? { recoveryHint } : {}),
+          };
         }
         if (!usingInitialPrepared && (!decision || (decision.decision !== "allow" && decision.decision !== "approve"))) {
           return stoppedResult(request, index, decision?.code || "risk_policy_invalid", receipts, step.kind);
@@ -805,14 +969,22 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
           }
         }
 
+        const focusBinding = focusBindingRecord?.binding;
         const dispatch: Dispatch = {
           step,
           frame: prepared.frame,
           target: prepared.target,
           ...(prepared.destination ? { destination: prepared.destination } : {}),
           ...(prepared.origin ? { origin: prepared.origin } : {}),
+          ...(capturesFocusForLaterStep(request, position, index) ? { captureFocus: true } : {}),
+          ...(capturesFocusForEnterLater(request, position, index) ? { captureFocusForEnter: true } : {}),
+          ...(focusBinding ? { focusBinding } : {}),
           signal: execution.controller.signal,
         };
+        if (focusFromStep !== undefined && focusBindingRecord) {
+          execution.focusBindings.delete(focusFromStep);
+          execution.focusRecords.delete(focusFromStep);
+        }
         let delivery: Delivery;
         try {
           delivery = await awaitAbortable(backend.dispatch(dispatch), execution.controller.signal);
@@ -842,9 +1014,47 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
         }
 
         if (delivery.focusId) {
-          execution.focusRecords.set(index, { scope: prepared.frame.scope, controlId: delivery.focusId, step: index });
+          const proof = isFocusBindingProof(delivery.hostEvidence) ? delivery.hostEvidence : undefined;
+          const hasPrivateBinding = typeof delivery.focusBinding === "string" || delivery.hostEvidence !== undefined;
+          const validBinding = typeof delivery.focusBinding === "string" && proof !== undefined
+            && proof.binding === delivery.focusBinding
+            && proof.sourceControlId === prepared.target.id
+            && proof.focusControlId === delivery.focusId
+            && proof.windowScope === prepared.target.windowScope;
+          if (hasPrivateBinding && !validBinding) {
+            // A private host binding without its matching evidence cannot
+            // become a generic focusFromStep target.
+            execution.focusRecords.delete(index);
+            execution.focusBindings.delete(index);
+          } else {
+            execution.focusRecords.set(index, {
+              scope: prepared.frame.scope,
+              controlId: delivery.focusId,
+              step: index,
+              ...(prepared.target.windowScope ? { windowScope: prepared.target.windowScope } : {}),
+            });
+            if (validBinding && proof) execution.focusBindings.set(index, {
+              binding: delivery.focusBinding!,
+              signal: execution.controller.signal,
+              sourceStep: index,
+              controlId: delivery.focusId,
+              windowScope: proof.windowScope,
+              sourceControlId: proof.sourceControlId,
+              proof,
+            });
+            else execution.focusBindings.delete(index);
+          }
+        } else if (delivery.suppressFocusHandoff !== true) {
+          execution.focusRecords.set(index, {
+            scope: prepared.frame.scope,
+            controlId: prepared.target.id,
+            step: index,
+            ...(prepared.target.windowScope ? { windowScope: prepared.target.windowScope } : {}),
+          });
+          execution.focusBindings.delete(index);
         } else {
-          execution.focusRecords.set(index, { scope: prepared.frame.scope, controlId: prepared.target.id, step: index });
+          execution.focusRecords.delete(index);
+          execution.focusBindings.delete(index);
         }
         if (step.expect) {
           let expectation: { ok: boolean; code?: string; control?: Control };
@@ -860,7 +1070,10 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
           }
           if (!expectation.ok) {
             receipts.push({ index, kind: step.kind, status: "dispatched", code: expectation.code ?? "expect_failed" });
-            return stoppedResult(request, index, expectation.code ?? "expect_failed", receipts);
+            const stopped = stoppedResult(request, index, expectation.code ?? "expect_failed", receipts);
+            return index < request.steps.length && expectation.code !== "cancelled"
+              ? { ...stopped, recoveryHint: ACT_EXPECTATION_FAILURE_HINT }
+              : stopped;
           }
           receipts.push({ index, kind: step.kind, status: "verified" });
           if (execution.onVerifiedStep && expectation.control && step.kind === "click") {
@@ -895,7 +1108,9 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
     try {
       request = preflight(raw);
     } catch (error) {
-      return rejectedResult(undefined, safeValidationCode(error, "invalid_request"));
+      const atStep = error instanceof RequestValidationError ? error.atStep : undefined;
+      const validation = error instanceof RequestValidationError ? error.diagnostic : undefined;
+      return rejectedResult(undefined, safeValidationCode(error, "invalid_request"), undefined, atStep, validation);
     }
     if (closed) return stoppedResult(request, 1, "closed");
     if (queuedEpoch !== epoch || globalAbort.signal.aborted || signal?.aborted) return stoppedResult(request, 1, "cancelled");
@@ -903,6 +1118,7 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
     const execution = startExecution(signal, executionOptions);
     // focusFromStep is scoped to this act batch, never to a prior batch.
     execution.focusRecords.clear();
+    execution.focusBindings.clear();
     return runBatch(request, execution, 0, []);
   }
 
@@ -918,17 +1134,63 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
     const read = allowModelDocumentText && !optionsForObserve.where
       ? optionsForObserve.read ?? (documentOnly ? "document" : undefined)
       : undefined;
+    const explicitProjection = optionsForObserve.projection;
+    const broadControlsQuery = isBroadControlsQuery(view, optionsForObserve.where, read);
+    const broadIncremental = options.defaultObservationProjection === "incremental"
+      && explicitProjection === undefined
+      && (view === "controls" || view === "both")
+      && read === undefined
+      && optionsForObserve.where === undefined;
+    const requestedProjection = explicitProjection
+      ?? (broadIncremental ? { mode: "compact", since: "previous" } as const : defaultObservationProjection);
+    const defaultBroadPreview = broadControlsQuery
+      && requestedProjection?.mode === "compact"
+      && requestedProjection.maxControls === undefined;
+    // Keep compact output bounded for broad control discovery at the public
+    // observation boundary. Scoped selectors, explicit limits, and full/legacy
+    // observations keep their existing behavior.
+    const projection = requestedProjection?.mode === "compact" && broadControlsQuery
+      ? { ...requestedProjection, maxControls: requestedProjection.maxControls ?? 6 }
+      : requestedProjection;
+    const effectiveRead = projection?.mode === "compact" && read !== undefined ? compactDocumentRead(read) : read;
+    const observeEpoch = epoch;
     const merged = mergeSignals([globalAbort.signal, optionsForObserve.signal]);
     try {
+      const queryKey = projection?.mode === "compact"
+        && (view === "controls" || view === "both")
+        && read === undefined
+        ? controlsQueryKey(optionsForObserve.where)
+        : undefined;
       const stored = await observeInternal({
         view: backendView,
         ...(optionsForObserve.where ? { where: { ...optionsForObserve.where } } : {}),
-        ...(read ? { read } : {}),
+        ...(effectiveRead ? { read: effectiveRead } : {}),
         signal: merged.signal,
-      }, true, read !== undefined);
-      return observationRegistry.publicObservation(stored, view);
+      }, true, effectiveRead !== undefined);
+      if (projection?.mode === "compact" && (observeEpoch !== epoch || closed || merged.signal.aborted)) {
+        throw new Error("observation_cancelled");
+      }
+      const observation = observationRegistry.publicObservation(stored, view, projection, queryKey, broadIncremental);
+      const projectionResult = observation.projection;
+      if (broadControlsQuery
+        && projectionResult?.mode === "compact"
+        && projectionResult.kind === "snapshot"
+        && (!projectionResult.backendComplete || (defaultBroadPreview && projectionResult.truncated))) {
+        const reasons = [
+          ...(!projectionResult.backendComplete ? ["The backend control query was incomplete."] : []),
+          ...(projectionResult.truncated ? ["The compact preview hit its row or byte budget."] : []),
+        ].join(" ");
+        return {
+          ...observation,
+          projection: {
+            ...projectionResult,
+            guidance: `${reasons} Narrow with an exact where:{name:"..."} or where:{within:"..."}; use where:{state:"focused"} for the current field.${allowModelDocumentText ? " Use read.query for page prose." : ""}`,
+          },
+        };
+      }
+      return observation;
     } catch (error) {
-      if (typeof read === "object" && read.cursor && error instanceof Error
+      if (typeof effectiveRead === "object" && effectiveRead.cursor && error instanceof Error
         && ["document_cursor_stale", "document_route_changed"].includes(error.message)) {
         throw new Error("document_cursor_stale");
       }
@@ -968,6 +1230,7 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
       if (!suspended.execution.controller.signal.aborted) suspended.execution.controller.abort(reason);
       cancelPending(suspended.execution, pendingReason);
     }
+    observationRegistry.invalidatePublicSnapshots();
   }
 
   function correct(reason = "corrected"): void {
@@ -996,6 +1259,7 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
       cancelPending(suspended.execution, "closed");
     }
     abortGlobal();
+    observationRegistry.invalidatePublicSnapshots();
     closePromise = Promise.resolve().then(() => backend.close()).then(() => undefined);
     return closePromise;
   }
@@ -1005,12 +1269,15 @@ export function createDeskSession(backend: DesktopBackend, options: DeskSessionO
     allowModelImages,
     allowModelDocumentText,
     limits: sessionLimits,
+    supportsObservationProjection: true as const,
+    ...(options.defaultObservationProjection === undefined ? {} : { defaultObservationProjection: options.defaultObservationProjection }),
     observe,
     act,
     replay,
     resolveApproval,
     correct,
     cancel,
+    invalidateObservationSnapshots: () => observationRegistry.invalidatePublicSnapshots(),
     close,
   });
 }

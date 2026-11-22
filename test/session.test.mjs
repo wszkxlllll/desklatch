@@ -8,7 +8,7 @@ const capabilities = [
   { kind: "type", targets: ["selector"] },
 ];
 
-function makeBackend({ image = true } = {}) {
+function makeBackend({ image = true, complete = true } = {}) {
   const calls = { observe: [], dispatch: [], close: 0 };
   const controls = [
     {
@@ -38,7 +38,7 @@ function makeBackend({ image = true } = {}) {
       calls.observe.push(options);
       return {
         scope: "backend-scope-secret",
-        complete: true,
+        complete,
         controls,
         ...(image ? { image: { mimeType: "image/png", dataBase64: "pixels", width: 10, height: 10 } } : {}),
       };
@@ -67,6 +67,145 @@ test("default observations are text-only and redact sensitive values", async () 
   assert.equal(JSON.stringify(observation).includes("backend-button-id"), false);
   assert.equal(JSON.stringify(observation).includes("backend-scope-secret"), false);
   await session.close();
+});
+
+test("compact observation projection is opt-in with an explicit full escape", async () => {
+  const backend = makeBackend();
+  const session = createDeskSession(backend, { defaultObservationProjection: "compact" });
+  assert.equal(session.supportsObservationProjection, true);
+  const compact = await session.observe();
+  assert.equal(compact.projection?.mode, "compact");
+  assert.equal(compact.projection?.kind, "snapshot");
+  assert.equal(compact.projection?.observedControls, backend.controls.length);
+  const clipped = await session.observe({ projection: { mode: "compact", maxControls: 1 } });
+  assert.equal(clipped.projection?.backendComplete, true);
+  assert.equal(clipped.projection?.truncated, true);
+  assert.equal(clipped.projection?.guidance, undefined);
+  const full = await session.observe({ projection: { mode: "full" } });
+  assert.equal(full.projection, undefined);
+  session.invalidateObservationSnapshots();
+  await session.close();
+});
+
+test("only incomplete broad compact controls include a suggestion to narrow the query", async t => {
+  const backend = makeBackend({ complete: false });
+  const session = createDeskSession(backend, { allowModelImages: true, defaultObservationProjection: "compact" });
+  t.after(() => session.close());
+  const [observe] = createDeskTools(session);
+
+  const broad = await observe.invoke({});
+  assert.equal(broad.complete, false);
+  assert.equal(broad.projection.backendComplete, false);
+  assert.match(broad.projection.guidance, /\bwhere\b/u);
+  assert.equal(broad.image, undefined);
+  assert.deepEqual(backend.calls.observe.map(call => call.view), ["controls"]);
+
+  const scoped = await observe.invoke({ where: { name: "Save" } });
+  assert.equal(scoped.projection.backendComplete, false);
+  assert.equal(scoped.projection.guidance, undefined);
+  assert.deepEqual(backend.calls.observe.at(-1).where, { name: "Save" });
+  const image = await observe.invoke({ view: "image" });
+  assert.equal(image.projection.guidance, undefined);
+  const full = await observe.invoke({ projection: { mode: "full" } });
+  assert.equal(full.projection, undefined);
+});
+
+test("incremental default compares repeated broad observations while preserving the current ref boundary", async () => {
+  const backend = makeBackend();
+  const session = createDeskSession(backend, { defaultObservationProjection: "incremental" });
+  assert.equal(session.defaultObservationProjection, "incremental");
+  const first = await session.observe();
+  assert.equal(first.projection?.kind, "snapshot");
+  const second = await session.observe();
+  assert.equal(second.projection?.kind, "unchanged");
+  assert.equal(second.projection?.basis, "published_controls");
+  assert.equal(second.controls.length, 0);
+  assert.ok(second.projection?.base === first.observationId);
+  await session.close();
+});
+
+test("broad compact previews bound model output while exact actions check every matching control", async t => {
+  const backend = makeBackend();
+  backend.controls.splice(0, backend.controls.length, ...Array.from({ length: 12 }, (_, index) => ({
+    id: `button-${index}`, name: index === 0 || index === 9 ? "Repeat" : `Button ${index}`,
+    role: "Button", within: "Toolbar", states: ["visible", "enabled"], actions: ["click"], effect: "read",
+  })));
+  const session = createDeskSession(backend, {
+    defaultObservationProjection: "compact", allowModelImages: true,
+    policy: () => ({ decision: "allow", code: "test" }),
+  });
+  t.after(() => session.close());
+  const [observe, act] = createDeskTools(session);
+  const overview = await observe.invoke({});
+  assert.equal(overview.image, undefined);
+  assert.equal(overview.controls.length, 6);
+  assert.equal(overview.projection.observedControls, 12);
+  assert.equal(overview.projection.backendComplete, true);
+  assert.equal(overview.complete, false);
+  assert.equal(overview.projection.truncated, true);
+  assert.equal(overview.controls.filter(control => control.name === "Repeat").length, 1);
+  const ambiguous = await act.invoke({ steps: [{ kind: "click", target: { name: "Repeat" } }] });
+  assert.equal(ambiguous.code, "target_ambiguous");
+  assert.equal(backend.calls.dispatch.length, 0);
+
+  const byRole = await observe.invoke({ view: "both", where: { role: "Button" } });
+  assert.equal(byRole.controls.length, 6);
+  assert.ok(byRole.image);
+  const scoped = await observe.invoke({ where: { within: "Toolbar" } });
+  assert.equal(scoped.controls.length, 12);
+  const expanded = await observe.invoke({ projection: { mode: "compact", maxControls: 9 } });
+  assert.equal(expanded.controls.length, 9);
+  const full = await observe.invoke({ projection: { mode: "full" } });
+  assert.equal(full.controls.length, 12);
+});
+
+test("incremental default keeps compact output for targeted and image observations", async () => {
+  const backend = makeBackend();
+  const session = createDeskSession(backend, {
+    allowModelImages: true,
+    defaultObservationProjection: "incremental",
+  });
+  const targeted = await session.observe({ view: "controls", where: { role: "Button" } });
+  assert.equal(targeted.projection?.mode, "compact");
+  assert.equal(targeted.projection?.kind, "snapshot");
+  const repeatedTarget = await session.observe({ view: "controls", where: { role: "Button" } });
+  assert.equal(repeatedTarget.projection?.mode, "compact");
+  assert.equal(repeatedTarget.projection?.kind, "snapshot");
+  assert.equal(repeatedTarget.projection?.base, undefined);
+  const image = await session.observe({ view: "image" });
+  assert.equal(image.projection?.mode, "compact");
+  assert.equal(image.projection?.kind, "snapshot");
+  assert.equal(image.image?.dataBase64, "pixels");
+  await session.close();
+});
+
+test("correct invalidates a compact baseline and an observation already in flight", async t => {
+  const backend = makeBackend({ image: false });
+  const read = backend.observe.bind(backend);
+  const entered = Promise.withResolvers();
+  const resume = Promise.withResolvers();
+  let hold = false;
+  backend.observe = async options => {
+    if (hold) {
+      entered.resolve();
+      await resume.promise;
+    }
+    return read(options);
+  };
+  const session = createDeskSession(backend, { defaultObservationProjection: "compact" });
+  t.after(() => session.close());
+  const base = await session.observe();
+  hold = true;
+  const pending = session.observe({ projection: { mode: "compact", since: base.observationId } });
+  await entered.promise;
+  session.correct();
+  hold = false;
+  resume.resolve();
+  await assert.rejects(pending, /observe_failed/u);
+  const fresh = await session.observe({ projection: { mode: "compact", since: base.observationId } });
+  assert.equal(fresh.projection.kind, "snapshot");
+  assert.equal(fresh.projection.fallback, "since_invalid");
+  assert.equal(backend.calls.dispatch.length, 0);
 });
 
 test("approval handoff returns promptly and resume is idempotent", async () => {
@@ -287,7 +426,9 @@ test("cancel while risk policy is in flight returns without dispatch", async () 
 
 test("a host tool-call cancellation invalidates only that batch's pending approval", async () => {
   const backend = makeBackend();
-  const session = createDeskSession(backend, { policy: () => ({ decision: "approve", code: "needs_host" }) });
+  const session = createDeskSession(backend, {
+    policy: () => ({ decision: "approve", code: "needs_host" }),
+  });
   const first = new AbortController();
   const [, act] = createDeskTools(session);
   const request = { steps: [{ kind: "click", target: { name: "Save" } }] };
@@ -436,6 +577,59 @@ test("refs survive a truncated general frame only through positive scoped identi
   await session.close();
 });
 
+test("browser-scoped ref refresh narrows by exact material selector and rejects replacement", async () => {
+  const original = {
+    id: "scoped-ref-target",
+    role: "Button",
+    name: "Target",
+    states: ["visible", "enabled"],
+    actions: ["click"],
+    effect: "edit",
+  };
+  let replaced = false;
+  let broadObserves = 0;
+  const scopedObserves = [];
+  let dispatches = 0;
+  const backend = {
+    capabilities: [{ kind: "click", targets: ["selector", "ref"], buttons: ["left"], counts: [1] }],
+    supportsScopedRefRefresh: true,
+    async observe(options) {
+      if (options.where) scopedObserves.push(options.where);
+      else broadObserves += 1;
+      return {
+        scope: "scoped-ref-scope",
+        complete: true,
+        controls: [{ ...original, ...(replaced ? { name: "Replacement" } : {}) }],
+      };
+    },
+    async dispatch() {
+      dispatches += 1;
+      return { status: "dispatched" };
+    },
+    async close() {},
+  };
+  const session = createDeskSession(backend, { policy: () => ({ decision: "allow", code: "test" }) });
+  const observation = await session.observe();
+  const first = await session.act({
+    observationId: observation.observationId,
+    steps: [{ kind: "click", target: { ref: observation.controls[0].ref } }],
+  });
+  assert.equal(first.status, "completed");
+  assert.equal(dispatches, 1);
+  assert.deepEqual(scopedObserves.at(-1), { role: "Button", name: "Target" });
+  replaced = true;
+  const stale = await session.act({
+    observationId: observation.observationId,
+    steps: [{ kind: "click", target: { ref: observation.controls[0].ref } }],
+  });
+  assert.equal(stale.status, "stopped");
+  assert.equal(stale.code, "stale_reference");
+  assert.equal(dispatches, 1, "replacement must not dispatch");
+  assert.equal(broadObserves, 1, "only the initial observation may be broad");
+  assert.equal(scopedObserves.length, 2);
+  await session.close();
+});
+
 test("point ownership compares pinned origin with fresh hits under truncation", async () => {
   const origin = {
     id: "origin-button",
@@ -533,7 +727,7 @@ test("drag compares both origin and destination endpoints", async () => {
 test("focusFromStep works without an external observation", async () => {
   const button = { id: "button", role: "Button", name: "Focus", states: ["visible", "enabled"], actions: ["click"] };
   const input = { id: "input", role: "Edit", name: "Field", states: ["visible", "enabled", "editable", "focused"], actions: ["type"] };
-  const calls = { dispatch: 0 };
+  const calls = { dispatch: [] };
   const backend = {
     capabilities: [
       { kind: "click", targets: ["selector"], buttons: ["left"], counts: [1] },
@@ -544,7 +738,7 @@ test("focusFromStep works without an external observation", async () => {
       return { scope: "focus-scope", complete: true, controls: [button, input], focusId: "input" };
     },
     async dispatch(request) {
-      calls.dispatch += 1;
+      calls.dispatch.push(request);
       return request.step.kind === "click" ? { status: "dispatched", focusId: "input" } : { status: "dispatched" };
     },
     async close() {},
@@ -555,7 +749,80 @@ test("focusFromStep works without an external observation", async () => {
     { kind: "type", target: { focusFromStep: 1 }, text: "ok" },
   ] });
   assert.equal(result.status, "completed");
-  assert.equal(calls.dispatch, 2);
+  assert.equal(calls.dispatch.length, 2);
+  assert.equal(calls.dispatch[0].captureFocus, true);
+  assert.equal(calls.dispatch[1].captureFocus, undefined);
+  await session.close();
+});
+
+test("focus capture hint is retained when the first step resumes after approval", async () => {
+  const button = { id: "button", role: "Button", name: "Focus", states: ["visible", "enabled"], actions: ["click"] };
+  const input = { id: "input", role: "Edit", name: "Field", states: ["visible", "enabled", "editable", "focused"], actions: ["type"] };
+  const dispatches = [];
+  const backend = {
+    capabilities: [
+      { kind: "click", targets: ["selector"], buttons: ["left"], counts: [1] },
+      { kind: "type", targets: ["focus"] },
+    ],
+    async observe(options) {
+      if (options.where) return { scope: "approval-focus-scope", complete: true, controls: [button] };
+      return { scope: "approval-focus-scope", complete: true, controls: [button, input], focusId: "input" };
+    },
+    async dispatch(request) {
+      dispatches.push(request);
+      return request.step.kind === "click" ? { status: "dispatched", focusId: "input" } : { status: "dispatched" };
+    },
+    async close() {},
+  };
+  const session = createDeskSession(backend, {
+    policy: ({ step }) => step.kind === "click"
+      ? { decision: "approve", code: "needs_host" }
+      : { decision: "allow", code: "test" },
+  });
+  const pending = await session.act({ steps: [
+    { kind: "click", target: { role: "Button", name: "Focus" } },
+    { kind: "type", target: { focusFromStep: 1 }, text: "ok" },
+  ] });
+  assert.equal(pending.code, "approval_required");
+  const resumed = await session.resolveApproval(pending.requestId, "approve");
+  assert.equal(resumed.status, "completed");
+  assert.equal(dispatches.length, 2);
+  assert.equal(dispatches[0].captureFocus, true);
+  assert.equal(dispatches[1].captureFocus, undefined);
+  await session.close();
+});
+
+test("focus handoff rejects a changed recipient even when scope is unchanged", async () => {
+  const button = { id: "button", role: "Button", name: "Focus", states: ["visible", "enabled"], actions: ["click"] };
+  const input = { id: "input", role: "Edit", name: "Field", states: ["visible", "enabled", "editable", "focused"], actions: ["type"] };
+  const replacement = { ...input, id: "replacement-input" };
+  let dispatched = false;
+  const dispatches = [];
+  const backend = {
+    capabilities: [
+      { kind: "click", targets: ["selector"], buttons: ["left"], counts: [1] },
+      { kind: "type", targets: ["focus"] },
+    ],
+    async observe(options) {
+      if (options.where) return { scope: "changed-focus-scope", complete: true, controls: [button] };
+      return { scope: "changed-focus-scope", complete: true, controls: [button, dispatched ? replacement : input], focusId: dispatched ? "replacement-input" : "input" };
+    },
+    async dispatch(request) {
+      dispatches.push(request);
+      dispatched = true;
+      return { status: "dispatched", focusId: "input" };
+    },
+    async close() {},
+  };
+  const session = createDeskSession(backend, { policy: () => ({ decision: "allow", code: "test" }) });
+  const result = await session.act({ steps: [
+    { kind: "click", target: { role: "Button", name: "Focus" } },
+    { kind: "type", target: { focusFromStep: 1 }, text: "ok" },
+  ] });
+  assert.equal(result.status, "stopped");
+  assert.equal(result.code, "focus_changed");
+  assert.equal(dispatches.length, 1);
+  assert.equal(dispatches[0].captureFocus, true);
   await session.close();
 });
 

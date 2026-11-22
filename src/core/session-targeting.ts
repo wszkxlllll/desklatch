@@ -1,4 +1,5 @@
 import type { Control, Frame, Point } from "../contracts.js";
+import { sameWindowPointBounds } from "./window-point.js";
 
 /** Private identity used to bind a target across an approval/readback boundary. */
 export function targetBindingKey(control: Control): string {
@@ -11,6 +12,8 @@ export function targetBindingKey(control: Control): string {
     actions: [...control.actions].sort(),
     rect: control.rect,
     effect: control.effect,
+    pointInteraction: control.pointInteraction && [control.pointInteraction.kind, control.pointInteraction.binding],
+    windowPoint: control.windowPoint,
     sensitive: control.sensitive,
     filterAction: control.filterAction,
     enterMaySubmit: control.enterMaySubmit,
@@ -18,8 +21,8 @@ export function targetBindingKey(control: Control): string {
   });
 }
 
-/** Material identity intentionally excludes value and geometry for ref targets. */
-export function equivalentMaterial(left: Control, right: Control): boolean {
+/** Material shared by ref and point grounding. Coordinates are checked by the hit test. */
+function sameRecipient(left: Control, right: Control): boolean {
   return left.id === right.id
     && left.role === right.role
     && left.name === right.name
@@ -28,9 +31,36 @@ export function equivalentMaterial(left: Control, right: Control): boolean {
     && left.sensitive === right.sensitive
     && left.filterAction === right.filterAction
     && left.enterMaySubmit === right.enterMaySubmit
-    && JSON.stringify([...left.actions].sort()) === JSON.stringify([...right.actions].sort())
+    && left.pointInteraction?.kind === right.pointInteraction?.kind
+    && left.pointInteraction?.binding === right.pointInteraction?.binding
+    && left.windowPoint === right.windowPoint
+    && (left.windowPoint !== true || (left.windowScope === right.windowScope && sameWindowPointBounds(left.rect, right.rect)))
     && JSON.stringify([...(left.labels ?? [])].sort()) === JSON.stringify([...(right.labels ?? [])].sort())
     && left.approvalContext?.token === right.approvalContext?.token;
+}
+
+export function equivalentMaterial(left: Control, right: Control): boolean {
+  return sameRecipient(left, right)
+    && JSON.stringify([...left.actions].sort()) === JSON.stringify([...right.actions].sort());
+}
+
+/**
+ * Point clicks are grounded against an image and a fresh control query.  A
+ * private focus probe can make that fresh query advertise keyboard actions
+ * which were not present in the image's public control snapshot.  Those
+ * transient keyboard capabilities do not change the pointer recipient, but
+ * every other material binding must still match exactly.
+ *
+ * Keep this comparator separate from `equivalentMaterial`: refs, drags, and
+ * keyboard actions must retain their existing strict action comparison.
+ */
+export function equivalentPointClickMaterial(left: Control, right: Control): boolean {
+  if (left.windowScope !== right.windowScope) return false;
+  const pointerActions = (control: Control): readonly string[] => control.actions
+    .filter((action) => action !== "keypress" && action !== "hotkey")
+    .sort();
+  return sameRecipient(left, right)
+    && JSON.stringify(pointerActions(left)) === JSON.stringify(pointerActions(right));
 }
 
 export function findEquivalentControl(frame: Frame, source: Control): Control | undefined {

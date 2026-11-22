@@ -48,6 +48,208 @@ test("unknown actions do not silently allow and a clear text-only review may all
   assert.equal(noReviewer.decision, "needs_evidence");
 });
 
+test("scoped point-click delegation is opt-in and requires an exact host-verified target", async () => {
+  const artifactRect = { x: 10, y: 20, width: 40, height: 30 };
+  const target = control({
+    id: "disposable-artifact-button",
+    role: "button",
+    name: "Opaque action",
+    states: ["visible", "enabled"],
+    actions: ["click"],
+    effect: "unknown",
+    rect: artifactRect,
+  });
+  const verifiedArtifact = { targetId: target.id, rect: artifactRect };
+  const calls = [];
+  const policy = createRiskPolicy({
+    hostRules: {
+      allowScopedPointClick(value) {
+        calls.push(value);
+        const point = value.step.kind === "click" && "point" in value.step.target ? value.step.target.point : undefined;
+        return value.target.id === verifiedArtifact.targetId
+          && JSON.stringify(value.target.rect) === JSON.stringify(verifiedArtifact.rect)
+          && point?.x === 25 && point?.y === 30
+          ? { targetId: verifiedArtifact.targetId, region: verifiedArtifact.rect, code: "artifact_scope_verified" }
+          : false;
+      },
+    },
+  });
+  const result = await policy(input({ kind: "click", target: { point: { x: 25, y: 30 } } }, target));
+  assert.deepEqual(result, { decision: "allow", code: "artifact_scope_verified" });
+  assert.equal(calls.length, 1);
+
+  const windowScoped = createRiskPolicy({
+    hostRules: {
+      allowScopedPointClick: () => ({ windowScope: "offline-canvas", region: artifactRect }),
+    },
+  });
+  const windowResult = await windowScoped(input({ kind: "click", target: { point: { x: 25, y: 30 } } }, { ...target, id: "canvas-button", windowScope: "offline-canvas" }));
+  assert.equal(windowResult.decision, "allow");
+
+  const largeTarget = { ...target, rect: { x: 0, y: 0, width: 5000, height: 5000 } };
+  const largeTargetPolicy = createRiskPolicy({
+    hostRules: {
+      allowScopedPointClick: () => ({ targetId: largeTarget.id, region: artifactRect }),
+    },
+  });
+  assert.equal((await largeTargetPolicy(input({ kind: "click", target: { point: { x: 25, y: 30 } } }, largeTarget))).decision, "allow");
+
+  const unchanged = await defaultRiskPolicy(input({ kind: "click", target: { point: { x: 25, y: 30 } } }, target));
+  assert.equal(unchanged.decision, "needs_evidence");
+});
+
+test("scoped point-click delegation rejects outside points and other host scopes", async () => {
+  const target = control({
+    id: "disposable-artifact-button",
+    role: "button",
+    states: ["visible", "enabled"],
+    actions: ["click"],
+    effect: "unknown",
+    rect: { x: 10, y: 20, width: 40, height: 30 },
+  });
+  const calls = [];
+  const policy = createRiskPolicy({
+    hostRules: {
+      allowScopedPointClick(value) {
+        calls.push(value.target.id);
+        return value.target.id === "disposable-artifact-button"
+          ? { targetId: "disposable-artifact-button", region: { x: 10, y: 20, width: 40, height: 30 } }
+          : undefined;
+      },
+    },
+  });
+  const outside = await policy(input({ kind: "click", target: { point: { x: 100, y: 100 } } }, target));
+  assert.equal(outside.decision, "needs_evidence");
+  assert.deepEqual(calls, []);
+
+  const otherApp = await policy(input({ kind: "click", target: { point: { x: 25, y: 30 } } }, { ...target, id: "other-app-button" }));
+  assert.equal(otherApp.decision, "needs_evidence");
+  assert.deepEqual(calls, ["other-app-button"]);
+
+  const narrowRegion = createRiskPolicy({
+    hostRules: {
+      allowScopedPointClick: () => ({ targetId: "disposable-artifact-button", region: { x: 10, y: 20, width: 5, height: 5 } }),
+    },
+  });
+  const outsideDelegatedRegion = await narrowRegion(input({ kind: "click", target: { point: { x: 25, y: 30 } } }, target));
+  assert.equal(outsideDelegatedRegion.decision, "needs_evidence");
+});
+
+test("scoped point-click delegation cannot bypass structural, host, or gesture guards", async () => {
+  const base = {
+    kind: "click",
+    target: { point: { x: 25, y: 30 } },
+  };
+  const target = control({
+    id: "disposable-artifact-button",
+    role: "button",
+    states: ["visible", "enabled"],
+    actions: ["click"],
+    effect: "unknown",
+    rect: { x: 10, y: 20, width: 40, height: 30 },
+  });
+  const make = hostRules => {
+    let calls = 0;
+    const policy = createRiskPolicy({
+      hostRules: {
+        ...hostRules,
+        allowScopedPointClick: () => { calls += 1; return { targetId: "disposable-artifact-button", region: { x: 10, y: 20, width: 40, height: 30 } }; },
+      },
+    });
+    return { policy, calls: () => calls };
+  };
+
+  const hardDenied = make({ hardDeny: () => true });
+  assert.equal((await hardDenied.policy(input(base, target))).decision, "deny");
+  assert.equal(hardDenied.calls(), 0);
+
+  const wildcard = createRiskPolicy({ hostRules: { allowScopedPointClick: () => true } });
+  assert.equal((await wildcard(input(base, target))).decision, "deny");
+
+  const highRisk = make({});
+  assert.equal((await highRisk.policy(input(base, { ...target, effect: "external" }))).decision, "approve");
+  assert.equal(highRisk.calls(), 0);
+
+  const concealedSensitive = make({});
+  assert.equal((await concealedSensitive.policy(input(base, { ...target, sensitive: true }))).decision, "approve");
+  assert.equal(concealedSensitive.calls(), 0);
+
+  const hostApproval = make({ requireApproval: () => true });
+  assert.equal((await hostApproval.policy(input(base, target))).decision, "approve");
+  assert.equal(hostApproval.calls(), 0);
+
+  const alternate = make({});
+  assert.equal((await alternate.policy(input({ ...base, count: 2 }, target))).decision, "needs_evidence");
+  assert.equal(alternate.calls(), 0);
+});
+
+test("scoped point-click delegation preserves OCR and reviewer fail-closed behavior", async () => {
+  const target = control({
+    id: "disposable-artifact-button",
+    role: "button",
+    states: ["visible", "enabled"],
+    actions: ["click"],
+    effect: "unknown",
+    rect: { x: 10, y: 20, width: 40, height: 30 },
+  });
+  const step = { kind: "click", target: { point: { x: 25, y: 30 } } };
+  const unavailableCalls = [];
+  const unavailable = createRiskPolicy({
+    ocr: { localOnly: true, recognize: async () => { throw new Error("ocr unavailable"); } },
+    hostRules: { allowScopedPointClick: () => { unavailableCalls.push(true); return { targetId: "disposable-artifact-button", region: { x: 10, y: 20, width: 40, height: 30 } }; } },
+  });
+  assert.equal((await unavailable(input(step, target))).decision, "needs_evidence");
+  assert.deepEqual(unavailableCalls, []);
+
+  const budgetCalls = [];
+  const budgetEmpty = createRiskPolicy({
+    maxExternalRequests: 0,
+    ocr: { localOnly: true, recognize: async () => ({ lines: [] }) },
+    hostRules: { allowScopedPointClick: () => { budgetCalls.push(true); return { targetId: "disposable-artifact-button", region: { x: 10, y: 20, width: 40, height: 30 } }; } },
+  });
+  assert.equal((await budgetEmpty(input(step, target))).decision, "needs_evidence");
+  assert.deepEqual(budgetCalls, []);
+
+  const safeOcrCalls = [];
+  const safeOcr = createRiskPolicy({
+    ocr: { localOnly: true, recognize: async () => ({ lines: [] }) },
+    hostRules: { allowScopedPointClick: () => { safeOcrCalls.push(true); return { targetId: "disposable-artifact-button", region: { x: 10, y: 20, width: 40, height: 30 } }; } },
+  });
+  assert.equal((await safeOcr(input(step, target))).decision, "allow");
+  assert.deepEqual(safeOcrCalls, [true]);
+
+  let ocrRiskRuleCalls = 0;
+  const ocrRisk = createRiskPolicy({
+    ocr: { localOnly: true, recognize: async () => ({ lines: [{ text: "Send", confidence: 0.99 }] }) },
+    hostRules: { allowScopedPointClick: () => { ocrRiskRuleCalls += 1; return { targetId: "disposable-artifact-button", region: { x: 10, y: 20, width: 40, height: 30 } }; } },
+  });
+  assert.equal((await ocrRisk(input(step, target))).decision, "approve");
+  assert.equal(ocrRiskRuleCalls, 0);
+
+  for (const [review, expected] of [
+    [{ decision: "deny" }, "deny"],
+    [{ decision: "approve" }, "approve"],
+    [{ classification: "unclear" }, "needs_evidence"],
+  ]) {
+    const reviewerCalls = [];
+    const policy = createRiskPolicy({
+      reviewer: () => review,
+      hostRules: { allowScopedPointClick: () => { reviewerCalls.push(true); return { targetId: "disposable-artifact-button", region: { x: 10, y: 20, width: 40, height: 30 } }; } },
+    });
+    assert.equal((await policy(input(step, target))).decision, expected);
+    assert.deepEqual(reviewerCalls, []);
+  }
+
+  let clearRuleCalls = 0;
+  const reviewerClear = createRiskPolicy({
+    ocr: { localOnly: true, recognize: async () => { throw new Error("ocr unavailable"); } },
+    reviewer: () => ({ classification: "clear" }),
+    hostRules: { allowScopedPointClick: () => { clearRuleCalls += 1; return { targetId: "disposable-artifact-button", region: { x: 10, y: 20, width: 40, height: 30 } }; } },
+  });
+  assert.equal((await reviewerClear(input(step, target))).decision, "allow");
+  assert.equal(clearRuleCalls, 0);
+});
+
 test("native controls with untyped effects use local evidence before review", async () => {
   const reviewed = [];
   const policy = createRiskPolicy({ reviewer(request) { reviewed.push(request.target.name); return { classification: "unclear" }; } });

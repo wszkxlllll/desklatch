@@ -3,8 +3,17 @@ import type { Capability } from "../contracts.js";
 const SAFE_ADAPTER_CODES = new Set([
   "backend_refused", "invalid_delivery", "dispatch_unknown", "cancelled_before_dispatch", "target_changed", "material_target_changed", "stale", "partial",
   "unknown", "cancelled", "timeout", "closed", "target_occluded", "point_occluded", "occluded", "focus_changed", "target_unavailable",
+  "action_refused_before_dispatch", "element_action_refused", "set_value_unavailable", "write_not_applied", "value_pattern_unavailable", "value_unavailable", "value_read_only_state_unavailable",
   "target_not_verified", "background_target_unavailable", "background_target_not_verified", "stale_observation",
   "stale_origin", "stale_point", "stale_snapshot", "point_outside_target", "invalid_window_point",
+  "window_scope_unverified", "pointer_focus_changed", "pointer_focus_unverified",
+  "window_point_gesture_unavailable", "window_point_input_busy", "window_point_display_changed",
+  "window_point_recipient_changed", "window_point_partial", "window_point_not_queued",
+  "window_point_delivery_unknown", "window_point_geometry_unavailable",
+  "grid_commit_binding_action_mismatch", "grid_commit_proof_expired", "grid_commit_foreground_changed",
+  "grid_commit_focus_changed", "grid_commit_proof_unavailable", "grid_commit_authorization_unknown",
+  "native_grid_commit_proof_invalid", "native_grid_commit_target_unavailable", "native_grid_commit_reply_invalid",
+  "native_grid_commit_postcheck_unknown", "native_grid_commit_unknown",
   "invalid_desktop_point", "background_point_not_verified", "point_not_unique", "window_evidence_unavailable",
   "control_token_unavailable", "sensitive_control_not_writable", "background_delivery_not_authorized",
   "foreground_input_not_authorized", "desktop_image_not_authorized", "focus_target_unsupported", "invalid_focus",
@@ -81,6 +90,7 @@ export function intersectCapabilities(
   if (!grantedCapabilities) return backendCapabilities.map((capability) => ({
     ...capability,
     targets: [...capability.targets],
+    ...(capability.foreground === true ? { foreground: true as const } : {}),
     ...(capability.buttons ? { buttons: [...capability.buttons] } : {}),
     ...(capability.counts ? { counts: [...capability.counts] } : {}),
     ...(capability.directions ? { directions: [...capability.directions] } : {}),
@@ -112,6 +122,7 @@ export function intersectCapabilities(
       result.push({
         kind: backendCapability.kind,
         targets,
+        ...(backendCapability.kind === "type" && backendCapability.foreground === true && grant.foreground === true ? { foreground: true as const } : {}),
         ...(buttons ? { buttons } : {}),
         ...(counts ? { counts } : {}),
         ...(directions ? { directions } : {}),
@@ -128,6 +139,7 @@ export function freezeCapabilities(capabilities: readonly Capability[]): readonl
   return Object.freeze(capabilities.map((capability) => Object.freeze({
     ...capability,
     targets: Object.freeze([...capability.targets]),
+    ...(capability.foreground === true ? { foreground: true as const } : {}),
     ...(capability.buttons ? { buttons: Object.freeze([...capability.buttons]) } : {}),
     ...(capability.counts ? { counts: Object.freeze([...capability.counts]) } : {}),
     ...(capability.directions ? { directions: Object.freeze([...capability.directions]) } : {}),

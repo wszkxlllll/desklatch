@@ -9,6 +9,7 @@ import type {
   Step,
   State,
 } from "./contracts.js";
+import { isWindowPointGesture } from "./core/window-point.js";
 
 /**
  * The policy deliberately has no model, OCR, desktop, or network dependency.
@@ -133,11 +134,31 @@ export type HostRuleResult =
 
 export type RiskHostRule = (input: RiskInput, signal: AbortSignal) => HostRuleResult | Promise<HostRuleResult>;
 
+/** Host-owned positive evidence for one exact bounded point-click scope. */
+export interface ScopedPointClickEvidence {
+  readonly targetId?: string;
+  readonly windowScope?: string;
+  readonly region: Readonly<Rect>;
+  readonly code?: string;
+}
+
+/** Return false/undefined for no match; a positive result must carry exact host evidence. */
+export type ScopedPointClickRule = (
+  input: RiskInput,
+  signal: AbortSignal,
+) => ScopedPointClickEvidence | false | undefined | Promise<ScopedPointClickEvidence | false | undefined>;
+
 export interface RiskHostRules {
   /** Cannot be overridden by a reviewer or a low-risk structural result. */
   hardDeny?: RiskHostRule;
   /** Requires the host's one-time approval flow; it never silently allows. */
   requireApproval?: RiskHostRule;
+  /**
+   * Optional host-only exception for one primary point click whose exact
+   * bounded scope/artifact the host has verified. The rule must not derive
+   * authorization from model-provided labels or metadata.
+   */
+  allowScopedPointClick?: ScopedPointClickRule;
 }
 
 export interface RiskPolicyOptions {
@@ -311,17 +332,22 @@ export function createRiskPolicy(options: RiskPolicyOptions = {}): RiskPolicy {
       return decision(local.decision, local.code, local.reason);
     }
 
+    const scopedPointRule = hostRules.allowScopedPointClick;
+    const scopedPointCandidate = scopedPointRule !== undefined && isScopedPointClickCandidate(input);
+
     // Structural evidence is insufficient. OCR is deliberately lazy and only
     // gets a host-bounded region; its text is never sent to an image-capable API.
     let localText: readonly TextRiskOcrLine[] | undefined;
     let localRegion: Rect | undefined;
-    if (ocr !== undefined && remainingRequests > 0) {
+    let ocrVerified = ocr === undefined;
+    if (ocr !== undefined && remainingRequests > 0 && (input.target.windowPoint !== true || input.step.kind === "click")) {
       const region = getOcrRegion(input);
       if (region !== undefined && isBoundedRegion(region)) {
         localRegion = region;
         remainingRequests -= 1;
         const ocrResult = await runOcr(ocr, { input, region, signal: input.signal ?? new AbortController().signal }, evidenceTimeoutMs);
         if (ocrResult.kind === "ok") {
+          ocrVerified = true;
           localText = ocrResult.lines;
           const ocrRisk = classifyOcrText(localText);
           if (ocrRisk !== undefined) {
@@ -345,7 +371,22 @@ export function createRiskPolicy(options: RiskPolicyOptions = {}): RiskPolicy {
       }
     }
 
-    if (reviewer === undefined) return decision("needs_evidence", local.code, local.reason);
+    if (reviewer === undefined) {
+      if (scopedPointCandidate && ocrVerified) {
+        const result = await runScopedPointClickRule(scopedPointRule!, input, ruleTimeoutMs, input.signal);
+        if (result.kind === "aborted") return decision("deny", "aborted", "The action was cancelled during scoped host policy evaluation.");
+        if (result.kind === "error") return decision("deny", "host_rule_failed_closed", "The scoped host policy could not be checked.");
+        if (result.evidence !== undefined && scopedPointClickMatches(input, result.evidence)) {
+          return decision("allow", result.evidence.code ?? "scoped_point_click", "The host verified an exact bounded point-click scope.");
+        }
+      }
+      if (input.target.windowPoint === true && input.target.windowScope && isWindowPointGesture(input.step)
+        && input.target.actions.includes(input.step.kind) && input.target.states.includes("visible")
+        && input.target.states.includes("enabled") && input.target.rect && pointInRect(input.step.target.point, input.target.rect)) {
+        return decision("allow", "authorized_window_point", "The scoped backend identified the same authorized foreground window as the point recipient.");
+      }
+      return decision("needs_evidence", local.code, local.reason);
+    }
     if (remainingRequests === 0) return decision("needs_evidence", "review_budget_exhausted", "The configured evidence budget is exhausted.");
 
     remainingRequests -= 1;
@@ -498,6 +539,12 @@ function classifyStructurally(input: RiskInput, forbiddenHotkeys: ReadonlySet<st
   if (target.filterAction === true && (primaryClick || enter || step.kind === "scroll" || step.kind === "type" || step.kind === "setValue")) {
     return { decision: "allow", code: "structural_filter_action", reason: "The host marked this as a bounded search/filter action." };
   }
+  const interaction = target.pointInteraction;
+  if (primaryClick && "point" in step.target && interaction?.binding
+    && (interaction.kind === "select" || interaction.kind === "placeCaret")
+    && target.states.includes("visible") && target.states.includes("enabled") && target.actions.includes("click")) {
+    return { decision: "allow", code: "local_pointer_interaction", reason: "The backend identified a local selection or caret placement at this point." };
+  }
   if (step.kind === "click" && !primaryClick) {
     return { decision: "review", code: "alternate_click", reason: "The default action of this control does not establish the effect of this mouse gesture." };
   }
@@ -535,7 +582,7 @@ function classifyStructurally(input: RiskInput, forbiddenHotkeys: ReadonlySet<st
   // An undeclared effect still leaves the actual recipient and gesture as
   // evidence. Treat a window-only hit or a generic confirmation as ambiguous.
   if (step.kind === "scroll") {
-    if (target.actions.includes("scroll") && /^(?:scrollbar|scrollarea|list|listbox|tree|document|pane|table|grid)$/iu.test(targetRole)) {
+    if (target.actions.includes("scroll") && /^(?:scrollbar|scroll[ _-]?bar|scrollarea|scroll[ _-]?pane|viewport|list|listbox|tree|document|pane|table|grid)$/iu.test(targetRole)) {
       return { decision: "allow", code: "structural_scroll", reason: "Scrolling within a structurally identified region is low impact." };
     }
     return { decision: "review", code: "ambiguous_scroll_target", reason: "The scroll recipient is not structurally identified as a bounded view." };
@@ -561,6 +608,30 @@ function classifyStructurally(input: RiskInput, forbiddenHotkeys: ReadonlySet<st
   }
 
   return { decision: "review", code: "ambiguous_action", reason: "The action's immediate consequence is not established." };
+}
+
+function isScopedPointClickCandidate(input: RiskInput): boolean {
+  const step = input.step;
+  if (step.kind !== "click" || (step.button ?? "left") !== "left" || (step.count ?? 1) !== 1) return false;
+  if (!("point" in step.target)) return false;
+  const point = step.target.point;
+  const rect = input.target.rect;
+  return Number.isFinite(point.x) && Number.isFinite(point.y)
+    && input.target.states.includes("visible")
+    && input.target.states.includes("enabled")
+    && input.target.actions.includes("click")
+    && rect !== undefined
+    && isFinitePositiveRect(rect)
+    && pointInRect(point, rect);
+}
+
+function scopedPointClickMatches(input: RiskInput, evidence: ScopedPointClickEvidence): boolean {
+  const step = input.step;
+  if (step.kind !== "click" || !("point" in step.target)) return false;
+  const recipientMatches = evidence.targetId !== undefined
+    ? input.target.id === evidence.targetId
+    : input.target.windowScope === evidence.windowScope;
+  return recipientMatches && pointInRect(step.target.point, evidence.region);
 }
 
 function checkStateForAction(step: Step, target: Control): LocalClassification | undefined {
@@ -748,6 +819,55 @@ async function runHostRule(rule: RiskHostRule, input: RiskInput, timeoutMs: numb
   }
 }
 
+async function runScopedPointClickRule(
+  rule: ScopedPointClickRule,
+  input: RiskInput,
+  timeoutMs: number,
+  parentSignal?: AbortSignal,
+): Promise<{ kind: "ok"; evidence?: ScopedPointClickEvidence } | { kind: "error" } | { kind: "aborted" }> {
+  const controller = new AbortController();
+  const signal = combineSignals(parentSignal, controller.signal);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const result = await Promise.race([Promise.resolve(rule(input, signal)), abortPromise(signal)]);
+    if (signal.aborted) return parentSignal?.aborted ? { kind: "aborted" } : { kind: "error" };
+    if (result === false || result === undefined) return { kind: "ok" };
+    const evidence = parseScopedPointClickEvidence(result);
+    return evidence === undefined ? { kind: "error" } : { kind: "ok", evidence };
+  } catch {
+    return parentSignal?.aborted ? { kind: "aborted" } : { kind: "error" };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function parseScopedPointClickEvidence(value: unknown): ScopedPointClickEvidence | undefined {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const targetId = typeof record.targetId === "string" && record.targetId.trim().length > 0 ? record.targetId : undefined;
+  const windowScope = typeof record.windowScope === "string" && record.windowScope.trim().length > 0 ? record.windowScope : undefined;
+  if ((targetId === undefined ? 0 : 1) + (windowScope === undefined ? 0 : 1) !== 1) return undefined;
+  const region = record.region;
+  if (region === null || typeof region !== "object" || Array.isArray(region)) return undefined;
+  const candidate = region as Record<string, unknown>;
+  if (![candidate.x, candidate.y, candidate.width, candidate.height].every(value => typeof value === "number")) return undefined;
+  const normalized: Rect = {
+    x: candidate.x as number,
+    y: candidate.y as number,
+    width: candidate.width as number,
+    height: candidate.height as number,
+  };
+  if (!isBoundedRegion(normalized)) return undefined;
+  const code = record.code;
+  if (code !== undefined && typeof code !== "string") return undefined;
+  return Object.freeze({
+    ...(targetId === undefined ? {} : { targetId }),
+    ...(windowScope === undefined ? {} : { windowScope }),
+    region: Object.freeze(normalized),
+    ...(code === undefined ? {} : { code: normalizeCode(code) }),
+  });
+}
+
 function parseHostRuleResult(value: unknown): { kind: "ok"; match: boolean; code?: string } | { kind: "error" } {
   if (typeof value === "boolean") return { kind: "ok", match: value };
   if (typeof value === "string") return { kind: "ok", match: true, code: normalizeCode(value) };
@@ -771,6 +891,15 @@ function rememberRiskEvidence(result: RiskDecision, evidence: RiskEvidence): Ris
 
 function sameRect(left: Rect, right: Rect): boolean {
   return left.x === right.x && left.y === right.y && left.width === right.width && left.height === right.height;
+}
+
+function pointInRect(point: { x: number; y: number }, rect: Readonly<Rect>): boolean {
+  const right = rect.x + rect.width;
+  const bottom = rect.y + rect.height;
+  return Number.isFinite(right) && Number.isFinite(bottom)
+    && point.x >= rect.x && point.y >= rect.y
+    && point.x < right
+    && point.y < bottom;
 }
 
 function cloneRect(rect: Rect): Rect {
@@ -842,7 +971,7 @@ function isKnownForbiddenHotkey(value: string): boolean {
 }
 
 function isNavigationKey(value: string): boolean {
-  return /^(tab|arrowleft|arrowright|arrowup|arrowdown|home|end)$/iu.test(normalizeText(value));
+  return /^(tab|arrowleft|arrowright|arrowup|arrowdown|home|end|pageup|pagedown)$/iu.test(normalizeText(value));
 }
 
 function isNonActionRole(role: string): boolean {
@@ -862,11 +991,15 @@ function isDraftActionLabel(value: string): boolean {
   return /^(?:(?:save|store)\s+(?:as\s+)?(?:draft|locally)|(?:保存|另存)(?:为)?(?:本地)?草稿)$/iu.test(value);
 }
 
-function isBoundedRegion(region: Rect): boolean {
+function isBoundedRegion(region: Readonly<Rect>): boolean {
+  return isFinitePositiveRect(region)
+    && region.width <= 4096 && region.height <= 4096;
+}
+
+function isFinitePositiveRect(region: Readonly<Rect>): boolean {
   return Number.isFinite(region.x) && Number.isFinite(region.y)
     && Number.isFinite(region.width) && Number.isFinite(region.height)
-    && region.width > 0 && region.height > 0
-    && region.width <= 4096 && region.height <= 4096;
+    && region.width > 0 && region.height > 0;
 }
 
 function clamp01(value: number): number {

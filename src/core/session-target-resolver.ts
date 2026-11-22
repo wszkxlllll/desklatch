@@ -12,13 +12,24 @@ import type {
   View,
 } from "../contracts.js";
 import { matchControl } from "../grounding.js";
+import { isSensitiveControl } from "./observation-registry.js";
 import type { StoredObservation } from "./observation-registry.js";
-import { equivalentMaterial, findEquivalentControl, pointInRect, pointWithinImage, targetBindingKey } from "./session-targeting.js";
+import { isWindowPointGesture } from "./window-point.js";
+import {
+  equivalentMaterial,
+  equivalentPointClickMaterial,
+  findEquivalentControl,
+  pointInRect,
+  pointWithinImage,
+  targetBindingKey,
+} from "./session-targeting.js";
 
 export interface FocusRecord {
   scope: string;
   controlId: string;
   step: number;
+  /** Exact source window; focus refreshes must not enumerate other authorized windows. */
+  windowScope?: string;
 }
 
 export interface Binding {
@@ -128,7 +139,11 @@ export class TargetResolver {
       if (!result.control || !result.stored) {
         return { code: result.code ?? "target_not_found", candidates: result.candidates, candidateObservation: result.stored };
       }
-      if (!result.control.actions.includes(step.kind)) return { code: "target_not_actionable", candidates: result.candidates };
+      if (!result.control.actions.includes(step.kind)) {
+        return isSensitiveControl(result.control)
+          ? { code: "target_not_actionable" }
+          : { code: "target_not_actionable", candidates: [result.control] };
+      }
       return {
         prepared: {
           step,
@@ -147,7 +162,12 @@ export class TargetResolver {
       const focusStep = (step.target as { focusFromStep: number }).focusFromStep;
       const record = this.deps.getFocus(focusStep);
       if (!record) return { code: "focus_unavailable" };
-      const current = await this.deps.observe({ view: "controls", signal }, false);
+      const where = record.windowScope ? { state: "focused" as const, within: record.windowScope } : undefined;
+      const current = await this.deps.observe({
+        view: "controls",
+        ...(where ? { where } : {}),
+        signal,
+      }, false);
       if (current.frame.scope !== record.scope) return { code: "focus_changed" };
       const target = current.frame.controls.find((control) => control.id === record.controlId);
       if (!target || current.frame.focusId !== record.controlId && !this.hasState(target, "focused")) return { code: "focus_changed" };
@@ -168,7 +188,9 @@ export class TargetResolver {
     this.deps.pin(sourceObservation);
     const source = form === "ref" ? sourceObservation.refs.get((step.target as { ref: string }).ref) : undefined;
     if (form === "ref" && !source) return { code: "stale_reference" };
-    const where = source?.windowScope ? this.selectorForControl(source) : undefined;
+    const canScopedRefresh = source?.windowScope !== undefined
+      || (this.deps.backend.supportsScopedRefRefresh === true && source?.name !== undefined);
+    const where = canScopedRefresh && source ? this.selectorForControl(source) : undefined;
     let current = await this.deps.observe({ view: "controls", ...(where ? { where } : {}), signal }, false);
     if (current.frame.scope !== sourceObservation.frame.scope) return { code: form === "point" ? "stale_point" : "stale_reference" };
 
@@ -185,13 +207,29 @@ export class TargetResolver {
       origin = sourceObservation.frame;
       if (!sourceObservation.frame.image) return { code: "point_evidence_required" };
       if (!pointWithinImage(sourceObservation.frame, point)) return { code: "point_out_of_bounds" };
-      const originTarget = await this.hitTestOrigin(sourceObservation.frame, point, signal);
-      target = await this.hitTestUnique(current.frame, point, signal);
+      const originTarget = await this.hitTestOrigin(sourceObservation.frame, point, signal, step.kind);
+      target = await this.hitTestUnique(current.frame, point, signal, step.kind);
       if (!originTarget || !target) return { code: "point_not_unique" };
-      if (originTarget.id !== target.id || !equivalentMaterial(originTarget, target)) return { code: "stale_point" };
+      if (target.windowPoint && !isWindowPointGesture(step)) return { code: "window_point_gesture_unavailable" };
+      const equivalent = step.kind === "click"
+        ? equivalentPointClickMaterial(originTarget, target)
+        : equivalentMaterial(originTarget, target);
+      if (originTarget.id !== target.id || !equivalent) return { code: "stale_point" };
     }
     if (!target) return { code: "target_not_found" };
-    if (!target.actions.includes(step.kind)) return { code: "target_not_actionable" };
+    if (!target.actions.includes(step.kind)) {
+      if (form === "ref" && source && sourceObservation.exposed && current.frame.complete
+        && !isSensitiveControl(source) && !isSensitiveControl(target)) {
+        const hasExistingPublishedRef = target.id === source.id
+          && [...sourceObservation.refs.values()].some(candidate => candidate.id === target.id);
+        return {
+          code: "target_not_actionable",
+          candidates: [target],
+          ...(hasExistingPublishedRef ? { candidateObservation: sourceObservation } : {}),
+        };
+      }
+      return { code: "target_not_actionable" };
+    }
     return {
       prepared: {
         step,
@@ -220,16 +258,16 @@ export class TargetResolver {
     return control.states.includes(state);
   }
 
-  private async hitTestUnique(frame: Frame, point: Point, signal: AbortSignal): Promise<Control | undefined> {
-    if (this.deps.backend.hitTest) return this.deps.backend.hitTest(frame, point, signal);
+  private async hitTestUnique(frame: Frame, point: Point, signal: AbortSignal, kind?: ActionKind): Promise<Control | undefined> {
+    if (this.deps.backend.hitTest) return this.deps.backend.hitTest(frame, point, signal, kind);
     if (!frame.complete) return undefined;
     const matches = frame.controls.filter((control) => pointInRect(point, control));
     return matches.length === 1 ? matches[0] : undefined;
   }
 
-  private async hitTestOrigin(frame: Frame, point: Point, signal: AbortSignal): Promise<Control | undefined> {
+  private async hitTestOrigin(frame: Frame, point: Point, signal: AbortSignal, kind?: ActionKind): Promise<Control | undefined> {
     const snapshotHitTest = this.deps.backend.hitTestSnapshot === true;
-    if (snapshotHitTest && this.deps.backend.hitTest) return this.deps.backend.hitTest(frame, point, signal);
+    if (snapshotHitTest && this.deps.backend.hitTest) return this.deps.backend.hitTest(frame, point, signal, kind);
     if (!frame.complete) return undefined;
     const matches = frame.controls.filter((control) => pointInRect(point, control));
     return matches.length === 1 ? matches[0] : undefined;
@@ -256,7 +294,15 @@ export class TargetResolver {
     const matched = matchControl(stored.frame, selector, { kind, aliases: true });
     const candidates = matched.candidates ?? [];
     if (!stored.frame.complete) return { stored, candidates, code: "observation_incomplete" };
-    if (!matched.control) return { stored, candidates, code: this.failureCode(matched.code, candidates) };
+    if (!matched.control) {
+      // If a complete exact selector uniquely names a published control but
+      // that control lacks the requested action, return it so the session can
+      // disclose only the ordinary authorized action summary. Alias matches,
+      // ambiguity, and incomplete frames never enter this fallback.
+      const exact = matchControl(stored.frame, selector);
+      if (exact.control && !exact.control.actions.includes(kind)) return { stored, control: exact.control };
+      return { stored, candidates, code: this.failureCode(matched.code, candidates) };
+    }
     return { stored, control: matched.control, candidates };
   }
 

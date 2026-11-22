@@ -56,6 +56,7 @@
     "controlTarget": { "oneOf": [{ "$ref": "#/$defs/selector" }, { "$ref": "#/$defs/refTarget" }] },
     "pointerTarget": { "oneOf": [{ "$ref": "#/$defs/controlTarget" }, { "$ref": "#/$defs/pointTarget" }] },
     "keyboardTarget": { "oneOf": [{ "$ref": "#/$defs/controlTarget" }, { "$ref": "#/$defs/focusTarget" }] },
+    "typeTarget": { "oneOf": [{ "$ref": "#/$defs/controlTarget" }, { "$ref": "#/$defs/pointTarget" }, { "$ref": "#/$defs/focusTarget" }] },
     "text": { "type": "string", "minLength": 1, "not": { "pattern": "[\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029]" } },
     "literal": { "type": "string", "not": { "pattern": "[\\u0000-\\u0008\\u000b\\u000c\\u000e-\\u001f\\u007f-\\u009f]" } },
     "expect": {
@@ -91,7 +92,7 @@
         },
         {
           "type": "object", "additionalProperties": false, "required": ["kind", "target", "text"],
-          "properties": { "kind": { "const": "type" }, "target": { "$ref": "#/$defs/keyboardTarget" }, "text": { "$ref": "#/$defs/text" }, "expect": { "$ref": "#/$defs/expect" } }
+          "properties": { "kind": { "const": "type" }, "target": { "$ref": "#/$defs/typeTarget" }, "text": { "$ref": "#/$defs/text" }, "delivery": { "const": "foreground" }, "expect": { "$ref": "#/$defs/expect" } }
         },
         {
           "type": "object", "additionalProperties": false, "required": ["kind", "target", "value"],

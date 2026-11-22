@@ -1,4 +1,4 @@
-import type { ActionKind, Capability, Control, DocumentObservation, DocumentRead, Expect, Frame, RiskPolicy, Selector, State, Step } from "../contracts.js";
+import type { ActionKind, Capability, Control, DocumentObservation, DocumentRead, Expect, Frame, RiskPolicy, Selector, State, Step, TargetForm } from "../contracts.js";
 
 export interface ControlObservation {
   ref: string;
@@ -15,6 +15,29 @@ export interface ControlObservation {
   filterAction?: boolean;
   disclosure?: boolean;
   sameDocumentTab?: boolean;
+  /** Compact view identity for read-side diffs. Act accepts the current ref. */
+  snapshotKey?: string;
+  valueTruncated?: boolean;
+  labelsTruncated?: boolean;
+}
+
+export type ObservationProjectionRequest =
+  | { readonly mode: "compact"; readonly maxControls?: number; readonly since?: string }
+  | { readonly mode: "full" };
+
+export interface ObservationProjection {
+  readonly mode: "compact";
+  readonly kind: "snapshot" | "unchanged" | "delta";
+  readonly backendComplete: boolean;
+  readonly truncated: boolean;
+  readonly observedControls: number;
+  readonly returnedControls: number;
+  readonly base?: string;
+  readonly fallback?: string;
+  readonly basis?: "published_controls";
+  readonly removed?: readonly string[];
+  /** A read-side suggestion for narrowing an incomplete broad controls query. */
+  readonly guidance?: string;
 }
 
 export interface DeskObservation {
@@ -25,6 +48,7 @@ export interface DeskObservation {
   image?: Frame["image"];
   /** Optional host-authorized page-provided rendered text. */
   document?: DocumentObservation;
+  projection?: ObservationProjection;
 }
 
 export interface CandidateSummary {
@@ -48,10 +72,76 @@ export interface StepReceipt {
   code?: string;
 }
 
+/** Bounded structural feedback for one atomic preflight validation failure. */
+export interface ActValidationDiagnostic {
+  readonly atStep?: number;
+  readonly kind?: ActionKind;
+  readonly constraint?: "observation_id_required" | "focus_from_step_earlier";
+  readonly targetForms?: readonly TargetForm[];
+  readonly requiredFields?: readonly string[];
+  readonly allowedFields?: readonly string[];
+  readonly allowedKeys?: readonly string[];
+  readonly allowedChords?: readonly (readonly string[])[];
+}
+
+const VALIDATION_ACTIONS = new Set<ActionKind>(["click", "type", "setValue", "scroll", "keypress", "hotkey", "drag"]);
+const VALIDATION_TARGET_FORMS = new Set<TargetForm>(["selector", "ref", "point", "focus", "path"]);
+const VALIDATION_FIELDS = new Set(["kind", "target", "text", "value", "key", "keys", "from", "to", "button", "count", "direction", "amount", "by", "expect", "delivery"]);
+
+/** Keep Code Mode receipts limited to the typed structural validation shape. */
+export function sanitizeActValidationDiagnostic(value: unknown): ActValidationDiagnostic | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  const atStep = typeof raw.atStep === "number" && Number.isSafeInteger(raw.atStep) && raw.atStep >= 1 && raw.atStep <= 512
+    ? raw.atStep : undefined;
+  const kind = typeof raw.kind === "string" && VALIDATION_ACTIONS.has(raw.kind as ActionKind) ? raw.kind as ActionKind : undefined;
+  const constraint = raw.constraint === "observation_id_required" || raw.constraint === "focus_from_step_earlier"
+    ? raw.constraint : undefined;
+  const targetForms = Array.isArray(raw.targetForms)
+    ? [...new Set(raw.targetForms.filter((entry): entry is TargetForm => typeof entry === "string" && VALIDATION_TARGET_FORMS.has(entry as TargetForm)))].slice(0, 5)
+    : [];
+  const fields = (name: "requiredFields" | "allowedFields") => Array.isArray(raw[name])
+    ? [...new Set(raw[name].filter((entry): entry is string => typeof entry === "string" && VALIDATION_FIELDS.has(entry)))].slice(0, 16)
+    : [];
+  const requiredFields = fields("requiredFields");
+  const allowedFields = fields("allowedFields");
+  const allowedKeys = Array.isArray(raw.allowedKeys)
+    ? [...new Set(raw.allowedKeys.filter((entry): entry is string => typeof entry === "string" && /^[A-Za-z0-9]{1,32}$/u.test(entry)))].slice(0, 32)
+    : [];
+  const allowedChords = Array.isArray(raw.allowedChords)
+    ? raw.allowedChords.flatMap((entry): readonly string[][] => {
+      if (!Array.isArray(entry) || entry.length < 2 || entry.length > 5 || !entry.every(item => typeof item === "string" && /^[A-Za-z0-9]{1,32}$/u.test(item))) return [];
+      return [[...entry]];
+    }).slice(0, 16)
+    : [];
+  if (atStep === undefined && kind === undefined && constraint === undefined && targetForms.length === 0
+    && requiredFields.length === 0 && allowedFields.length === 0 && allowedKeys.length === 0 && allowedChords.length === 0) return undefined;
+  return {
+    ...(atStep === undefined ? {} : { atStep }),
+    ...(kind === undefined ? {} : { kind }),
+    ...(constraint === undefined ? {} : { constraint }),
+    ...(targetForms.length === 0 ? {} : { targetForms }),
+    ...(requiredFields.length === 0 ? {} : { requiredFields }),
+    ...(allowedFields.length === 0 ? {} : { allowedFields }),
+    ...(allowedKeys.length === 0 ? {} : { allowedKeys }),
+    ...(allowedChords.length === 0 ? {} : { allowedChords }),
+  };
+}
+
+/** Safe result-only feedback for a failed declared check before later steps. */
+export const ACT_EXPECTATION_FAILURE_HINT = "The step identified by atStep was dispatched. Its check ran before the next step and failed, so later steps were not sent. Do not repeat the delivered step. If the intended condition depends on a later action, put the check on that action or read afterward." as const;
+
+/** Safe result-only feedback when a grounded point click has no established effect. */
+export const ACT_POINT_CLICK_EVIDENCE_HINT = "Do not retry the same pixels with the same evidence. Locate an explicit control or focused target; stop if unresolved." as const;
+
+export type ActRecoveryHint = typeof ACT_EXPECTATION_FAILURE_HINT | typeof ACT_POINT_CLICK_EVIDENCE_HINT;
+
 export interface ActResult {
   status: "completed" | "stopped" | "rejected";
   atStep?: number;
   code?: string;
+  validation?: ActValidationDiagnostic;
+  recoveryHint?: ActRecoveryHint;
   steps: readonly StepReceipt[];
   candidates?: readonly CandidateSummary[];
   requestId?: string;
@@ -109,12 +199,15 @@ export interface DeskSessionOptions {
   expectTimeoutMs?: number;
   onApprovalRequested?: ApprovalHandler;
   signal?: AbortSignal;
+  /** Keep legacy/full output unless a bounded projection is explicitly opted into. */
+  defaultObservationProjection?: "compact" | "incremental";
 }
 
 export interface DeskObserveOptions {
   view?: "controls" | "image" | "both" | "document";
   where?: Selector;
   read?: DocumentRead;
+  projection?: ObservationProjectionRequest;
   signal?: AbortSignal;
 }
 
@@ -123,6 +216,8 @@ export interface DeskSession {
   readonly allowModelImages: boolean;
   readonly allowModelDocumentText: boolean;
   readonly limits: Readonly<{ maxSteps: number; maxTextLength: number; maxScrollAmount: number }>;
+  readonly supportsObservationProjection?: true;
+  readonly defaultObservationProjection?: "compact" | "incremental";
   observe(options?: DeskObserveOptions): Promise<DeskObservation>;
   act(raw: unknown, signal?: AbortSignal, options?: DeskSessionActOptions): Promise<ActResult>;
   /** Host-only replay boundary; absent on legacy/session adapters. */
@@ -130,5 +225,7 @@ export interface DeskSession {
   resolveApproval(requestId: string, decision: ApprovalDecision): Promise<ApprovalResolution>;
   correct(reason?: string): void;
   cancel(reason?: string): void;
+  /** Host-only invalidation for the public snapshot history. */
+  invalidateObservationSnapshots?(): void;
   close(): Promise<void>;
 }

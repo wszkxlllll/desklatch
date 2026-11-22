@@ -60,6 +60,10 @@ export interface LocalEvidenceSinkLike {
 export class EvidenceCapturingBackend implements DesktopBackend {
   public readonly capabilities: readonly Capability[];
   public readonly allowDocumentText: boolean;
+  public readonly supportsScopedRefRefresh: boolean;
+  public declare readonly hitTestSnapshot: DesktopBackend["hitTestSnapshot"];
+  /** Preserve the wrapped backend's optional hit-test capability. */
+  public declare readonly hitTest: DesktopBackend["hitTest"];
   private readonly failClosed: boolean;
 
   public constructor(private readonly backend: DesktopBackend, private readonly options: EvidenceCapturingBackendOptions) {
@@ -70,16 +74,14 @@ export class EvidenceCapturingBackend implements DesktopBackend {
     }
     this.capabilities = backend.capabilities;
     this.allowDocumentText = backend.allowDocumentText === true;
+    this.supportsScopedRefRefresh = backend.supportsScopedRefRefresh === true;
+    if (backend.hitTestSnapshot !== undefined) this.hitTestSnapshot = backend.hitTestSnapshot;
+    if (backend.hitTest !== undefined) this.hitTest = backend.hitTest.bind(backend);
     this.failClosed = options.failClosed ?? true;
   }
 
   public observe(options: ObserveOptions): Promise<Frame> {
     return this.backend.observe(options);
-  }
-
-  public hitTest(frame: Frame, point: { x: number; y: number }, signal?: AbortSignal): Promise<Control | undefined> {
-    if (this.backend.hitTest === undefined) return Promise.resolve(undefined);
-    return this.backend.hitTest(frame, point, signal);
   }
 
   public async dispatch(request: Dispatch): Promise<Delivery> {
