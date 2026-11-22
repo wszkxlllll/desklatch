@@ -339,6 +339,14 @@ export class CuaWindowsTransport implements WindowsTransport {
    * the immutable exact-window identity supplied by the backend.
    */
   async authorizeForegroundHotkey(target: WindowsWindowTarget, options: { readonly signal?: AbortSignal }): Promise<string | undefined> {
+    return this.authorizeForegroundKeyboard(target, options);
+  }
+
+  async authorizeForegroundText(target: WindowsWindowTarget, options: { readonly signal?: AbortSignal }): Promise<string | undefined> {
+    return this.authorizeForegroundKeyboard(target, options);
+  }
+
+  private async authorizeForegroundKeyboard(target: WindowsWindowTarget, options: { readonly signal?: AbortSignal }): Promise<string | undefined> {
     this.assertOpen();
     options.signal?.throwIfAborted();
     try {

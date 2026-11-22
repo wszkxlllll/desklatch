@@ -107,7 +107,9 @@ Windows 前台表格会话只有在公布带 `foreground:true` 的 `type` 能力
 
 核验要对应实际目标。用 `state:"visible"` 可以确认控件仍可见，用 `valueEquals` 可以确认控件公开的值。需要确认 Word 或 Excel 已经保存时，由宿主在保存后独立读回文件和指定内容。
 
-当前 Windows CUA 会话的 `type` 能力带有 `foreground:true` 时，才接受 `delivery:"foreground"`。这条路径需要精确授权的 PID/HWND、`allowForegroundInput` 和 `allowDesktopCapture`。对于 selector 或 ref，执行器从新鲜且完整的控件几何中找到唯一可写接收方。对于 point，执行器核对同一观察的点证据和命中的可写控件。两条路径都会复查前台、遮挡和物理接收方。后端使用的私有几何或窗口图像留在宿主内，Code Mode 只提交参数和处理回执。输入后用公开值或保存结果核对是否提交。
+当前 Windows CUA 会话的 `type` 能力带有 `foreground:true` 时，才接受 `delivery:"foreground"`。按坐标输入需要精确授权的 PID/HWND、`allowForegroundInput` 和 `allowDesktopCapture`。对于尚未聚焦的 selector 或 ref，执行器从新鲜且完整的控件几何中找到唯一可写接收方。对于 point，执行器核对同一观察的点证据和命中的可写控件。派发前复查前台、遮挡和物理接收方。后端使用的私有几何或窗口图像留在宿主内，Code Mode 只提交参数和处理回执。输入后用公开值或保存结果核对是否提交。
+
+已聚焦的可写文本编辑区可以直接在光标或选区输入。会话在 `type.targets` 提供 `focus` 时，可在同批先用 `hotkey` 全选文本，再用 `type` 指定 `target:{focusFromStep:1}`。派发前核对窗口和原焦点，通过后在原选区键入。对于 Excel，若焦点仍在网格，`Ctrl+A` 选中的可能是区域，修改单元格时应定位到该格。
 
 会话已公布前台输入能力时，可以这样提交。
 

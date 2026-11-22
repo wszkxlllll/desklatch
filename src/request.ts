@@ -849,6 +849,13 @@ export function describeActParameters(schema: unknown, options: { readonly codeS
     propertySchema(branch, "kind")?.const === "type"
     && propertySchema(branch, "delivery")?.const === "foreground"
     && targetForms(propertySchema(branch, "target"), schema).some(form => form === "selector" || form === "ref"));
+  if (hasForegroundType && (maxSteps === undefined || maxSteps >= 2)
+    && variants.some(branch => propertySchema(branch, "kind")?.const === "type"
+      && targetForms(propertySchema(branch, "target"), schema).includes("focus"))
+    && variants.some(branch => propertySchema(branch, "kind")?.const === "hotkey"
+      && chordEnums(propertySchema(branch, "keys"), schema).chords.some(keys => keys.join("+") === "ctrl+a"))) {
+    guide.push('To replace selected text after Ctrl+A, use type with target:{focusFromStep:<Ctrl+A step>} in the same act to preserve the selection.');
+  }
   const hasEnterFocus = variants.some(branch =>
     propertySchema(branch, "kind")?.const === "keypress"
     && enumValues(propertySchema(branch, "key"), schema)?.includes("Enter") === true

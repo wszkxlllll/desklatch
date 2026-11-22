@@ -285,6 +285,13 @@ export interface WindowsPhysicalInspector {
     focused: WindowsFocusEvidence,
     signal?: AbortSignal,
   ): Promise<WindowsTransportDelivery>;
+  /** Deliver text to the same live editor, preserving its caret and selection. */
+  dispatchFocusedText?(
+    target: WindowsWindowTarget,
+    text: string,
+    focused: WindowsFocusEvidence,
+    signal?: AbortSignal,
+  ): Promise<WindowsTransportDelivery>;
   /** Native physical pixel delivery for an already active, authorized window without controls. */
   dispatchWindowPoint?(
     target: WindowsWindowTarget,
@@ -362,6 +369,11 @@ export interface WindowsTransport {
    * to another hotkey transport after this hook is present.
    */
   authorizeForegroundHotkey?(
+    target: WindowsWindowTarget,
+    options: { readonly signal?: AbortSignal },
+  ): Promise<string | undefined>;
+  /** Recheck live input authority before typing into the exact focused editor. */
+  authorizeForegroundText?(
     target: WindowsWindowTarget,
     options: { readonly signal?: AbortSignal },
   ): Promise<string | undefined>;

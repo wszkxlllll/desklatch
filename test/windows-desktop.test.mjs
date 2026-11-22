@@ -131,6 +131,42 @@ test('native hotkey refuses before SendInput when the pre-send UIA RuntimeId cha
   assert.equal(fixture.calls.sendInput, 0);
 });
 
+test('native focused typing sends UTF-16 input without clicks and does not replay a partial write', async () => {
+  const focus = { target: targetA, focused: true, pid: targetA.pid, hwnd: targetA.hwnd, runtimeId: 'runtime-1' };
+  const value = '\u4e2d\u{1f600}';
+  const captureInputs = (fixture, limit = Infinity) => {
+    const batches = [];
+    fixture.api.sendInput = (count, input) => {
+      batches.push(Array.from({ length: count }, (_, index) => {
+        const offset = 40 * index;
+        return [input.readUInt32LE(offset), input.readUInt16LE(offset + 8),
+          input.readUInt16LE(offset + 10), input.readUInt32LE(offset + 12)];
+      }));
+      return Math.min(limit, count);
+    };
+    return batches;
+  };
+  const fixture = nativeHotkeyFixture();
+  const batches = captureInputs(fixture);
+  assert.deepEqual(await fixture.inspector.dispatchFocusedText(targetA, value, focus), { status: 'dispatched' });
+  assert.deepEqual(batches, [[
+    [1, 0, 0x4e2d, 4], [1, 0, 0x4e2d, 6],
+    [1, 0, 0xd83d, 4], [1, 0, 0xd83d, 6], [1, 0, 0xde00, 4], [1, 0, 0xde00, 6],
+  ]]);
+
+  const partial = nativeHotkeyFixture();
+  const partialBatches = captureInputs(partial, 1);
+  assert.deepEqual(await partial.inspector.dispatchFocusedText(targetA, value, focus),
+    { status: 'partial', code: 'native_type_partial' });
+  assert.equal(partialBatches.length, 2);
+  assert.deepEqual(partialBatches[1], [[1, 0, 0x4e2d, 6]]);
+
+  const moved = nativeHotkeyFixture({ beforeRuntime: 'another-editor' });
+  assert.deepEqual(await moved.inspector.dispatchFocusedText(targetA, value, focus),
+    { status: 'refused', code: 'native_type_focus_changed' });
+  assert.equal(moved.calls.sendInput, 0);
+});
+
 test('native window hotkey reports unknown when the enrolled root changes after the full batch', async () => {
   const fixture = nativeHotkeyFixture({ afterRuntime: 'editor-closed', rootAfter: 0x300000000001n });
   const result = await fixture.inspector.dispatchHotkey(targetA, ['ctrl', 's'], {
@@ -1682,6 +1718,75 @@ test('CUA foreground hotkeys use an optional exact native chord route without tr
   assert.deepEqual(calls[0].keys, ['ctrl', 's']);
   assert.equal(calls[0].focused.runtimeId, 'doc-runtime-1');
   await backend.close();
+});
+
+test('Ctrl+A and type preserve the same Windows editor selection within and across calls', async t => {
+  const bounds = { x: 20, y: 30, width: 420, height: 280 };
+  const actions = [];
+  let selection = false;
+  let value = 'old value';
+  let allowText = true;
+  const transport = {
+    source: 'cua-uia-0.54',
+    async observeWindow(window) {
+      return {
+        target: window, bounds, complete: true,
+        elements: [
+          { index: '0', depth: 0, role: 'Window', label: 'Editor', actions: [], rect: bounds },
+          { index: '1', depth: 1, role: 'Document', label: 'Text Editor', actions: ['text'],
+            focused: true, editable: true, runtimeId: 'editor-1', token: 'editor-token',
+            rect: { x: 40, y: 70, width: 300, height: 180 } },
+        ],
+      };
+    },
+    async authorizeForegroundHotkey() { return undefined; },
+    async authorizeForegroundText() { return allowText ? undefined : 'foreground_input_not_authorized'; },
+    async dispatch() { assert.fail('focus-bound text must not use a click or the token write route'); },
+  };
+  const inspector = {
+    async read(window) { return { target: window, bounds, visible: true, minimized: false, foregroundHwnd: window.hwnd, foregroundPid: window.pid }; },
+    async readFocused(window) { return { target: window, focused: true, pid: window.pid, hwnd: window.hwnd, runtimeId: 'editor-1', role: 'Document' }; },
+    async dispatchHotkey(_window, keys) {
+      assert.deepEqual(keys, ['ctrl', 'a']);
+      actions.push('select');
+      selection = true;
+      return { status: 'dispatched' };
+    },
+    async dispatchFocusedText(_window, text, focused) {
+      assert.equal(focused.runtimeId, 'editor-1');
+      actions.push('type');
+      value = selection ? text : value + text;
+      selection = false;
+      return { status: 'dispatched' };
+    },
+  };
+  const backend = await createWindowsDesktopBackend({
+    authorization: { targets: [targetA], allowForegroundInput: true, allowDesktopCapture: true, background: { source: 'cua-uia-0.54' } },
+    transport, inspector,
+  });
+  const session = createDeskSession(backend);
+  t.after(() => session.close());
+  assert.ok(session.capabilities.find(capability => capability.kind === 'type')?.targets.includes('focus'));
+  const editor = { role: 'Document', name: 'Text Editor' };
+  const select = { kind: 'hotkey', target: editor, keys: ['ctrl', 'a'] };
+  const type = { kind: 'type', target: { focusFromStep: 1 }, text: 'new value' };
+  const result = await session.act({ steps: [select, type] });
+  assert.equal(result.status, 'completed', JSON.stringify(result));
+  assert.deepEqual(result.steps.map(step => step.status), ['dispatched', 'dispatched']);
+  assert.equal(value, 'new value');
+
+  await session.act({ steps: [select] });
+  const separate = await session.act({ steps: [{ ...type, target: editor, text: 'separate calls', delivery: 'foreground' }] });
+  assert.equal(separate.status, 'completed', JSON.stringify(separate));
+  assert.equal(value, 'separate calls');
+  assert.deepEqual(actions, ['select', 'type', 'select', 'type']);
+
+  allowText = false;
+  const revoked = await session.act({ steps: [select, type] });
+  assert.equal(revoked.code, 'foreground_input_not_authorized');
+  assert.deepEqual(revoked.steps.map(step => step.status), ['dispatched', 'not_dispatched']);
+  assert.equal(value, 'separate calls');
+  assert.deepEqual(actions, ['select', 'type', 'select', 'type', 'select']);
 });
 
 test('native foreground hotkey partial or wrong-receiver results are terminal and never replayed', async () => {

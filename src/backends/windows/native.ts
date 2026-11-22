@@ -33,6 +33,7 @@ const MOUSE_WHEEL = 0x0800;
 const MOUSE_HORIZONTAL_WHEEL = 0x1000;
 const WHEEL_DELTA = 120;
 const KEYEVENTF_KEYUP = 0x0002;
+const KEYEVENTF_UNICODE = 0x0004;
 const INPUT_SIZE_X64 = 40;
 // Keep the x64 buffer generously sized for Koffi's ABI marshalling. The
 // documented fields used here remain cbSize=0, hwndActive=8, hwndFocus=16;
@@ -352,61 +353,98 @@ export class User32Inspector implements WindowsPhysicalInspector {
     signal?.throwIfAborted();
     const plan = nativeHotkeyPlan(keys);
     if (!plan) return { status: "refused", code: "native_hotkey_unsupported" };
-    if (!focusEvidenceMatchesTarget(focused, target)) return { status: "refused", code: "native_hotkey_focus_unconfirmed" };
+    return this.dispatchFocusedKeyboard(target, focused, hotkeyInputSequence(plan), plan.scope, "native_hotkey", signal);
+  }
+
+  /** Send printable text to the exact live editor without clicking away its selection. */
+  async dispatchFocusedText(
+    target: WindowsWindowTarget,
+    text: string,
+    focused: WindowsFocusEvidence,
+    signal?: AbortSignal,
+  ): Promise<WindowsTransportDelivery> {
+    if (signal?.aborted) return { status: "refused", code: "cancelled_before_dispatch" };
+    if (!text || /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/u.test(text)) return { status: "refused", code: "invalid_text" };
+    const events: NativeKeyEvent[] = [];
+    for (let index = 0; index < text.length; index += 1) {
+      const scanCode = text.charCodeAt(index);
+      events.push({ virtualKey: 0, scanCode, flags: KEYEVENTF_UNICODE },
+        { virtualKey: 0, scanCode, flags: KEYEVENTF_UNICODE | KEYEVENTF_KEYUP });
+    }
+    return this.dispatchFocusedKeyboard(target, focused, events, "control", "native_type", signal);
+  }
+
+  private async dispatchFocusedKeyboard(
+    target: WindowsWindowTarget,
+    focused: WindowsFocusEvidence,
+    events: readonly NativeKeyEvent[],
+    scope: "control" | "window",
+    codePrefix: "native_hotkey" | "native_type",
+    signal?: AbortSignal,
+  ): Promise<WindowsTransportDelivery> {
+    const refuse = (code: string): WindowsTransportDelivery => ({ status: "refused", code: codePrefix + "_" + code });
+    if (!focusEvidenceMatchesTarget(focused, target)) return refuse("focus_unconfirmed");
 
     // These reads are intentionally awaited before the final synchronous
     // guard below. No await occurs between that guard and SendInput.
-    const before = await this.read(target, undefined, signal);
-    if (!physicalForegroundMatches(before, target)) return { status: "refused", code: "native_hotkey_foreground_unconfirmed" };
-    const beforeUiFocus = await this.readFocused(target, signal);
-    if (!focusEvidenceMatchesTarget(beforeUiFocus, target)) return { status: "refused", code: "native_hotkey_focus_unconfirmed" };
+    const before = await this.read(target, undefined, signal).catch(() => undefined);
+    if (signal?.aborted) return { status: "refused", code: "cancelled_before_dispatch" };
+    if (!physicalForegroundMatches(before, target)) return refuse("foreground_unconfirmed");
+    const beforeUiFocus = await this.readFocused(target, signal).catch(() => undefined);
+    if (signal?.aborted) return { status: "refused", code: "cancelled_before_dispatch" };
+    if (!focusEvidenceMatchesTarget(beforeUiFocus, target)) return refuse("focus_unconfirmed");
     // Both scopes are approved against the exact UIA element that was
     // enrolled by the caller.  A window-scoped chord may legitimately move
     // focus as a result of the full chord (for example, Save closing an
     // editor), but it must never start after the receiver changed.
     if (typeof focused.runtimeId !== "string" || focused.runtimeId.length === 0
       || typeof beforeUiFocus.runtimeId !== "string" || beforeUiFocus.runtimeId.length === 0) {
-      return { status: "refused", code: "native_hotkey_focus_unconfirmed" };
+      return refuse("focus_unconfirmed");
     }
     if (beforeUiFocus.runtimeId !== focused.runtimeId) {
-      return { status: "refused", code: "native_hotkey_focus_changed" };
+      return refuse("focus_changed");
     }
     const beforeFocus = readGuiThreadFocus(this.#api, target);
     if (!beforeFocus || beforeFocus.active !== target.hwnd || beforeFocus.root !== target.hwnd || beforeFocus.pid !== target.pid
       || (beforeFocus.flags & 0x1e) !== 0) {
-      return { status: "refused", code: "native_hotkey_focus_unconfirmed" };
+      return refuse("focus_unconfirmed");
     }
+    const input = keyboardInputBatch(events);
+    if (signal?.aborted) return { status: "refused", code: "cancelled_before_dispatch" };
     // Final synchronous ownership/focus/modifier guard immediately before the
     // native call. A held modifier would make the batch's meaning ambiguous.
     if (!syncForegroundMatches(this.#api, target)
       || !syncGuiThreadFocusMatches(this.#api, target, beforeFocus.focus)
+      || Number(this.#api.isWindowEnabled(target.hwnd)) === 0
       || modifiersHeld(this.#api)) {
-      return { status: "refused", code: "native_hotkey_focus_changed" };
+      return refuse("focus_changed");
     }
 
-    const input = keyboardInputBatch(plan);
     let delivered: number;
     try {
-      delivered = Number(this.#api.sendInput(plan.inputCount, input, INPUT_SIZE_X64));
+      delivered = Number(this.#api.sendInput(events.length, input, INPUT_SIZE_X64));
     } catch (error) {
-      return { status: "unknown", code: errorCode(error) ?? "native_hotkey_delivery_unknown" };
+      return { status: "unknown", code: errorCode(error) ?? codePrefix + "_delivery_unknown" };
     }
-    if (!Number.isSafeInteger(delivered) || delivered !== plan.inputCount) {
-      // SendInput may have delivered a strict prefix. Never replay the chord.
+    if (!Number.isSafeInteger(delivered) || delivered < 0 || delivered > events.length) {
+      return { status: "unknown", code: codePrefix + "_delivery_unknown" };
+    }
+    if (delivered !== events.length) {
+      // SendInput may have delivered a strict prefix. Never replay it.
       if (delivered > 0) {
         // Release every key this batch could have depressed. This is cleanup,
         // never a replay; only send it while the same receiver is still
         // synchronously proven, so a user switch cannot receive the cleanup.
         if (syncForegroundMatches(this.#api, target)
           && syncGuiThreadFocusMatches(this.#api, target, beforeFocus.focus)) {
-          const release = keyboardReleaseBatch(plan, delivered);
-          if (release.count > 0) {
-            try { this.#api.sendInput(release.count, release.buffer, INPUT_SIZE_X64); } catch { /* preserve partial */ }
+          const release = keyboardReleaseEvents(events.slice(0, delivered));
+          if (release.length > 0) {
+            try { this.#api.sendInput(release.length, keyboardInputBatch(release), INPUT_SIZE_X64); } catch { /* preserve partial */ }
           }
         }
-        return { status: "partial", code: "native_hotkey_partial" };
+        return { status: "partial", code: codePrefix + "_partial" };
       }
-      return { status: "refused", code: "native_hotkey_not_queued" };
+      return refuse("not_queued");
     }
 
     const after = await this.read(target, undefined, signal).catch(() => undefined);
@@ -414,7 +452,7 @@ export class User32Inspector implements WindowsPhysicalInspector {
     const afterNativeFocus = readGuiThreadFocus(this.#api, target);
     if (!physicalForegroundMatches(after, target)
       || !focusEvidenceMatchesTarget(afterFocus, target)
-      || (plan.scope === "control" && focused.runtimeId !== undefined && afterFocus?.runtimeId !== focused.runtimeId)
+      || (scope === "control" && afterFocus?.runtimeId !== focused.runtimeId)
       || !afterNativeFocus
       || afterNativeFocus.active !== target.hwnd
       || afterNativeFocus.root !== target.hwnd
@@ -424,13 +462,13 @@ export class User32Inspector implements WindowsPhysicalInspector {
       // returned. Re-read the exact foreground owner synchronously so a
       // receiver switch cannot be reported as delivered.
       || !syncForegroundMatches(this.#api, target)
-      || (plan.scope === "control" && afterNativeFocus.focus !== beforeFocus.focus)) {
-      return { status: "unknown", code: "native_hotkey_focus_changed" };
+      || (scope === "control" && afterNativeFocus.focus !== beforeFocus.focus)) {
+      return { status: "unknown", code: codePrefix + "_focus_changed" };
     }
     // A window-scoped chord may transition the focused child while retaining
     // the enrolled receiver.  Do not let any later generic focus handoff
     // attach that transitioned child to this action's receipt.
-    return plan.scope === "window"
+    return scope === "window"
       ? { status: "dispatched", suppressFocusHandoff: true }
       : { status: "dispatched" };
   }
@@ -594,17 +632,22 @@ interface NativeHotkeyPlan {
   readonly scope: "control" | "window";
   readonly modifiers: readonly number[];
   readonly key: number;
-  readonly inputCount: number;
+}
+
+interface NativeKeyEvent {
+  readonly virtualKey: number;
+  readonly flags: number;
+  readonly scanCode?: number;
 }
 
 function nativeHotkeyPlan(keys: readonly string[]): NativeHotkeyPlan | undefined {
   if (!Array.isArray(keys) || (keys.length !== 2 && keys.length !== 3)) return undefined;
   const normalized = keys.map(key => typeof key === "string" ? key.toLocaleLowerCase() : "");
   if (new Set(normalized).size !== normalized.length || normalized[0] !== "ctrl") return undefined;
-  if (normalized.length === 2 && normalized[1] === "a") return { scope: "control", modifiers: [VK_CONTROL], key: 0x41, inputCount: 4 };
-  if (normalized.length === 2 && normalized[1] === "s") return { scope: "window", modifiers: [VK_CONTROL], key: 0x53, inputCount: 4 };
+  if (normalized.length === 2 && normalized[1] === "a") return { scope: "control", modifiers: [VK_CONTROL], key: 0x41 };
+  if (normalized.length === 2 && normalized[1] === "s") return { scope: "window", modifiers: [VK_CONTROL], key: 0x53 };
   if (normalized.length === 3 && normalized[1] === "shift" && normalized[2] === "s") {
-    return { scope: "window", modifiers: [VK_CONTROL, VK_SHIFT], key: 0x53, inputCount: 6 };
+    return { scope: "window", modifiers: [VK_CONTROL, VK_SHIFT], key: 0x53 };
   }
   return undefined;
 }
@@ -614,15 +657,9 @@ export function nativeHotkeyScope(keys: readonly string[]): "control" | "window"
   return nativeHotkeyPlan(keys)?.scope;
 }
 
-function keyboardInputBatch(plan: NativeHotkeyPlan): Buffer {
-  const input = Buffer.alloc(plan.inputCount * INPUT_SIZE_X64);
-  let index = 0;
-  for (const virtualKey of plan.modifiers) writeKeyboardInput(input, index++, virtualKey, 0);
-  writeKeyboardInput(input, index++, plan.key, 0);
-  writeKeyboardInput(input, index++, plan.key, KEYEVENTF_KEYUP);
-  for (let modifierIndex = plan.modifiers.length - 1; modifierIndex >= 0; modifierIndex -= 1) {
-    writeKeyboardInput(input, index++, plan.modifiers[modifierIndex], KEYEVENTF_KEYUP);
-  }
+function keyboardInputBatch(events: readonly NativeKeyEvent[]): Buffer {
+  const input = Buffer.alloc(events.length * INPUT_SIZE_X64);
+  events.forEach((event, index) => writeKeyboardInput(input, index, event));
   return input;
 }
 
@@ -649,23 +686,20 @@ function windowPointInputBatch(gesture: WindowPointGesture, display: Pick<FrameI
   return batch;
 }
 
-function keyboardReleaseBatch(plan: NativeHotkeyPlan, delivered: number): { readonly buffer: Buffer; readonly count: number } {
-  const sequence = hotkeyInputSequence(plan);
-  const pressed: number[] = [];
-  for (const event of sequence.slice(0, Math.min(delivered, sequence.length))) {
+function keyboardReleaseEvents(events: readonly NativeKeyEvent[]): NativeKeyEvent[] {
+  const pressed = new Map<number, NativeKeyEvent>();
+  for (const event of events) {
+    const key = event.scanCode === undefined ? event.virtualKey : 0x10000 + event.scanCode;
     if ((event.flags & KEYEVENTF_KEYUP) !== 0) {
-      const index = pressed.lastIndexOf(event.virtualKey);
-      if (index >= 0) pressed.splice(index, 1);
-    } else if (!pressed.includes(event.virtualKey)) {
-      pressed.push(event.virtualKey);
+      pressed.delete(key);
+    } else {
+      pressed.set(key, event);
     }
   }
-  const input = Buffer.alloc(pressed.length * INPUT_SIZE_X64);
-  pressed.reverse().forEach((virtualKey, index) => writeKeyboardInput(input, index, virtualKey, KEYEVENTF_KEYUP));
-  return { buffer: input, count: pressed.length };
+  return [...pressed.values()].reverse().map(event => ({ ...event, flags: event.flags | KEYEVENTF_KEYUP }));
 }
 
-function hotkeyInputSequence(plan: NativeHotkeyPlan): Array<{ readonly virtualKey: number; readonly flags: number }> {
+function hotkeyInputSequence(plan: NativeHotkeyPlan): NativeKeyEvent[] {
   return [
     ...plan.modifiers.map(virtualKey => ({ virtualKey, flags: 0 })),
     { virtualKey: plan.key, flags: 0 },
@@ -674,13 +708,13 @@ function hotkeyInputSequence(plan: NativeHotkeyPlan): Array<{ readonly virtualKe
   ];
 }
 
-function writeKeyboardInput(buffer: Buffer, index: number, virtualKey: number, flags: number): void {
+function writeKeyboardInput(buffer: Buffer, index: number, event: NativeKeyEvent): void {
   const offset = index * INPUT_SIZE_X64;
   buffer.writeUInt32LE(INPUT_KEYBOARD, offset);
-  // x64 INPUT's KEYBDINPUT union begins at byte 8. The remaining fields are
-  // already zeroed by Buffer.alloc (scan code, timestamp, extra info).
-  buffer.writeUInt16LE(virtualKey, offset + 8);
-  buffer.writeUInt32LE(flags, offset + 12);
+  // x64 INPUT's KEYBDINPUT union begins at byte 8.
+  buffer.writeUInt16LE(event.virtualKey, offset + 8);
+  buffer.writeUInt16LE(event.scanCode ?? 0, offset + 10);
+  buffer.writeUInt32LE(event.flags, offset + 12);
 }
 
 interface NativeGuiFocus {

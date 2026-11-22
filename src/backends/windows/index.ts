@@ -567,6 +567,28 @@ class WindowsDesktopSession implements WindowsDesktopBackend {
       } else {
         this.clearGridEditHandoffs();
       }
+      const focusedTarget = "focusFromStep" in step.target;
+      if (step.kind === "type" && !coordinateTarget && resolved.control
+        && (focusedTarget || resolved.control.control.states.includes("focused"))
+        && isWritableTextControl(resolved.control)
+        && this.#authorization.allowForegroundInput === true
+        && (!foregroundTypeRequested || this.#authorization.allowDesktopCapture === true)
+        && this.#inspector?.dispatchFocusedText && this.#transport.authorizeForegroundText) {
+        // Use the actual caret or selection. A center click here would collapse
+        // the selection made by the previous action (for example, Ctrl+A).
+        const focused = await this.readFocused(target, request.signal);
+        if (!focused || !focusMatchesControl(focused, resolved.control)) return refuse("keyboard_focus_not_confirmed");
+        const code = await this.#transport.authorizeForegroundText(target, { signal: request.signal })
+          .catch(() => "focused_type_authorization_failed");
+        if (request.signal?.aborted) return refuse("cancelled_before_dispatch");
+        if (code) return refuse(code);
+        try {
+          return await this.#inspector.dispatchFocusedText(target, step.text, focused, request.signal);
+        } catch (error) {
+          return { status: "unknown", code: errorCode(error) ?? "native_type_delivery_unknown" };
+        }
+      }
+      if (step.kind === "type" && focusedTarget) return refuse("focused_type_unavailable");
       const point = gridHandoff?.point ?? resolved.point
         ?? (resolved.control?.control.rect ? center(resolved.control.control.rect) : undefined);
       const pointerFocus = resolved.control?.pointerFocus;
@@ -1101,14 +1123,16 @@ function capabilitiesFor(authorization: NormalizedAuthorization, transport: Wind
   }
   const foreground = physicalEvidence && authorization.allowForegroundInput === true && authorization.allowDesktopCapture === true;
   const keyboard = physicalEvidence && authorization.allowForegroundInput === true && inspector?.readFocused !== undefined;
-  return windowsCuaCapabilities({ background, foreground, keyboard });
+  const focusedType = keyboard && inspector?.dispatchFocusedText !== undefined && transport.authorizeForegroundText !== undefined;
+  return windowsCuaCapabilities({ background, foreground, keyboard, focusedType });
 }
 
 /** Shared by the on-demand product catalog and the live CUA session. */
-export function windowsCuaCapabilities({ background, foreground, keyboard }: {
+export function windowsCuaCapabilities({ background, foreground, keyboard, focusedType = false }: {
   readonly background: boolean;
   readonly foreground: boolean;
   readonly keyboard: boolean;
+  readonly focusedType?: boolean;
 }): readonly Capability[] {
   const targetForms = foreground ? ["selector", "ref", "point"] as const : ["selector", "ref"] as const;
   const capabilities: Capability[] = [];
@@ -1123,14 +1147,9 @@ export function windowsCuaCapabilities({ background, foreground, keyboard }: {
     }
     capabilities.push(Object.freeze({ kind: "scroll", targets: targetForms, directions: ["up", "down", "left", "right"] as const, units: ["line", "page"] as const }));
   }
-  if (background || foreground) capabilities.push(Object.freeze({
+  if (background || foreground || focusedType) capabilities.push(Object.freeze({
     kind: "type",
-    // With the explicit foreground grant, selector/ref controls may use the
-    // same verified center-point CUA route without exposing pixels to the
-    // model (including Code Mode/ref callers).  A background-only session
-    // retains its ordinary UIA selector/ref route; point is never advertised
-    // without the foreground capture grant.
-    targets: foreground ? targetForms : ["selector", "ref"] as const,
+    targets: [...(background || foreground ? targetForms : []), ...(focusedType ? ["focus"] as const : [])],
     ...(foreground ? { foreground: true as const } : {}),
   }));
   if (background) capabilities.push(Object.freeze({ kind: "setValue", targets: ["selector", "ref"] as const }));
@@ -1839,6 +1858,13 @@ function foregroundTypeControlReady(
   if (resolved.source.role === "Canvas" || resolved.source.password === true || resolved.control.sensitive === true) return false;
   if (!resolved.token || !resolved.control.actions.includes("type") || !resolved.control.states.includes("editable")) return false;
   return contains(resolved.control.rect, point) && validRect(resolved.control.rect);
+}
+
+function isWritableTextControl(resolved: InternalControl): boolean {
+  const { control, source } = resolved;
+  return isEditableValuePatternRole(control.role) && !source.password && !control.sensitive
+    && source.enabled !== false
+    && control.states.includes("editable") && control.actions.includes("type");
 }
 
 function actionAllowed(step: Step, control?: Control, foreground = false, pointerFocus = false): boolean {

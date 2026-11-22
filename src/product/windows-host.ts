@@ -343,6 +343,11 @@ function createGrantGuardedTransport(
     const candidate = windows.find(window => window.pid === target.pid && window.hwnd === target.hwnd);
     return candidate !== undefined && await verify(candidate);
   };
+  const authorizeKeyboardTarget = async (target: WindowsWindowTarget): Promise<string | undefined> => {
+    const code = await authorizationLive(true);
+    if (code) return code;
+    return await verifyTarget(target) ? undefined : "window_scope_changed";
+  };
   return {
     source: transport.source,
     open: transport.open ? signal => transport.open!(signal) : undefined,
@@ -374,10 +379,14 @@ function createGrantGuardedTransport(
       // native inspector's SendInput route runs outside the CUA transport, so
       // product grants and exact app-window enrollment must be revalidated
       // immediately before it is allowed to run.
-      const code = await authorizationLive(true);
+      const code = await authorizeKeyboardTarget(target);
       if (code) return code;
-      if (!(await verifyTarget(target))) return "window_scope_changed";
       return transport.authorizeForegroundHotkey!(target, callOptions);
+    } : undefined,
+    authorizeForegroundText: transport.authorizeForegroundText ? async (target, callOptions) => {
+      const code = await authorizeKeyboardTarget(target);
+      if (code) return code;
+      return transport.authorizeForegroundText!(target, callOptions);
     } : undefined,
     authorizeWindowPoint: async (target, callOptions) => {
       const code = await authorizationLive(true, "desktop");
